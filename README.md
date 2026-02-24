@@ -1,0 +1,51 @@
+# 3D Viewer
+
+Веб-вьюер для просмотра 3D-моделей (STEP, STL, IGES): загрузка файлов, просмотр в браузере, скриншот с аннотациями.
+
+**Версия:** 1.0.0
+
+## Возможности
+
+- **Форматы:** STEP (.stp, .step), STL, IGES (.igs, .iges). Конвертация STEP/IGES в браузере через [opencascade.js](https://github.com/OpenCascade.js/opencascade.js) (WASM).
+- **Управление камерой:** TrackballControls — вращение (правая кнопка мыши), панорама (средняя), zoom (колёсико).
+- **Скриншот:** сохранение текущего вида в PNG; редактор скриншота (фигуры, текст, обрезка).
+- **Вид по умолчанию:** кнопка сброса камеры к сохранённому виду после загрузки модели.
+
+## Стек
+
+- Vue 3, TypeScript, Vite  
+- Three.js (сцена, GLTFLoader, STLLoader)  
+- opencascade.js — чтение STEP/IGES, тесселяция, экспорт в GLB  
+
+## Запуск
+
+```bash
+cd viewer
+npm install
+npm run dev
+```
+
+В браузере откройте адрес, который выведет Vite (например http://localhost:5173).
+
+## Сборка
+
+```bash
+cd viewer
+npm run build
+```
+
+Результат в `viewer/dist/`.
+
+## Версионность
+
+Версия проекта задаётся в `viewer/package.json` (поле `version`). Формат — [SemVer](https://semver.org/) (major.minor.patch).
+
+## Структура
+
+- `viewer/` — приложение (Vue 3 + Vite)
+- `docs/` — заметки по развитию (например, разнесение сборки)
+- `viewer/src/lib/stepLoader.ts` — загрузка STEP/IGES через opencascade.js
+
+## Лицензия
+
+Приватный проект.
