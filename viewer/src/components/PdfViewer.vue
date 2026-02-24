@@ -105,6 +105,15 @@ watch(
   { immediate: true }
 )
 
+function getCurrentPageImageUrl(): string {
+  if (!canvasRef.value) return ''
+  return canvasRef.value.toDataURL('image/png') || ''
+}
+
+defineExpose({
+  getCurrentPageImageUrl,
+})
+
 onUnmounted(() => {
   pdfDoc = null
 })
