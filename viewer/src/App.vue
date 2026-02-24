@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { jsPDF } from 'jspdf'
 import type { ViewMode, MeasureSnapMode } from './components/ViewerToolbar.vue'
 import Viewer3D from './components/Viewer3D.vue'
 import ViewerToolbar from './components/ViewerToolbar.vue'
@@ -19,8 +20,42 @@ const sectionActive = ref(false)
 const sectionOffset = ref(0)
 const measureMode = ref(false)
 const measureSnapMode = ref<MeasureSnapMode>('intersection')
+const isDraggingFile = ref(false)
+
+const MODEL_EXTENSIONS = ['stl', 'step', 'stp', 'igs', 'iges', 'glb', 'gltf']
 
 let pdfInput: HTMLInputElement | null = null
+
+function onDragOver(e: DragEvent) {
+  if (!e.dataTransfer?.types.includes('Files')) return
+  e.preventDefault()
+  e.dataTransfer.dropEffect = 'copy'
+  isDraggingFile.value = true
+}
+
+function onDragLeave() {
+  isDraggingFile.value = false
+}
+
+function onDrop(e: DragEvent) {
+  isDraggingFile.value = false
+  if (!e.dataTransfer?.types.includes('Files')) return
+  e.preventDefault()
+  const file = e.dataTransfer.files?.[0]
+  if (!file) return
+  const ext = (file.name.split('.').pop() || '').toLowerCase()
+  if (ext === 'pdf') {
+    if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
+    pdfFile.value = { url: URL.createObjectURL(file), name: file.name }
+    return
+  }
+  if (MODEL_EXTENSIONS.includes(ext)) {
+    if (viewMode.value === '2d') viewMode.value = 'split'
+    setTimeout(() => viewerRef.value?.loadModelFile?.(file), 0)
+    return
+  }
+  alert('Поддерживаются PDF и 3D (STL, STEP, IGES, GLB)')
+}
 
 function onOpenPdf() {
   if (!pdfInput) {
@@ -53,6 +88,76 @@ function onExportGlb() {
 
 function onExportStl() {
   viewerRef.value?.exportStl?.()
+}
+
+async function onExportReport() {
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+  const pageW = doc.getPageWidth()
+  const pageH = doc.getPageHeight()
+  const margin = 15
+  const imgW = pageW - margin * 2
+  let y = margin
+  const lineH = 7
+
+  const addImage = (dataUrl: string, title: string) => {
+    if (y > pageH - 80) {
+      doc.addPage()
+      y = margin
+    }
+    doc.setFontSize(11)
+    doc.text(title, margin, y)
+    y += lineH
+    const img = new Image()
+    return new Promise<void>((resolve, reject) => {
+      img.onload = () => {
+        const k = imgW / img.width
+        const h = Math.min(img.height * k, 140)
+        doc.addImage(dataUrl, 'PNG', margin, y, imgW, h)
+        y += h + lineH
+        resolve()
+      }
+      img.onerror = reject
+      img.src = dataUrl
+    })
+  }
+
+  try {
+    if (pdfFile.value && pdfViewerRef.value) {
+      const pdfImg = pdfViewerRef.value.getCurrentPageImageUrl?.()
+      if (pdfImg) {
+        await addImage(pdfImg, 'Чертеж (PDF)')
+      }
+    }
+    if (viewerRef.value) {
+      const threeImg = await viewerRef.value.takeScreenshot()
+      if (threeImg) {
+        await addImage(threeImg, '3D модель')
+      }
+    }
+    const report = viewerRef.value?.getMeasurementReport?.()
+    if (y > pageH - 40) {
+      doc.addPage()
+      y = margin
+    }
+    doc.setFontSize(12)
+    doc.text('Измерения', margin, y)
+    y += lineH + 2
+    doc.setFontSize(10)
+    if (report) {
+      doc.text(`Длина: ${report.length.toFixed(2)} мм`, margin, y)
+      y += lineH
+      doc.text(`ΔX: ${report.dx.toFixed(2)} мм  ΔY: ${report.dy.toFixed(2)} мм  ΔZ: ${report.dz.toFixed(2)} мм`, margin, y)
+    } else {
+      doc.text('Измерения не проведены', margin, y)
+    }
+    const name = viewerRef.value?.getLoadedFileName?.() || pdfFile.value?.name || 'report'
+    const base = name.replace(/\.[^.]+$/, '') || 'report'
+    const date = new Date().toISOString().slice(0, 10)
+    doc.save(`Отчет_${base}_${date}.pdf`)
+  } catch (e) {
+    console.error('Export report:', e)
+    alert('Не удалось сформировать отчёт')
+  }
 }
 
 function onSectionMode() {
@@ -141,10 +246,23 @@ function closeScreenshotModal() {
 
 const showPdfPanel = () => viewMode.value === '2d' || viewMode.value === 'split'
 const show3dPanel = () => viewMode.value === '3d' || viewMode.value === 'split'
+
+onMounted(() => {
+  window.addEventListener('dragover', onDragOver)
+  window.addEventListener('drop', onDrop)
+  window.addEventListener('dragleave', onDragLeave)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('dragover', onDragOver)
+  window.removeEventListener('drop', onDrop)
+  window.removeEventListener('dragleave', onDragLeave)
+})
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="{ 'is-dragging-file': isDraggingFile }">
+    <div v-if="isDraggingFile" class="drop-overlay">Отпустите файл (PDF или 3D)</div>
     <ViewerToolbar
       :view-mode="viewMode"
       :section-mode="sectionMode"
@@ -166,6 +284,7 @@ const show3dPanel = () => viewMode.value === '3d' || viewMode.value === 'split'
       @clear-measurements="onClearMeasurements"
       @export-glb="onExportGlb"
       @export-stl="onExportStl"
+      @export-report="onExportReport"
     />
     <div class="content" :class="'mode-' + viewMode">
       <div v-show="showPdfPanel()" class="panel pdf-panel">
@@ -204,6 +323,23 @@ const show3dPanel = () => viewMode.value === '3d' || viewMode.value === 'split'
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
+  position: relative;
+}
+.app.is-dragging-file {
+  outline: 3px dashed #646cff;
+  outline-offset: -3px;
+}
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.2rem;
+  color: #fff;
+  pointer-events: none;
+  z-index: 500;
 }
 .content {
   flex: 1;

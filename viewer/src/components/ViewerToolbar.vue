@@ -30,6 +30,7 @@ const emit = defineEmits<{
   'clear-measurements': []
   'export-glb': []
   'export-stl': []
+  'export-report': []
 }>()
 
 function clampOffset(v: number) {
@@ -160,6 +161,7 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
         <button type="button" class="group-btn" @click="emit('screenshot')">Скриншот</button>
         <button type="button" class="group-btn" @click="emit('export-glb')">Экспорт GLB</button>
         <button type="button" class="group-btn" @click="emit('export-stl')">Экспорт STL</button>
+        <button type="button" class="group-btn" @click="emit('export-report')">Отчёт PDF</button>
       </div>
     </div>
   </header>

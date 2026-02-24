@@ -670,10 +670,28 @@ onUnmounted(() => {
   }
 })
 
+function loadModelFile(file: File) {
+  handleFile(file)
+}
+
+function getMeasurementReport(): { length: number; dx: number; dy: number; dz: number } | null {
+  if (measurementPoints.length !== 2) return null
+  const p0 = measurementPoints[0]
+  const p1 = measurementPoints[1]
+  return {
+    length: p0.distanceTo(p1),
+    dx: p1.x - p0.x,
+    dy: p1.y - p0.y,
+    dz: p1.z - p0.z,
+  }
+}
+
 defineExpose({
   openFileDialog,
+  loadModelFile,
   takeScreenshot,
   getLoadedFileName: () => loadedFileName,
+  getMeasurementReport,
   resetView,
   setSectionAxis,
   setSectionOffset,

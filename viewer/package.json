@@ -16,6 +16,7 @@
     "vite-plugin-wasm": "^3.5.0"
   },
   "dependencies": {
+    "jspdf": "^4.2.0",
     "opencascade.js": "^2.0.0-beta.b5ff984",
     "pdfjs-dist": "^5.4.624",
     "three": "^0.183.1",
