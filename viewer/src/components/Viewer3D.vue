@@ -227,13 +227,63 @@ function handleFile(file: File) {
         })
       return
     }
-    if (ext === 'dxf') {
-      console.warn('формат: DXF — пока не реализовано')
+    if (ext === 'jt') {
+      console.log('формат: JT — отправка на конвертер')
       console.groupEnd()
+      isLoading.value = true
+      const baseUrl = (import.meta as any).env?.VITE_CONVERTER_URL ?? ''
+      const converterBase = baseUrl ? baseUrl.replace(/\/$/, '') : ''
+      const useProxy = import.meta.env.DEV && !converterBase
+      const convertUrl = useProxy ? '/api/convert/jt' : (converterBase ? `${converterBase}/convert/jt` : '')
+      if (!convertUrl) {
+        console.error(`${LOG_PREFIX} VITE_CONVERTER_URL не задан`)
+        isLoading.value = false
+        alert('Конвертер JT не настроен (VITE_CONVERTER_URL)')
+        return
+      }
+      const formData = new FormData()
+      formData.append('file', file)
+      fetch(convertUrl, {
+        method: 'POST',
+        body: formData,
+      })
+        .then(async (res) => {
+          console.log(`${LOG_PREFIX} JT fetch response ok:`, res.ok, res.status)
+          if (!res.ok) {
+            const text = await res.text()
+            let msg = res.statusText
+            try {
+              const body = JSON.parse(text)
+              msg = body.detail ? `${body.error || ''}: ${body.detail}` : (body.error || msg)
+            } catch (_) {
+              if (text) msg = text.slice(0, 200)
+            }
+            throw new Error(msg)
+          }
+          return res.blob()
+        })
+        .then((blob) => {
+          console.log(`${LOG_PREFIX} JT blob size:`, blob.size, blob.type)
+          const url = URL.createObjectURL(blob)
+          return loadGlbUrl(url, performance.now())
+        })
+        .then(() => {
+          console.log(`${LOG_PREFIX} JT loadGlbUrl done`)
+          loadedFileName = file.name
+        })
+        .catch((err) => {
+          console.error(`${LOG_PREFIX} Ошибка конвертации JT:`, err)
+          alert('Ошибка конвертации JT: ' + (err instanceof Error ? err.message : String(err)))
+        })
+        .finally(() => {
+          console.log(`${LOG_PREFIX} JT finally, loading=false`)
+          isLoading.value = false
+        })
       return
     }
-    console.warn('формат: неизвестный, расширение:', ext)
+    console.warn('формат: неизвестный или не поддерживается, расширение:', ext)
     console.groupEnd()
+    alert('Формат не поддерживается')
   }
   reader.onerror = () => {
     console.error(`${LOG_PREFIX} Ошибка чтения файла:`, file.name, reader.error)
