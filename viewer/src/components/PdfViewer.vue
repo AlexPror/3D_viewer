@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watch, onUnmounted, nextTick } from 'vue'
+import { ref, watch, onUnmounted } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
+import { logger } from '../lib/logger'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
@@ -12,110 +13,104 @@ const props = defineProps<{
   pdfName?: string
 }>()
 
-const canvasRef = ref<HTMLCanvasElement | null>(null)
-const currentPage = ref(1)
-const totalPages = ref(0)
 const loading = ref(false)
 const error = ref<string | null>(null)
+const totalPages = ref(0)
+const screenshotPage = ref(1)
 
 let pdfDoc: pdfjsLib.PDFDocumentProxy | null = null
 
-const LOG = '[PdfViewer]'
-
-async function loadPdf() {
-  if (!props.pdfUrl) {
-    console.log(LOG, 'loadPdf skip: no pdfUrl')
-    return
-  }
-  console.log(LOG, 'loadPdf start', props.pdfUrl)
-  loading.value = true
-  error.value = null
-  try {
-    const loadingTask = pdfjsLib.getDocument({ url: props.pdfUrl })
-    pdfDoc = await loadingTask.promise
-    totalPages.value = pdfDoc.numPages
-    currentPage.value = 1
-    console.log(LOG, 'doc loaded, pages:', pdfDoc.numPages)
-  } catch (e) {
-    console.error(LOG, 'loadPdf error', e)
-    error.value = e instanceof Error ? e.message : 'Ошибка загрузки PDF'
-  } finally {
-    loading.value = false
-    console.log(LOG, 'finally: loading=false, nextTick')
-    await nextTick()
-    if (totalPages.value > 0) {
-      console.log(LOG, 'calling renderPage(1), canvasRef:', !!canvasRef.value)
-      await renderPage(1)
-      console.log(LOG, 'renderPage(1) done')
-    }
-  }
-}
-
-async function renderPage(num: number) {
-  console.log(LOG, 'renderPage', num, 'pdfDoc:', !!pdfDoc, 'canvasRef:', !!canvasRef.value)
-  if (!pdfDoc || !canvasRef.value) {
-    console.warn(LOG, 'renderPage early return: no doc or canvas')
-    return
-  }
-  const page = await pdfDoc.getPage(num)
-  const ctx = canvasRef.value.getContext('2d')
-  if (!ctx) {
-    console.warn(LOG, 'renderPage: no 2d context')
-    return
-  }
-  const scale = window.devicePixelRatio || 1
-  const viewport = page.getViewport({ scale })
-  canvasRef.value.width = viewport.width
-  canvasRef.value.height = viewport.height
-  canvasRef.value.style.width = viewport.width / scale + 'px'
-  canvasRef.value.style.height = viewport.height / scale + 'px'
-  console.log(LOG, 'renderPage', num, 'drawing viewport', viewport.width, 'x', viewport.height)
-  await page.render({
-    canvasContext: ctx,
-    viewport,
-  }).promise
-  console.log(LOG, 'renderPage', num, 'done')
-}
-
-function prevPage() {
-  console.log(LOG, 'prevPage', currentPage.value)
-  if (currentPage.value <= 1) return
-  currentPage.value--
-  renderPage(currentPage.value)
-}
-
-function nextPage() {
-  console.log(LOG, 'nextPage', currentPage.value)
-  if (currentPage.value >= totalPages.value) return
-  currentPage.value++
-  renderPage(currentPage.value)
-}
+const SCREENSHOT_SCALE = 2
+const MAX_CANVAS_DIM = 4096
 
 watch(
   () => props.pdfUrl,
-  (url) => {
-    console.log(LOG, 'watch pdfUrl', url)
-    if (url) loadPdf()
-    else {
+  async (url) => {
+    if (!url) {
       pdfDoc = null
       totalPages.value = 0
-      currentPage.value = 1
+      screenshotPage.value = 1
+      return
+    }
+    logger.info('PdfViewer', `Загрузка PDF для скриншота: ${props.pdfName || url}`)
+    loading.value = true
+    error.value = null
+    try {
+      const loadingTask = pdfjsLib.getDocument({ url })
+      pdfDoc = await loadingTask.promise
+      totalPages.value = pdfDoc.numPages
+      screenshotPage.value = 1
+      logger.info('PdfViewer', `PDF загружен: ${pdfDoc.numPages} стр. (iframe + скриншот)`)
+    } catch (e) {
+      logger.error('PdfViewer', 'Ошибка загрузки PDF', e)
+      error.value = e instanceof Error ? e.message : 'Ошибка загрузки PDF'
+      pdfDoc = null
+      totalPages.value = 0
+    } finally {
+      loading.value = false
     }
   },
   { immediate: true }
 )
 
-function getCurrentPageImageUrl(): string {
-  if (!canvasRef.value) return ''
-  return canvasRef.value.toDataURL('image/png') || ''
+async function getCurrentPageImageUrlAsync(pageNum?: number): Promise<string> {
+  const page = pageNum ?? screenshotPage.value
+  logger.info('PdfViewer', `getCurrentPageImageUrlAsync: page=${page}, pdfDoc=${!!pdfDoc}, totalPages=${totalPages.value}`)
+  if (!pdfDoc || page < 1 || page > totalPages.value) {
+    logger.warn('PdfViewer', `getCurrentPageImageUrlAsync: выход без рендера (нет документа или неверная страница)`)
+    return ''
+  }
+  try {
+    const p = await pdfDoc.getPage(page)
+    const viewport = p.getViewport({ scale: SCREENSHOT_SCALE })
+    let w = Math.ceil(viewport.width)
+    let h = Math.ceil(viewport.height)
+    if (w > MAX_CANVAS_DIM || h > MAX_CANVAS_DIM) {
+      const scale = Math.min(MAX_CANVAS_DIM / w, MAX_CANVAS_DIM / h)
+      w = Math.ceil(w * scale)
+      h = Math.ceil(h * scale)
+    }
+    const finalViewport = p.getViewport({
+      scale: (viewport.scale * w) / viewport.width,
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) {
+      logger.warn('PdfViewer', 'getCurrentPageImageUrlAsync: не удалось получить 2D контекст')
+      return ''
+    }
+    await p.render({
+      canvasContext: ctx,
+      viewport: finalViewport,
+    }).promise
+    const dataUrl = canvas.toDataURL('image/png') || ''
+    logger.info('PdfViewer', `getCurrentPageImageUrlAsync: страница ${page} отрендерена ${w}×${h}, dataURL длина=${dataUrl.length}`)
+    return dataUrl
+  } catch (e) {
+    logger.error('PdfViewer', 'getCurrentPageImageUrlAsync: ошибка рендера страницы', e)
+    return ''
+  }
 }
 
-defineExpose({
-  getCurrentPageImageUrl,
-})
+function clearMeasurements() {
+  /* измерения в PDF отключены */
+}
 
 onUnmounted(() => {
   pdfDoc = null
+})
+
+defineExpose({
+  getCurrentPageImageUrlAsync,
+  get screenshotPage() {
+    return screenshotPage.value
+  },
+  get totalPages() {
+    return totalPages.value
+  },
+  clearMeasurements,
 })
 </script>
 
@@ -123,14 +118,24 @@ onUnmounted(() => {
   <div class="pdf-viewer">
     <div v-if="loading" class="pdf-loading">Загрузка PDF…</div>
     <div v-else-if="error" class="pdf-error">{{ error }}</div>
-    <template v-else-if="totalPages > 0">
+    <template v-else>
       <div class="pdf-toolbar">
-        <button type="button" :disabled="currentPage <= 1" @click="prevPage">← Назад</button>
-        <span class="page-info">{{ currentPage }} / {{ totalPages }}</span>
-        <button type="button" :disabled="currentPage >= totalPages" @click="nextPage">Вперёд →</button>
+        <label class="pdf-screenshot-label">
+          Страница для скриншота:
+          <select v-model.number="screenshotPage" class="pdf-page-select">
+            <option v-for="n in totalPages" :key="n" :value="n">{{ n }}</option>
+          </select>
+          <span class="pdf-total-pages">из {{ totalPages }}</span>
+        </label>
       </div>
-      <div class="pdf-canvas-wrap">
-        <canvas ref="canvasRef" class="pdf-canvas" />
+      <div class="pdf-iframe-wrap">
+        <iframe
+          v-if="pdfUrl"
+          :src="pdfUrl"
+          class="pdf-iframe"
+          title="Просмотр PDF"
+        />
+        <div v-else class="pdf-placeholder">Нет PDF</div>
       </div>
     </template>
   </div>
@@ -158,27 +163,50 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.75rem;
+  gap: 0.5rem;
   padding: 0.5rem;
   background: #252525;
   border-bottom: 1px solid #333;
 }
-.page-info {
+.pdf-screenshot-label {
   font-size: 0.9rem;
   color: #ccc;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
 }
-.pdf-canvas-wrap {
+.pdf-page-select {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.9rem;
+  background: #333;
+  color: #eee;
+  border: 1px solid #444;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.pdf-total-pages {
+  color: #888;
+  font-size: 0.85rem;
+}
+.pdf-iframe-wrap {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   display: flex;
-  justify-content: center;
-  padding: 1rem;
 }
-.pdf-canvas {
-  max-width: 100%;
-  height: auto;
+.pdf-iframe {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: none;
   background: #fff;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.pdf-placeholder {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  font-size: 0.95rem;
 }
 </style>

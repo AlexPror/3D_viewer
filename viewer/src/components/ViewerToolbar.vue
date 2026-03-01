@@ -1,6 +1,7 @@
 <script setup lang="ts">
-export type ViewMode = '2d' | '3d' | 'split'
+export type ViewMode = '2d' | '3d' | 'split' | 'log'
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
+export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance'
 
 const SECTION_OFFSET_MIN = -2000
 const SECTION_OFFSET_MAX = 2000
@@ -13,6 +14,7 @@ defineProps<{
   sectionOffset?: number
   measureMode?: boolean
   measureSnapMode?: MeasureSnapMode
+  measureType?: MeasureType
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +29,7 @@ const emit = defineEmits<{
   'update:sectionOffset': [value: number]
   'measure': []
   'update:measureSnapMode': [value: MeasureSnapMode]
+  'update:measureType': [value: MeasureType]
   'clear-measurements': []
   'export-glb': []
   'export-stl': []
@@ -82,6 +85,15 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
             @click="emit('update:viewMode', 'split')"
           >
             Совм.
+          </button>
+          <button
+            type="button"
+            class="mode-btn"
+            :class="{ active: viewMode === 'log' }"
+            @click="emit('update:viewMode', 'log')"
+            title="Панель логов"
+          >
+            Лог
           </button>
         </div>
       </div>
@@ -145,6 +157,18 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
           Измерение
         </button>
         <button type="button" class="group-btn" @click="emit('clear-measurements')">Очистить</button>
+        <select
+          class="measure-type-select"
+          :value="measureType ?? 'distance'"
+          @change="emit('update:measureType', ($event.target as HTMLSelectElement).value as MeasureType)"
+          title="Тип измерения"
+        >
+          <option value="distance">Расстояние</option>
+          <option value="radius">Радиус</option>
+          <option value="diameter">Диаметр</option>
+          <option value="arc">Длина дуги</option>
+          <option value="hole-center-distance">Расст. между центрами отверстий</option>
+        </select>
         <select
           class="snap-select"
           :value="measureSnapMode ?? 'intersection'"
@@ -316,6 +340,7 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
   width: 5rem;
   vertical-align: middle;
 }
+.measure-type-select,
 .snap-select {
   padding: 0.25rem 0.4rem;
   font-size: 0.78rem;
