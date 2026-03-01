@@ -7,11 +7,16 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  close: []
+  close: [dataUrl: string | null]
+  'final-image': [dataUrl: string]
 }>()
 
+function getCanvasDataUrl(): string | null {
+  return canvasRef.value?.toDataURL('image/png') ?? null
+}
+
 const canvasRef = ref<HTMLCanvasElement | null>(null)
-const tool = ref<'arrow' | 'rect' | 'ellipse' | 'text'>('arrow')
+const tool = ref<'crop' | 'arrow' | 'rect' | 'ellipse' | 'text'>('crop')
 const isDrawing = ref(false)
 const startX = ref(0)
 const startY = ref(0)
@@ -332,6 +337,10 @@ function onMouseDown(e: MouseEvent) {
   const pos = getMousePos(e)
   startX.value = pos.x
   startY.value = pos.y
+  if (tool.value === 'crop') {
+    isDrawing.value = true
+    return
+  }
   if (tool.value === 'text') {
     closeTextOverlay()
     const hit = hitTestText(pos)
@@ -354,6 +363,18 @@ function onMouseMove(e: MouseEvent) {
   if (!isDrawing.value || !ctx) return
   const pos = getMousePos(e)
   redraw()
+  if (tool.value === 'crop') {
+    ctx.strokeStyle = '#0a0'
+    ctx.lineWidth = 2
+    ctx.setLineDash([6, 4])
+    const x1 = Math.min(startX.value, pos.x)
+    const y1 = Math.min(startY.value, pos.y)
+    const w = Math.abs(pos.x - startX.value)
+    const h = Math.abs(pos.y - startY.value)
+    ctx.strokeRect(x1, y1, w, h)
+    ctx.setLineDash([])
+    return
+  }
   ctx.strokeStyle = currentStrokeColor.value
   ctx.lineWidth = 2
   if (tool.value === 'arrow') drawArrow(ctx, startX.value, startY.value, pos.x, pos.y, currentStrokeColor.value)
@@ -372,6 +393,49 @@ function onMouseMove(e: MouseEvent) {
 function onMouseUp(e: MouseEvent) {
   if (!isDrawing.value) return
   const pos = getMousePos(e)
+  if (tool.value === 'crop') {
+    const x1 = Math.min(startX.value, pos.x)
+    const y1 = Math.min(startY.value, pos.y)
+    let w = Math.abs(pos.x - startX.value)
+    let h = Math.abs(pos.y - startY.value)
+    if (w < 10 || h < 10) {
+      isDrawing.value = false
+      redraw()
+      return
+    }
+    const src = canvasRef.value
+    if (!src || !ctx) {
+      isDrawing.value = false
+      return
+    }
+    const off = document.createElement('canvas')
+    off.width = w
+    off.height = h
+    const offCtx = off.getContext('2d')
+    if (!offCtx) {
+      isDrawing.value = false
+      redraw()
+      return
+    }
+    offCtx.drawImage(src, x1, y1, w, h, 0, 0, w, h)
+    src.width = w
+    src.height = h
+    canvasWidth.value = w
+    canvasHeight.value = h
+    ctx = src.getContext('2d')
+    if (ctx) ctx.drawImage(off, 0, 0)
+    const croppedImg = new Image()
+    croppedImg.onload = () => {
+      img = croppedImg
+      shapes.value = []
+      selectedTextIndex.value = null
+      pendingNewText.value = null
+      redraw()
+    }
+    croppedImg.src = src.toDataURL('image/png')
+    isDrawing.value = false
+    return
+  }
   const dx = Math.abs(pos.x - startX.value)
   const dy = Math.abs(pos.y - startY.value)
   if ((dx > 3 || dy > 3) && (tool.value === 'arrow' || tool.value === 'rect' || tool.value === 'ellipse')) {
@@ -390,17 +454,16 @@ function onMouseUp(e: MouseEvent) {
 
 function saveToFile() {
   if (!canvasRef.value) return
+  const dataUrl = canvasRef.value.toDataURL('image/png')
   const a = document.createElement('a')
-  a.href = canvasRef.value.toDataURL('image/png')
+  a.href = dataUrl
   const baseName = props.suggestedFileName?.replace(/\.[^.]+$/, '') ?? ''
   const safe = baseName ? baseName.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || undefined : undefined
   a.download = safe ? `${safe}.png` : `screenshot-${Date.now()}.png`
   a.click()
+  emit('final-image', dataUrl)
 }
 
-function sendToChat() {
-  alert('Отправка в чат — заглушка. Здесь будет интеграция с чатом проекта.')
-}
 
 watch(editingText, () => {
   if (selectedTextIndex.value !== null) {
@@ -443,13 +506,14 @@ watch(() => props.imageUrl, () => loadImage())
 </script>
 
 <template>
-  <div class="modal-overlay" @click.self="emit('close')">
+  <div class="modal-overlay" @click.self="emit('close', getCanvasDataUrl())">
     <div class="modal">
       <div class="modal-header">
         <span>Редактор скриншота</span>
-        <button type="button" class="btn-close" @click="emit('close')">×</button>
+        <button type="button" class="btn-close" @click="emit('close', getCanvasDataUrl())">×</button>
       </div>
       <div class="toolbar">
+        <button type="button" :class="{ active: tool === 'crop' }" @click="tool = 'crop'" title="Выделите область — лишнее обрежется">Обрезать</button>
         <button type="button" :class="{ active: tool === 'arrow' }" @click="tool = 'arrow'">Стрелка</button>
         <button type="button" :class="{ active: tool === 'rect' }" @click="tool = 'rect'">Прямоугольник</button>
         <button type="button" :class="{ active: tool === 'ellipse' }" @click="tool = 'ellipse'">Эллипс</button>
@@ -460,12 +524,11 @@ watch(() => props.imageUrl, () => loadImage())
           <label class="toolbar-label">Цвет:</label>
           <input v-model="textColorModel" type="color" class="toolbar-input-color" />
         </template>
-        <template v-else>
+        <template v-else-if="tool !== 'crop'">
           <label class="toolbar-label">Цвет:</label>
           <input v-model="currentStrokeColor" type="color" class="toolbar-input-color" />
         </template>
         <button type="button" @click="saveToFile">Сохранить на ПК</button>
-        <button type="button" @click="sendToChat">Отправить в чат</button>
       </div>
       <div v-if="tool === 'text'" class="text-hint">Кликните на изображение — откроется блок. Перетащите за полоску «Перетащить» или за край блока. Удалить: кнопка или Delete.</div>
       <div class="canvas-wrap">
@@ -519,7 +582,8 @@ watch(() => props.imageUrl, () => loadImage())
   z-index: 1000;
 }
 .modal {
-  background: #252525;
+  background: #1a2238;
+  border: 1px solid #3a4a6a;
   border-radius: 8px;
   max-width: 95vw;
   max-height: 95vh;
@@ -528,16 +592,19 @@ watch(() => props.imageUrl, () => loadImage())
   overflow: hidden;
 }
 .modal-header {
+  flex-shrink: 0;
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid #444;
+  border-bottom: 1px solid #3a4a6a;
+  background: #1e2433;
+  color: #e0e8f0;
 }
 .btn-close {
   background: none;
   border: none;
-  color: #aaa;
+  color: #8a9bb5;
   font-size: 1.5rem;
   cursor: pointer;
   padding: 0 0.5rem;
@@ -546,58 +613,61 @@ watch(() => props.imageUrl, () => loadImage())
   color: #fff;
 }
 .toolbar {
+  flex-shrink: 0;
   display: flex;
   flex-wrap: wrap;
   gap: 0.25rem;
   padding: 0.5rem;
-  border-bottom: 1px solid #444;
+  border-bottom: 1px solid #3a4a6a;
+  background: #1e2433;
 }
 .toolbar button {
   padding: 0.35rem 0.6rem;
   font-size: 0.85rem;
-  background: #333;
-  color: #e0e0e0;
-  border: 1px solid #555;
+  background: #2d3a52;
+  color: #e0e8f0;
+  border: 1px solid #4a5f7a;
   border-radius: 4px;
   cursor: pointer;
 }
 .toolbar button:hover {
-  background: #444;
+  background: #3d4a62;
+  border-color: #5a6f8a;
 }
 .toolbar button.active {
-  background: #646cff;
-  border-color: #646cff;
+  background: #4a6fc7;
+  border-color: #5a7fd7;
 }
 .toolbar-label {
   font-size: 0.85rem;
-  color: #aaa;
+  color: #8a9bb5;
   margin-left: 0.5rem;
 }
 .toolbar-input-num {
   width: 3rem;
   padding: 0.2rem 0.3rem;
   font-size: 0.85rem;
-  background: #333;
+  background: #2d3a52;
   color: #eee;
-  border: 1px solid #555;
+  border: 1px solid #4a5f7a;
   border-radius: 4px;
 }
 .toolbar-input-color {
   width: 2rem;
   height: 1.6rem;
   padding: 0;
-  border: 1px solid #555;
+  border: 1px solid #4a5f7a;
   border-radius: 4px;
   cursor: pointer;
-  background: #333;
+  background: #2d3a52;
 }
 .text-row {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.4rem 0.5rem;
-  background: #2a2a2a;
-  border-bottom: 1px solid #444;
+  background: #232d42;
+  border-bottom: 1px solid #3a4a6a;
 }
 .text-label {
   font-size: 0.85rem;
@@ -618,15 +688,19 @@ watch(() => props.imageUrl, () => loadImage())
   color: #888;
 }
 .text-hint {
+  flex-shrink: 0;
   font-size: 0.8rem;
-  color: #999;
+  color: #8a9bb5;
   padding: 0.3rem 0.5rem;
-  border-bottom: 1px solid #333;
+  border-bottom: 1px solid #3a4a6a;
+  background: #1e2433;
 }
 .canvas-wrap {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 0.5rem;
-  max-height: 70vh;
+  background: #252525;
 }
 .canvas-container {
   position: relative;

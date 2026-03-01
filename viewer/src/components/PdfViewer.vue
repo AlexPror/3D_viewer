@@ -94,6 +94,27 @@ async function getCurrentPageImageUrlAsync(pageNum?: number): Promise<string> {
   }
 }
 
+async function getPageTextContent(pageNum: number): Promise<string> {
+  if (!pdfDoc || pageNum < 1 || pageNum > totalPages.value) return ''
+  try {
+    const p = await pdfDoc.getPage(pageNum)
+    const content = await p.getTextContent()
+    const parts: string[] = []
+    let lastY: number | null = null
+    for (const item of content.items) {
+      const t = 'transform' in item && Array.isArray(item.transform) ? item.transform : []
+      const y = t[5] ?? 0
+      if (lastY !== null && Math.abs(y - lastY) > 2) parts.push('\n')
+      lastY = y
+      parts.push('str' in item ? (item as { str: string }).str : '')
+    }
+    return parts.join(' ').replace(/\n /g, '\n').trim()
+  } catch (e) {
+    logger.error('PdfViewer', 'getPageTextContent: ошибка', e)
+    return ''
+  }
+}
+
 function clearMeasurements() {
   /* измерения в PDF отключены */
 }
@@ -102,11 +123,14 @@ onUnmounted(() => {
   pdfDoc = null
 })
 
+function getScreenshotPage(): number {
+  return screenshotPage.value
+}
+
 defineExpose({
   getCurrentPageImageUrlAsync,
-  get screenshotPage() {
-    return screenshotPage.value
-  },
+  getPageTextContent,
+  getScreenshotPage,
   get totalPages() {
     return totalPages.value
   },
@@ -147,7 +171,7 @@ defineExpose({
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  background: #1a1a1a;
+  background: #1a2228;
 }
 .pdf-loading,
 .pdf-error {

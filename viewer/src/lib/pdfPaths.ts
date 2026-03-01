@@ -298,7 +298,7 @@ export function hitTestSegment(
       snapX = segment.cx + segment.r * Math.cos(angle)
       snapY = segment.cy + segment.r * Math.sin(angle)
     }
-    return { hit, snapX, snapY, distSq: distToCircle * distToCircle }
+    return { hit, snapX, snapY, distSq }
   }
   return { hit: false, snapX: pdfX, snapY: pdfY, distSq: Infinity }
 }

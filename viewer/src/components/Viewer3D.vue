@@ -38,6 +38,9 @@ let measurementPerpLine: THREE.Line | null = null
 let measurementCircleMesh: THREE.LineLoop | null = null
 let measurementCircleMesh2: THREE.LineLoop | null = null
 let measurementArcPathLine: THREE.Line | null = null
+/** Геометрии двух плоскостей для режима «расстояние» (в мировых координатах), чтобы подсвечивать их на скриншоте */
+let measurementFaceGeometries: THREE.BufferGeometry[] = []
+let measurementPlanesGroup: THREE.Group
 let measurementLabelEl: HTMLDivElement | null = null
 let measurementPerpLabelEl: HTMLDivElement | null = null
 let measurementExtraLabelEl: HTMLDivElement | null = null
@@ -129,6 +132,8 @@ function initScene() {
   scene.add(measureGroup)
   highlightGroup = new THREE.Group()
   scene.add(highlightGroup)
+  measurementPlanesGroup = new THREE.Group()
+  scene.add(measurementPlanesGroup)
 
   const axesSize = 100
   axesHelper = new THREE.Group()
@@ -984,23 +989,67 @@ function onCanvasClick(ev: MouseEvent) {
   }
   if (hits.length === 0) {
     logger.info('Viewer3D', 'Клик в режиме измерений: луч не попал в модель (hits.length === 0)')
-    if (measurementPoints.length >= 2) clearMeasurements()
     return
   }
   const hit = hits[0]
   const mesh = hit.object as THREE.Mesh
-  const worldNormal = hit.face!.normal.clone().transformDirection(mesh.matrixWorld).normalize()
+  const face = hit.face!
+  const pos = mesh.geometry.attributes.position
+  const faceIndex =
+    typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
+      ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
+      : Math.floor(face.a / 3)
+  const worldNormal = face.normal.clone().transformDirection(mesh.matrixWorld).normalize()
   const candidates = getSnapCandidates(hit)
   const closest = getClosestSnapPoint(candidates, camera, mouse)
   const point = (closest ?? getPointFromHit(hit)).clone()
+
+  const buildFaceGeometryForHighlight = (): THREE.BufferGeometry | null => {
+    const geom =
+      getCoplanarFaceGeometry(mesh, faceIndex) ??
+      (pos
+        ? (() => {
+            const vA = new THREE.Vector3(
+              pos.getX(face.a),
+              pos.getY(face.a),
+              pos.getZ(face.a),
+            ).applyMatrix4(mesh.matrixWorld)
+            const vB = new THREE.Vector3(
+              pos.getX(face.b),
+              pos.getY(face.b),
+              pos.getZ(face.b),
+            ).applyMatrix4(mesh.matrixWorld)
+            const vC = new THREE.Vector3(
+              pos.getX(face.c),
+              pos.getY(face.c),
+              pos.getZ(face.c),
+            ).applyMatrix4(mesh.matrixWorld)
+            const g = new THREE.BufferGeometry().setAttribute(
+              'position',
+              new THREE.Float32BufferAttribute(
+                [vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z],
+                3,
+              ),
+            )
+            g.computeVertexNormals()
+            return g
+          })()
+        : null)
+    return geom ? geom.clone() : null
+  }
+
   if (measurementPoints.length >= 2) {
     clearMeasurements()
     measurementPoints = [point]
     measurementPointNormals = [worldNormal]
+    const faceGeom = buildFaceGeometryForHighlight()
+    if (faceGeom) measurementFaceGeometries.push(faceGeom)
   } else {
     measurementPoints.push(point)
     const normalToPush = worldNormal ?? (measurementPointNormals.length > 0 ? measurementPointNormals[0] : null)
     measurementPointNormals.push(normalToPush)
+    const faceGeom = buildFaceGeometryForHighlight()
+    if (faceGeom) measurementFaceGeometries.push(faceGeom)
     logger.info('Viewer3D', `Точка измерения добавлена (distance), всего точек: ${measurementPoints.length}`)
   }
   if (measurementPoints.length === 2 || measurementPoints.length === 3) {
@@ -1474,6 +1523,26 @@ function updateMeasurementGraphics() {
     measureGroup.add(measurementArcPathLine)
   }
   if (measureType !== 'distance' && measureType !== 'hole-center-distance' && !(measureType === 'diameter' && measurementPoints.length === 2)) return
+  while (measurementPlanesGroup.children.length) {
+    const c = measurementPlanesGroup.children[0]
+    measurementPlanesGroup.remove(c)
+    if ('geometry' in c && c.geometry) c.geometry.dispose()
+    if ('material' in c && c.material) (c.material as THREE.Material).dispose()
+  }
+  if (measureType === 'distance' && measurementPoints.length === 2 && measurementFaceGeometries.length === 2) {
+    const planeMat = new THREE.MeshBasicMaterial({
+      color: 0x4488ff,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      depthTest: true,
+    })
+    for (const geom of measurementFaceGeometries) {
+      const mesh = new THREE.Mesh(geom, planeMat.clone())
+      measurementPlanesGroup.add(mesh)
+    }
+  }
   if (measurementPoints.length === 3) {
     const [p0, p1, p2] = measurementPoints
     const segs = [
@@ -1556,6 +1625,14 @@ function clearMeasurements() {
   measurementTriangleLines = []
   measurementPoints = []
   measurementPointNormals = []
+  for (const g of measurementFaceGeometries) g.dispose()
+  measurementFaceGeometries = []
+  while (measurementPlanesGroup.children.length) {
+    const c = measurementPlanesGroup.children[0]
+    measurementPlanesGroup.remove(c)
+    if ('geometry' in c && c.geometry) c.geometry.dispose()
+    if ('material' in c && c.material) (c.material as THREE.Material).dispose()
+  }
   if (measurementPerpLine) {
     measureGroup.remove(measurementPerpLine)
     measurementPerpLine.geometry.dispose()
@@ -1616,6 +1693,8 @@ function setMeasureType(type: MeasureType) {
   if (type !== 'distance') {
     measurementPoints = []
     measurementPointNormals = []
+    for (const g of measurementFaceGeometries) g.dispose()
+    measurementFaceGeometries = []
   }
   radiusOrDiameterResult = null
   arcResult = null
@@ -2183,8 +2262,19 @@ function getMeasurementReport():
   if (measurementPoints.length === 2) {
     const p0 = measurementPoints[0]
     const p1 = measurementPoints[1]
+    const nA = measurementPointNormals[0] ?? null
+    const nB = measurementPointNormals[1] ?? null
+    let lengthVal = p0.distanceTo(p1)
+    if (nA || nB) {
+      const baseNormal = (nB || nA)!.clone().normalize()
+      const basePoint = nB ? p1 : p0
+      const otherPoint = nB ? p0 : p1
+      const v = otherPoint.clone().sub(basePoint)
+      const distSigned = v.dot(baseNormal)
+      lengthVal = Math.abs(distSigned)
+    }
     return {
-      length: p0.distanceTo(p1),
+      length: lengthVal,
       dx: p1.x - p0.x,
       dy: p1.y - p0.y,
       dz: p1.z - p0.z,

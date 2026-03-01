@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "jspdf": "^4.2.0",
+    "jspdf-autotable": "^5.0.7",
     "opencascade.js": "^2.0.0-beta.b5ff984",
     "pdfjs-dist": "^5.4.624",
     "three": "^0.183.1",

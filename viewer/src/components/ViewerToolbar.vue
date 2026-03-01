@@ -22,7 +22,8 @@ const emit = defineEmits<{
   'open-pdf': []
   'open-file': []
   'reset-view': []
-  'screenshot': []
+  'screenshot-2d': []
+  'screenshot-3d': []
   'section-mode': []
   'fix-section': []
   'clear-section': []
@@ -182,10 +183,11 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
       </div>
       <div class="group group-export">
         <span class="group-label">Экспорт</span>
-        <button type="button" class="group-btn" @click="emit('screenshot')">Скриншот</button>
+        <button type="button" class="group-btn" @click="emit('screenshot-2d')">Скриншот 2D</button>
+        <button type="button" class="group-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
         <button type="button" class="group-btn" @click="emit('export-glb')">Экспорт GLB</button>
         <button type="button" class="group-btn" @click="emit('export-stl')">Экспорт STL</button>
-        <button type="button" class="group-btn" @click="emit('export-report')">Отчёт PDF</button>
+        <button type="button" class="group-btn" @click="emit('export-report')">Отчёт из скриншотов</button>
       </div>
     </div>
   </header>
