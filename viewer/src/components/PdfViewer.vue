@@ -127,6 +127,10 @@ function getScreenshotPage(): number {
   return screenshotPage.value
 }
 
+const emit = defineEmits<{
+  'screenshot-2d': []
+}>()
+
 defineExpose({
   getCurrentPageImageUrlAsync,
   getPageTextContent,
@@ -144,13 +148,15 @@ defineExpose({
     <div v-else-if="error" class="pdf-error">{{ error }}</div>
     <template v-else>
       <div class="pdf-toolbar">
+        <span class="pdf-toolbar-title">2D PDF</span>
         <label class="pdf-screenshot-label">
-          Страница для скриншота:
+          Страница:
           <select v-model.number="screenshotPage" class="pdf-page-select">
             <option v-for="n in totalPages" :key="n" :value="n">{{ n }}</option>
           </select>
           <span class="pdf-total-pages">из {{ totalPages }}</span>
         </label>
+        <button type="button" class="pdf-screenshot-btn" @click="emit('screenshot-2d')">Скриншот 2D</button>
       </div>
       <div class="pdf-iframe-wrap">
         <iframe
@@ -186,11 +192,27 @@ defineExpose({
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  padding: 0.5rem;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
   background: #252525;
   border-bottom: 1px solid #333;
+}
+.pdf-toolbar-title {
+  font-weight: 600;
+  color: #fff;
+}
+.pdf-screenshot-btn {
+  margin-left: auto;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #e0e0e0;
+  background: rgba(80, 110, 150, 0.5);
+}
+.pdf-screenshot-btn:hover {
+  background: rgba(100, 130, 180, 0.6);
 }
 .pdf-screenshot-label {
   font-size: 0.9rem;

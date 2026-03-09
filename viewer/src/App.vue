@@ -142,7 +142,7 @@ function onDragLeave() {
   isDraggingFile.value = false
 }
 
-function onDrop(e: DragEvent) {
+async function onDrop(e: DragEvent) {
   isDraggingFile.value = false
   if (!e.dataTransfer?.types.includes('Files')) return
   e.preventDefault()
@@ -156,9 +156,24 @@ function onDrop(e: DragEvent) {
     return
   }
   if (MODEL_EXTENSIONS.includes(ext)) {
-    logger.info('App', `3D файл сброшен: ${file.name}`)
     if (viewMode.value === '2d' || viewMode.value === 'log') viewMode.value = 'split'
-    setTimeout(() => viewerRef.value?.loadModelFile?.(file), 0)
+    const modelFiles = Array.from(e.dataTransfer.files || [])
+      .filter((f) => MODEL_EXTENSIONS.includes((f.name.split('.').pop() || '').toLowerCase()))
+      .slice(0, 5)
+    if (modelFiles.length) {
+      if ((e.dataTransfer.files?.length ?? 0) > 5) {
+        logger.warn('App', `Сброшено ${e.dataTransfer.files!.length} файлов, загружаем 5`)
+        alert('Загружаем первые 5 файлов для стабильной работы.')
+      }
+      logger.info('App', `3D файлы сброшены: ${modelFiles.map((f) => f.name).join(', ')}`)
+      for (const f of modelFiles) {
+        try {
+          await viewerRef.value?.loadModelFile?.(f)
+        } catch (e) {
+          logger.error('App', `Ошибка загрузки ${f.name}`, e)
+        }
+      }
+    }
     return
   }
   alert('Поддерживаются PDF и 3D (STL, STEP, IGES, GLB)')
@@ -803,28 +818,9 @@ onUnmounted(() => {
     <div v-if="isDraggingFile" class="drop-overlay">Отпустите файл (PDF или 3D)</div>
     <ViewerToolbar
       :view-mode="viewMode"
-      :section-mode="sectionMode"
-      :section-active="sectionActive"
-      :section-offset="sectionOffset"
-      :measure-mode="measureMode"
-      :measure-snap-mode="measureSnapMode"
-      :measure-type="measureType"
       @update:view-mode="onViewModeChange"
       @open-pdf="onOpenPdf"
       @open-file="onOpenFile"
-      @reset-view="onResetView"
-      @screenshot-2d="onScreenshotTab"
-      @screenshot-3d="onScreenshot3D"
-      @section-mode="onSectionMode"
-      @fix-section="onFixSection"
-      @clear-section="onClearSection"
-      @update:section-offset="onSectionOffset"
-      @measure="onMeasure"
-      @update:measure-snap-mode="onMeasureSnapMode"
-      @update:measure-type="onMeasureTypeUpdate"
-      @clear-measurements="onClearMeasurements"
-      @export-glb="onExportGlb"
-      @export-stl="onExportStl"
       @export-report="onExportReport"
     />
     <div class="report-screenshots-panel">
@@ -872,16 +868,34 @@ onUnmounted(() => {
           ref="pdfViewerRef"
           :pdf-url="pdfFile.url"
           :pdf-name="pdfFile.name"
+          @screenshot-2d="onScreenshotTab"
         />
         <div v-else class="panel-placeholder">Выберите PDF (чертежи, спецификация)</div>
       </div>
       <div v-show="show3dPanel()" class="panel viewer-panel">
         <Viewer3D
-        ref="viewerRef"
-        @section-active="onSectionActive"
-        @section-inactive="onSectionInactive"
-        @section-offset-changed="onSectionOffsetChanged"
-      />
+          ref="viewerRef"
+          :section-mode="sectionMode"
+          :section-active="sectionActive"
+          :section-offset="sectionOffset"
+          :measure-mode="measureMode"
+          :measure-snap-mode="measureSnapMode"
+          :measure-type="measureType"
+          @section-active="onSectionActive"
+          @section-inactive="onSectionInactive"
+          @section-offset-changed="onSectionOffsetChanged"
+          @section-mode="onSectionMode"
+          @fix-section="onFixSection"
+          @clear-section="onClearSection"
+          @update:section-offset="onSectionOffset"
+          @measure="onMeasure"
+          @update:measure-snap-mode="onMeasureSnapMode"
+          @update:measure-type="onMeasureTypeUpdate"
+          @clear-measurements="onClearMeasurements"
+          @export-glb="onExportGlb"
+          @export-stl="onExportStl"
+          @screenshot-3d="onScreenshot3D"
+        />
       </div>
       <div v-show="showLogPanel()" class="panel log-panel-wrap">
         <LogPanel />

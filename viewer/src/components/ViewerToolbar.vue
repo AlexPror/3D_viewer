@@ -3,54 +3,16 @@ export type ViewMode = '2d' | '3d' | 'split' | 'log'
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
 export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance'
 
-const SECTION_OFFSET_MIN = -2000
-const SECTION_OFFSET_MAX = 2000
-const SECTION_OFFSET_STEP = 10
-
 defineProps<{
   viewMode: ViewMode
-  sectionMode?: boolean
-  sectionActive?: boolean
-  sectionOffset?: number
-  measureMode?: boolean
-  measureSnapMode?: MeasureSnapMode
-  measureType?: MeasureType
 }>()
 
 const emit = defineEmits<{
   'update:viewMode': [value: ViewMode]
   'open-pdf': []
   'open-file': []
-  'reset-view': []
-  'screenshot-2d': []
-  'screenshot-3d': []
-  'section-mode': []
-  'fix-section': []
-  'clear-section': []
-  'update:sectionOffset': [value: number]
-  'measure': []
-  'update:measureSnapMode': [value: MeasureSnapMode]
-  'update:measureType': [value: MeasureType]
-  'clear-measurements': []
-  'export-glb': []
-  'export-stl': []
   'export-report': []
 }>()
-
-function clampOffset(v: number) {
-  return Math.min(SECTION_OFFSET_MAX, Math.max(SECTION_OFFSET_MIN, v))
-}
-
-function onOffsetInput(ev: Event) {
-  const val = parseFloat((ev.target as HTMLInputElement).value)
-  if (Number.isFinite(val)) emit('update:sectionOffset', clampOffset(val))
-}
-
-function onOffsetWheel(ev: WheelEvent, current: number) {
-  ev.preventDefault()
-  const delta = ev.deltaY > 0 ? -SECTION_OFFSET_STEP : SECTION_OFFSET_STEP
-  emit('update:sectionOffset', clampOffset(current + delta))
-}
 </script>
 
 <template>
@@ -58,10 +20,8 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
     <span class="title">3D Viewer</span>
     <div class="tool-groups">
       <div class="group group-file">
-        <span class="group-label">Файл и вид</span>
         <button type="button" class="group-btn" @click="emit('open-pdf')">Открыть 2D PDF</button>
         <button type="button" class="group-btn" @click="emit('open-file')">Открыть 3D модель</button>
-        <button type="button" class="group-btn" @click="emit('reset-view')">Вид по умолчанию</button>
         <div class="view-mode">
           <button
             type="button"
@@ -97,96 +57,6 @@ function onOffsetWheel(ev: WheelEvent, current: number) {
             Лог
           </button>
         </div>
-      </div>
-      <div class="group group-section">
-        <span class="group-label">Сечение</span>
-        <button
-          type="button"
-          class="group-btn"
-          :class="{ active: sectionMode }"
-          @click="emit('section-mode')"
-          title="Клик по модели задаёт плоскость сечения"
-        >
-          Сечение
-        </button>
-        <button
-          type="button"
-          class="btn-fix-section"
-          title="Зафиксировать сечение (скриншот, измерение)"
-          @click="emit('fix-section')"
-        >
-          ✓
-        </button>
-        <button
-          type="button"
-          class="btn-clear-section"
-          title="Снять сечение"
-          @click="emit('clear-section')"
-        >
-          ✕
-        </button>
-        <template v-if="sectionActive">
-          <input
-            type="number"
-            class="offset-input"
-            :min="SECTION_OFFSET_MIN"
-            :max="SECTION_OFFSET_MAX"
-            :step="SECTION_OFFSET_STEP"
-            :value="sectionOffset ?? 0"
-            @input="onOffsetInput"
-            @wheel.prevent="onOffsetWheel($event, sectionOffset ?? 0)"
-          />
-          <input
-            type="range"
-            class="offset-slider"
-            :min="SECTION_OFFSET_MIN"
-            :max="SECTION_OFFSET_MAX"
-            :step="SECTION_OFFSET_STEP"
-            :value="sectionOffset ?? 0"
-            @input="onOffsetInput"
-          />
-        </template>
-      </div>
-      <div class="group group-measure">
-        <span class="group-label">Измерение</span>
-        <button
-          type="button"
-          class="group-btn"
-          :class="{ active: measureMode }"
-          @click="emit('measure')"
-        >
-          Измерение
-        </button>
-        <button type="button" class="group-btn" @click="emit('clear-measurements')">Очистить</button>
-        <select
-          class="measure-type-select"
-          :value="measureType ?? 'distance'"
-          @change="emit('update:measureType', ($event.target as HTMLSelectElement).value as MeasureType)"
-          title="Тип измерения"
-        >
-          <option value="distance">Расстояние</option>
-          <option value="radius">Радиус</option>
-          <option value="diameter">Диаметр</option>
-          <option value="arc">Длина дуги</option>
-          <option value="hole-center-distance">Расст. между центрами отверстий</option>
-        </select>
-        <select
-          class="snap-select"
-          :value="measureSnapMode ?? 'intersection'"
-          @change="emit('update:measureSnapMode', ($event.target as HTMLSelectElement).value as MeasureSnapMode)"
-        >
-          <option value="intersection">Точка пересечения</option>
-          <option value="vertex">Вершина</option>
-          <option value="face">Центр грани</option>
-          <option value="edge">Ребро</option>
-        </select>
-      </div>
-      <div class="group group-export">
-        <span class="group-label">Экспорт</span>
-        <button type="button" class="group-btn" @click="emit('screenshot-2d')">Скриншот 2D</button>
-        <button type="button" class="group-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
-        <button type="button" class="group-btn" @click="emit('export-glb')">Экспорт GLB</button>
-        <button type="button" class="group-btn" @click="emit('export-stl')">Экспорт STL</button>
         <button type="button" class="group-btn" @click="emit('export-report')">Отчёт из скриншотов</button>
       </div>
     </div>

@@ -11,10 +11,30 @@ import { logger } from '../lib/logger'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
+const props = defineProps<{
+  sectionMode?: boolean
+  sectionActive?: boolean
+  sectionOffset?: number
+  measureMode?: boolean
+  measureSnapMode?: MeasureSnapMode
+  measureType?: MeasureType
+}>()
+
 const emit = defineEmits<{
   'section-active': []
   'section-inactive': []
   'section-offset-changed': [value: number]
+  'section-mode': []
+  'fix-section': []
+  'clear-section': []
+  'update:sectionOffset': [value: number]
+  'measure': []
+  'update:measureSnapMode': [value: MeasureSnapMode]
+  'update:measureType': [value: MeasureType]
+  'clear-measurements': []
+  'export-glb': []
+  'export-stl': []
+  'screenshot-3d': []
 }>()
 
 let scene: THREE.Scene
@@ -52,6 +72,10 @@ let lastHoverNormal: THREE.Vector3 | null = null
 let lastHoverPoint: THREE.Vector3 | null = null
 const measureModeRef = ref(false)
 const sectionModeRef = ref(false)
+const wireframeModeRef = ref(false)
+/** Выбранная грань для кнопки «Перпендикулярно» (центр и нормаль в мировой СК). */
+let selectedFacePoint: THREE.Vector3 | null = null
+let selectedFaceNormal: THREE.Vector3 | null = null
 let sectionPlaneMesh: THREE.Mesh | null = null
 let sectionPlaneBasePoint: THREE.Vector3 | null = null
 let sectionPlaneNormal: THREE.Vector3 | null = null
@@ -59,6 +83,7 @@ let sectionPlaneClipNormal: THREE.Vector3 | null = null
 let sectionPlaneOffset = 0
 const SECTION_OFFSET_MIN = -2000
 const SECTION_OFFSET_MAX = 2000
+const SECTION_OFFSET_STEP = 10
 let animationId: number
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
 export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance'
@@ -66,11 +91,60 @@ let measureSnapMode: MeasureSnapMode = 'intersection'
 let measureType: MeasureType = 'distance'
 let fileInput: HTMLInputElement | null = null
 let loadedFileName: string | null = null
+
+export interface LoadedModelItem {
+  id: string
+  name: string
+  thumbnailDataUrl: string
+  /** Модель отображается в сцене (false = только в библиотеке) */
+  inScene: boolean
+}
+
+const MAX_MODELS_IN_SCENE = 8
+const MAX_FILES_SELECT = 5
+const THUMBNAIL_PLACEHOLDER = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="120"><rect fill="%23252" width="160" height="120"/><text x="80" y="60" fill="%238a9bb5" text-anchor="middle" font-size="12">…</text></svg>'
+
+const loadedModels = ref<LoadedModelItem[]>([])
+const modelGroupsById = new Map<string, THREE.Group>()
 const savedCameraPosition = new THREE.Vector3(500, 400, 500)
 const savedCameraTarget = new THREE.Vector3(0, 0, 0)
 
 const DEFAULT_COLOR = 0x888888
 const DEFAULT_SPECULAR = 0x222222
+
+const MODEL_COLOR_LIGHT = 0xf2f4f6
+
+/** Настройки мыши/камеры: дистанция и скорость. */
+const mouseMaxDistance = ref(50000)
+const mouseMinDistance = ref(10)
+const mouseZoomSpeed = ref(0.032)
+const mouseInvertWheel = ref(false)
+const mouseRotateSpeed = ref(6.4)
+const mousePanSpeed = ref(2)
+const mouseDamping = ref(0.22)
+const mouseZoomGestureMs = ref(450)
+/** Левая кнопка: перемещение модели в сцене (перетаскивание детали) */
+const leftButtonMoveModel = ref(true)
+
+function applyMouseSettings() {
+  if (!controls) return
+  controls.minDistance = mouseMinDistance.value
+  controls.maxDistance = mouseMaxDistance.value
+  controls.rotateSpeed = mouseRotateSpeed.value
+  controls.panSpeed = mousePanSpeed.value
+  controls.dynamicDampingFactor = mouseDamping.value
+}
+
+function applyModelTint() {
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const arr = Array.isArray(obj.material) ? obj.material : [obj.material]
+    arr.forEach((m: THREE.Material) => {
+      if ('color' in m) (m as THREE.Material & { color: THREE.Color }).color.setHex(MODEL_COLOR_LIGHT)
+    })
+  })
+}
+
 const SNAP_SCREEN_THRESHOLD = 0.08
 const snapProj = new THREE.Vector3()
 
@@ -84,7 +158,7 @@ function initScene() {
     50,
     containerRef.value.clientWidth / containerRef.value.clientHeight,
     0.1,
-    10000
+    500000
   )
   camera.position.set(500, 400, 500)
 
@@ -98,13 +172,8 @@ function initScene() {
   containerRef.value.appendChild(renderer.domElement)
 
   controls = new TrackballControls(camera, renderer.domElement)
-  controls.rotateSpeed = 6.4
   controls.zoomSpeed = 0.9
-  controls.panSpeed = 2
   controls.staticMoving = false
-  controls.dynamicDampingFactor = 0.22
-  controls.minDistance = 10
-  controls.maxDistance = 5000
   controls.noZoom = true
   controls.target.set(0, 0, 0)
   controls.mouseButtons = {
@@ -112,6 +181,7 @@ function initScene() {
     MIDDLE: THREE.MOUSE.PAN,
     RIGHT: THREE.MOUSE.ROTATE,
   }
+  applyMouseSettings()
   controls.handleResize()
   savedCameraPosition.copy(camera.position)
   savedCameraTarget.copy(controls.target)
@@ -194,20 +264,12 @@ function initScene() {
 
   function animate() {
     animationId = requestAnimationFrame(animate)
-    const tFrame = performance.now()
     controls.update()
     let hits: THREE.Intersection[] = []
-    let rayMs = 0
-    let holeMs = 0
-    let zoneMs = 0
     if (measureModeRef.value && meshGroup.children.length && containerRef.value) {
-      holeMs = 0
-      zoneMs = 0
       const rect = renderer.domElement.getBoundingClientRect()
       raycaster.setFromCamera(mouse, camera)
-      const tRay = performance.now()
       hits = raycaster.intersectObject(meshGroup, true)
-      rayMs = performance.now() - tRay
       while (highlightGroup.children.length) {
         const c = highlightGroup.children[0]
         highlightGroup.remove(c)
@@ -226,9 +288,7 @@ function initScene() {
           const worldNormal = hit.face!.normal.clone().transformDirection(mesh.matrixWorld).normalize()
           lastHoverNormal = worldNormal.clone()
           lastHoverPoint = hit.point.clone()
-          const tHole = performance.now()
           let holeInfo = getHoverHoleInfo(mesh, hit.point)
-          holeMs = performance.now() - tHole
           let radiusInfo: { center: THREE.Vector3; radius: number } | null =
             holeInfo ? null : getHoverRadiusInfo(mesh, faceIndex, worldNormal)
           if (!holeInfo && radiusInfo && isCylinderAHole(mesh, radiusInfo.center, radiusInfo.radius, worldNormal, raycaster)) {
@@ -236,7 +296,6 @@ function initScene() {
             radiusInfo = null
           }
           // 1) Всегда подсвечиваем поверхность под курсором (валидация выбора)
-          const tZone = performance.now()
           const surfaceZoneGeom = getCylindricalZoneGeometry(mesh, faceIndex, worldNormal)
           const surfaceFaceGeom =
             surfaceZoneGeom ??
@@ -267,7 +326,6 @@ function initScene() {
               g.computeVertexNormals()
               return g
             })()
-          zoneMs = performance.now() - tZone
           const surfaceMat = new THREE.MeshBasicMaterial({
             color: 0x4488ff,
             transparent: true,
@@ -553,17 +611,7 @@ function initScene() {
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
       if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
     }
-      const tRender = performance.now()
-      renderer.render(scene, camera)
-      const renderMs = performance.now() - tRender
-      const totalMs = performance.now() - tFrame
-      if (hits.length > 0) {
-        console.log(
-          '[animate] ray:', rayMs.toFixed(1), 'ms | hole:', holeMs.toFixed(1), 'ms | zone:', zoneMs.toFixed(1), 'ms | render:', renderMs.toFixed(1), 'ms | total:', totalMs.toFixed(1), 'ms'
-        )
-      } else if (totalMs > 50) {
-        console.log('[animate] (no hit) render:', renderMs.toFixed(1), 'ms | total:', totalMs.toFixed(1), 'ms')
-      }
+    renderer.render(scene, camera)
   }
   animate()
 
@@ -601,6 +649,130 @@ function resetView() {
   camera.position.copy(savedCameraPosition)
   controls.target.copy(savedCameraTarget)
   controls.update()
+}
+
+type ViewPreset = 'front' | 'back' | 'top' | 'bottom' | 'left' | 'right' | 'iso' | 'dimetric'
+
+const orientationDropdownOpen = ref(false)
+const orientationDropdownRef = ref<HTMLDivElement | null>(null)
+const mouseSettingsDropdownOpen = ref(false)
+const mouseSettingsDropdownRef = ref<HTMLDivElement | null>(null)
+const scenePanelOrientationOpen = ref(false)
+const scenePanelOrientationRef = ref<HTMLDivElement | null>(null)
+
+function onOrientationClickOutside(ev: MouseEvent) {
+  if (!orientationDropdownOpen.value) return
+  const el = orientationDropdownRef.value
+  if (el && !el.contains(ev.target as Node)) orientationDropdownOpen.value = false
+}
+
+function onMouseSettingsClickOutside(ev: MouseEvent) {
+  if (!mouseSettingsDropdownOpen.value) return
+  const el = mouseSettingsDropdownRef.value
+  if (el && !el.contains(ev.target as Node)) mouseSettingsDropdownOpen.value = false
+}
+
+function onScenePanelOrientationClickOutside(ev: MouseEvent) {
+  if (!scenePanelOrientationOpen.value) return
+  const el = scenePanelOrientationRef.value
+  if (el && !el.contains(ev.target as Node)) scenePanelOrientationOpen.value = false
+}
+
+const ORIENTATION_OPTIONS: { id: ViewPreset; label: string; tooltip: string; hasIcon: boolean }[] = [
+  { id: 'front', label: 'П', tooltip: 'Вид спереди', hasIcon: true },
+  { id: 'back', label: 'З', tooltip: 'Вид сзади', hasIcon: true },
+  { id: 'top', label: 'В', tooltip: 'Вид сверху', hasIcon: true },
+  { id: 'bottom', label: 'Н', tooltip: 'Вид снизу', hasIcon: true },
+  { id: 'left', label: 'Л', tooltip: 'Вид слева', hasIcon: true },
+  { id: 'right', label: 'Пр', tooltip: 'Вид справа', hasIcon: true },
+  { id: 'iso', label: 'Изометрия', tooltip: 'Изометрия', hasIcon: false },
+  { id: 'dimetric', label: 'Диметрия', tooltip: 'Диметрия', hasIcon: false },
+]
+
+function setViewOrientation(preset: ViewPreset) {
+  if (!camera || !controls || !meshGroup || meshGroup.children.length === 0) return
+  orientationDropdownOpen.value = false
+  scenePanelOrientationOpen.value = false
+  const box = new THREE.Box3().setFromObject(meshGroup)
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z, 1)
+  const distance = maxDim * 1.5
+  const dir = new THREE.Vector3()
+  switch (preset) {
+    case 'front':
+      dir.set(0, 0, 1)
+      break
+    case 'back':
+      dir.set(0, 0, -1)
+      break
+    case 'top':
+      dir.set(0, 1, 0)
+      break
+    case 'bottom':
+      dir.set(0, -1, 0)
+      break
+    case 'left':
+      dir.set(-1, 0, 0)
+      break
+    case 'right':
+      dir.set(1, 0, 0)
+      break
+    case 'iso':
+      dir.set(1, 1, 1).normalize()
+      break
+    case 'dimetric':
+      dir.set(2, 1, 2).normalize()
+      break
+    default:
+      return
+  }
+  camera.position.copy(center).add(dir.multiplyScalar(distance))
+  controls.target.copy(center)
+  controls.update()
+}
+
+function viewPerpendicularToFace() {
+  if (!camera || !controls || !meshGroup?.children.length || !selectedFacePoint || !selectedFaceNormal) return
+  const box = new THREE.Box3().setFromObject(meshGroup)
+  const size = box.getSize(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z, 1)
+  const distance = maxDim * 1.5
+  const n = selectedFaceNormal.clone().normalize()
+  controls.target.copy(selectedFacePoint)
+  camera.position.copy(selectedFacePoint).add(n.clone().multiplyScalar(distance))
+  // Ориентация: грань параллельна экрану, мировой «верх» — вертикально на экране
+  const worldUp = new THREE.Vector3(0, 1, 0)
+  const upOnPlane = worldUp.clone().sub(n.clone().multiplyScalar(worldUp.dot(n)))
+  if (upOnPlane.lengthSq() < 1e-6) {
+    upOnPlane.set(0, 0, 1)
+    if (Math.abs(n.dot(upOnPlane)) > 0.99) upOnPlane.set(1, 0, 0)
+  }
+  upOnPlane.normalize()
+  camera.up.copy(upOnPlane)
+  camera.lookAt(selectedFacePoint)
+  controls.update()
+}
+
+function applyWireframeToObject(obj: THREE.Object3D, enabled: boolean) {
+  obj.traverse((o: THREE.Object3D) => {
+    if (o instanceof THREE.Mesh && o.material) {
+      const arr = Array.isArray(o.material) ? o.material : [o.material]
+      arr.forEach((m: THREE.Material) => {
+        if ('wireframe' in m) (m as THREE.Material & { wireframe: boolean }).wireframe = enabled
+      })
+    }
+  })
+}
+
+function toggleWireframe() {
+  wireframeModeRef.value = !wireframeModeRef.value
+  applyWireframeToObject(meshGroup, wireframeModeRef.value)
+  if (renderer && containerRef.value) {
+    const pr = wireframeModeRef.value ? 1 : Math.min(window.devicePixelRatio, 2)
+    renderer.setPixelRatio(pr)
+    renderer.setSize(containerRef.value.clientWidth, containerRef.value.clientHeight)
+  }
 }
 
 function applySectionToMeshGroup(plane: THREE.Plane | null) {
@@ -720,6 +892,21 @@ function setSectionMode(enabled: boolean) {
   logger.info('Viewer3D', `Режим сечения: ${enabled ? 'вкл' : 'выкл'}`)
 }
 
+function clampOffset(v: number) {
+  return Math.min(SECTION_OFFSET_MAX, Math.max(SECTION_OFFSET_MIN, v))
+}
+
+function onHeaderOffsetInput(ev: Event) {
+  const val = parseFloat((ev.target as HTMLInputElement).value)
+  if (Number.isFinite(val)) emit('update:sectionOffset', clampOffset(val))
+}
+
+function onHeaderOffsetWheel(ev: WheelEvent, current: number) {
+  ev.preventDefault()
+  const delta = ev.deltaY > 0 ? -SECTION_OFFSET_STEP : SECTION_OFFSET_STEP
+  emit('update:sectionOffset', clampOffset(current + delta))
+}
+
 function updateMouseFromClient(clientX: number, clientY: number) {
   if (!renderer?.domElement) return
   const rect = renderer.domElement.getBoundingClientRect()
@@ -738,68 +925,69 @@ function onContainerMouseMove(ev: MouseEvent) {
 const zoomToCursorPlane = new THREE.Plane()
 const zoomToCursorPoint = new THREE.Vector3()
 const zoomToCursorDir = new THREE.Vector3()
-const ZOOM_GESTURE_MS = 450
 let zoomAnchorPoint: THREE.Vector3 | null = null
 let lastWheelTime = 0
 
-const mouseDownPlane = new THREE.Plane()
-const mouseDownPoint = new THREE.Vector3()
-const mouseDownDir = new THREE.Vector3()
+let draggedModelGroup: THREE.Group | null = null
+let dragStartModelPos: THREE.Vector3 | null = null
+let dragStartIntersection: THREE.Vector3 | null = null
+/** Чтобы не считать клик после перетаскивания модели */
+let didDragModel = false
+const dragPlane = new THREE.Plane()
+const dragIntersect = new THREE.Vector3()
 
-let panAnchorPoint: THREE.Vector3 | null = null
-let isPanningWithAnchor = false
-const panRaycaster = new THREE.Raycaster()
-const panRayDir = new THREE.Vector3()
-
-function getPointUnderCursor(clientX: number, clientY: number): THREE.Vector3 | null {
-  if (!camera || !controls || !renderer?.domElement) return null
-  const rect = renderer.domElement.getBoundingClientRect()
-  const mx = ((clientX - rect.left) / rect.width) * 2 - 1
-  const my = -((clientY - rect.top) / rect.height) * 2 + 1
-  const r = new THREE.Raycaster()
-  r.setFromCamera(new THREE.Vector2(mx, my), camera)
-  mouseDownPlane.setFromNormalAndCoplanarPoint(
-    mouseDownDir.copy(camera.position).sub(controls.target).normalize(),
-    controls.target
-  )
-  const out = new THREE.Vector3()
-  return r.ray.intersectPlane(mouseDownPlane, out) ? out : null
+function findWrapperGroup(obj: THREE.Object3D): THREE.Group | null {
+  let o: THREE.Object3D | null = obj
+  while (o && o.parent !== meshGroup) o = o.parent
+  return o && o.parent === meshGroup ? (o as THREE.Group) : null
 }
 
 function onCanvasMouseDown(ev: MouseEvent) {
-  if (!camera || !controls) return
-  if (ev.button === 1) {
-    const pt = getPointUnderCursor(ev.clientX, ev.clientY)
-    if (pt) {
-      panAnchorPoint = pt.clone()
-      isPanningWithAnchor = true
-      controls.enabled = false
-      ev.preventDefault()
-      ev.stopPropagation()
+  if (!camera || !controls || !meshGroup) return
+  if (ev.button === 0 && leftButtonMoveModel.value) {
+    const rect = renderer.domElement.getBoundingClientRect()
+    const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
+    const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
+    raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
+    const hits = raycaster.intersectObject(meshGroup, true)
+    if (hits.length > 0) {
+      const wrapper = findWrapperGroup(hits[0].object)
+      if (wrapper) {
+        draggedModelGroup = wrapper
+        dragStartModelPos = wrapper.position.clone()
+        dragStartIntersection = hits[0].point.clone()
+        didDragModel = false
+        controls.enabled = false
+        ev.preventDefault()
+        ev.stopPropagation()
+      }
     }
-    return
   }
-  // Правая кнопка — только вращение через TrackballControls, не сдвигаем target
 }
 
 function onCanvasMouseMovePan(ev: MouseEvent) {
-  if (!isPanningWithAnchor || !panAnchorPoint || !camera || !controls) return
+  if (!draggedModelGroup || !dragStartModelPos || !dragStartIntersection || !camera || !controls) return
   ev.preventDefault()
   ev.stopPropagation()
+  didDragModel = true
   const rect = renderer.domElement.getBoundingClientRect()
   const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
   const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
-  panRaycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
-  panRayDir.copy(panRaycaster.ray.direction)
-  const dist = camera.position.distanceTo(panAnchorPoint)
-  camera.position.copy(panAnchorPoint).sub(panRayDir.multiplyScalar(dist))
-  controls.target.copy(panAnchorPoint)
+  const r = new THREE.Raycaster()
+  r.setFromCamera(new THREE.Vector2(mx, my), camera)
+  const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
+  dragPlane.setFromNormalAndCoplanarPoint(dir, dragStartIntersection)
+  if (r.ray.intersectPlane(dragPlane, dragIntersect)) {
+    const delta = dragIntersect.clone().sub(dragStartIntersection)
+    draggedModelGroup.position.copy(dragStartModelPos).add(delta)
+  }
 }
 
 function onCanvasMouseUp(ev: MouseEvent) {
-  if (ev.button === 1 && isPanningWithAnchor) {
-    isPanningWithAnchor = false
-    panAnchorPoint = null
+  if (ev.button === 0 && draggedModelGroup) {
+    draggedModelGroup = null
+    dragStartModelPos = null
+    dragStartIntersection = null
     if (controls) controls.enabled = true
     ev.preventDefault()
     ev.stopPropagation()
@@ -813,7 +1001,7 @@ function onCanvasWheel(ev: WheelEvent) {
   const rect = renderer.domElement.getBoundingClientRect()
   const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
   const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
-  if (zoomAnchorPoint === null || now - lastWheelTime > ZOOM_GESTURE_MS) {
+  if (zoomAnchorPoint === null || now - lastWheelTime > mouseZoomGestureMs.value) {
     const raycaster = new THREE.Raycaster()
     raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
     zoomToCursorPlane.setFromNormalAndCoplanarPoint(
@@ -825,15 +1013,22 @@ function onCanvasWheel(ev: WheelEvent) {
   }
   lastWheelTime = now
   const dist = camera.position.distanceTo(zoomAnchorPoint)
-  const zoomFactor = 1 + (ev.deltaY > 0 ? -0.032 : 0.032) * Math.max(1, dist * 0.001)
+  const sign = mouseInvertWheel.value ? (ev.deltaY > 0 ? 1 : -1) : (ev.deltaY > 0 ? -1 : 1)
+  const zoomFactor = 1 + sign * mouseZoomSpeed.value * Math.max(1, dist * 0.001)
   let newDist = dist * zoomFactor
-  newDist = Math.max(controls.minDistance, Math.min(controls.maxDistance, newDist))
+  const minD = mouseMinDistance.value
+  const maxD = mouseMaxDistance.value
+  newDist = Math.max(minD, Math.min(maxD, newDist))
   const dirFromPoint = camera.position.clone().sub(zoomAnchorPoint).normalize()
   camera.position.copy(zoomAnchorPoint).add(dirFromPoint.multiplyScalar(newDist))
   controls.target.copy(zoomAnchorPoint)
 }
 
 function onCanvasClick(ev: MouseEvent) {
+  if (didDragModel) {
+    didDragModel = false
+    return
+  }
   if (!renderer || !camera || !meshGroup.children.length) {
     if (measureModeRef.value) logger.info('Viewer3D', 'Клик: модель не загружена или нет сцены, измерение игнорируется')
     return
@@ -850,7 +1045,15 @@ function onCanvasClick(ev: MouseEvent) {
     setSectionFromHit(hit.point.clone(), worldNormal)
     return
   }
-  if (!measureModeRef.value) return
+  if (!measureModeRef.value) {
+    if (hits.length > 0) {
+      const hit = hits[0]
+      const worldNormal = hit.face!.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
+      selectedFacePoint = hit.point.clone()
+      selectedFaceNormal = worldNormal
+    }
+    return
+  }
   logger.info('Viewer3D', `Клик в режиме измерений: measureType=${measureType}, hitsCount=${hits.length}`)
   if (measureType === 'radius') {
     if (hits.length === 0) return
@@ -1879,6 +2082,69 @@ function getPointFromHit(hit: THREE.Intersection): THREE.Vector3 {
   return hit.point.clone()
 }
 
+function nextModelId() {
+  return `model_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+}
+
+function renderModelThumbnail(group: THREE.Object3D, width = 160, height = 120): Promise<string> {
+  return new Promise((resolve) => {
+    if (!renderer) {
+      resolve('')
+      return
+    }
+    try {
+      const box = new THREE.Box3().setFromObject(group)
+      const size = box.getSize(new THREE.Vector3())
+      const center = box.getCenter(new THREE.Vector3())
+      if (size.x + size.y + size.z < 0.001) {
+        resolve('')
+        return
+      }
+      const maxDim = Math.max(size.x, size.y, size.z)
+      const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, maxDim * 5)
+      camera.position.copy(center).add(new THREE.Vector3(maxDim * 0.8, maxDim * 0.6, maxDim * 0.8))
+      camera.lookAt(center)
+      const tempScene = new THREE.Scene()
+      tempScene.background = new THREE.Color(0xf0f0f0)
+      tempScene.add(group.clone(true))
+      tempScene.add(new THREE.AmbientLight(0xffffff, 0.8))
+      const dir = new THREE.DirectionalLight(0xffffff, 0.6)
+      dir.position.set(maxDim, maxDim, maxDim)
+      tempScene.add(dir)
+      const rt = new THREE.WebGLRenderTarget(width, height, { antialias: true })
+      renderer.setRenderTarget(rt)
+      renderer.render(tempScene, camera)
+      const pixels = new Uint8ClampedArray(width * height * 4)
+      renderer.readRenderTargetPixels(rt, 0, 0, width, height, pixels)
+      renderer.setRenderTarget(null)
+      rt.dispose()
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve('')
+        return
+      }
+      const imageData = ctx.createImageData(width, height)
+      for (let y = height - 1; y >= 0; y--) {
+        for (let x = 0; x < width; x++) {
+          const src = (y * width + x) * 4
+          const dst = ((height - 1 - y) * width + x) * 4
+          imageData.data[dst] = pixels[src]
+          imageData.data[dst + 1] = pixels[src + 1]
+          imageData.data[dst + 2] = pixels[src + 2]
+          imageData.data[dst + 3] = pixels[src + 3]
+        }
+      }
+      ctx.putImageData(imageData, 0, 0)
+      resolve(canvas.toDataURL('image/png') || '')
+    } catch {
+      resolve('')
+    }
+  })
+}
+
 function clearMeshGroup() {
   while (meshGroup.children.length) {
     const child = meshGroup.children[0]
@@ -1903,15 +2169,40 @@ function clearMeshGroup() {
   }
 }
 
-function loadGlbUrl(url: string, loadStartedAt?: number): Promise<void> {
+function loadGlbUrl(
+  url: string,
+  loadStartedAt?: number,
+  opts?: { modelId: string; modelName: string }
+): Promise<void> {
   return new Promise((resolve, reject) => {
     const loader = new GLTFLoader()
     loader.load(
       url,
-      (gltf) => {
+      async (gltf) => {
         const t0 = loadStartedAt ?? performance.now()
-        clearMeshGroup()
-        meshGroup.add(gltf.scene)
+        const wrapper = new THREE.Group()
+        if (opts) {
+          wrapper.userData = { modelId: opts.modelId }
+          modelGroupsById.set(opts.modelId, wrapper)
+        } else {
+          clearMeshGroup()
+          modelGroupsById.clear()
+          loadedModels.value = []
+        }
+        wrapper.add(gltf.scene)
+        applyModelTint()
+        if (opts && meshGroup.children.length > 0) {
+          const box = new THREE.Box3().setFromObject(wrapper)
+          const size = box.getSize(new THREE.Vector3())
+          let maxX = -Infinity
+          for (const c of meshGroup.children) {
+            const b = new THREE.Box3().setFromObject(c)
+            maxX = Math.max(maxX, b.max.x)
+          }
+          if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
+        }
+        meshGroup.add(wrapper)
+        if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
         else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
         const box = new THREE.Box3().setFromObject(meshGroup)
@@ -1922,6 +2213,52 @@ function loadGlbUrl(url: string, loadStartedAt?: number): Promise<void> {
         )
         centerModel(box)
         URL.revokeObjectURL(url)
+        if (opts) {
+          const visibleCount = loadedModels.value.filter((m) => m.inScene).length
+          const inScene = visibleCount < MAX_MODELS_IN_SCENE
+          if (!inScene) {
+            meshGroup.remove(wrapper)
+            wrapper.visible = false
+            modelGroupsById.set(opts.modelId, wrapper)
+            logger.info('Viewer3D', `Лимит сцены (${MAX_MODELS_IN_SCENE}): модель добавлена в библиотеку`)
+          }
+          loadedModels.value = [
+            ...loadedModels.value,
+            { id: opts.modelId, name: opts.modelName, thumbnailDataUrl: THUMBNAIL_PLACEHOLDER, inScene },
+          ]
+          loadedFileName = opts.modelName
+          if (inScene && meshGroup.children.length > 0) {
+            const box = new THREE.Box3().setFromObject(meshGroup)
+            centerModel(box)
+          }
+          const scheduleThumb = () => {
+            const cb = () => {
+              renderModelThumbnail(wrapper).then((thumb) => {
+                if (thumb) {
+                  const idx = loadedModels.value.findIndex((m) => m.id === opts.modelId)
+                  if (idx >= 0) {
+                    const next = [...loadedModels.value]
+                    next[idx] = { ...next[idx], thumbnailDataUrl: thumb }
+                    loadedModels.value = next
+                  }
+                }
+              })
+            }
+            if (typeof requestIdleCallback !== 'undefined') {
+              requestIdleCallback(cb, { timeout: 500 })
+            } else {
+              setTimeout(cb, 100)
+            }
+          }
+          scheduleThumb()
+          if (!inScene) {
+            if (meshGroup.children.length > 0) {
+              const box = new THREE.Box3().setFromObject(meshGroup)
+              centerModel(box)
+            }
+            alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
+          }
+        }
         resolve()
       },
       undefined,
@@ -1933,7 +2270,11 @@ function loadGlbUrl(url: string, loadStartedAt?: number): Promise<void> {
   })
 }
 
-function loadSTL(arrayBuffer: ArrayBuffer, _filename: string) {
+async function loadSTL(
+  arrayBuffer: ArrayBuffer,
+  filename: string,
+  opts?: { modelId: string; modelName: string }
+): Promise<void> {
   console.log(`${LOG_PREFIX} STL: парсинг, размер ${arrayBuffer.byteLength} байт`)
   const loader = new STLLoader()
   const geometry = loader.parse(arrayBuffer)
@@ -1946,8 +2287,30 @@ function loadSTL(arrayBuffer: ArrayBuffer, _filename: string) {
     flatShading: false,
   })
   const mesh = new THREE.Mesh(geometry, material)
-  clearMeshGroup()
-  meshGroup.add(mesh)
+  mesh.name = (filename || 'model').replace(/\.[^.]+$/, '') || 'model'
+  const wrapper = new THREE.Group()
+  if (opts) {
+    wrapper.userData = { modelId: opts.modelId }
+    modelGroupsById.set(opts.modelId, wrapper)
+  } else {
+    clearMeshGroup()
+    modelGroupsById.clear()
+    loadedModels.value = []
+  }
+  wrapper.add(mesh)
+  applyModelTint()
+  if (opts && meshGroup.children.length > 0) {
+    const box = new THREE.Box3().setFromObject(wrapper)
+    const size = box.getSize(new THREE.Vector3())
+    let maxX = -Infinity
+    for (const c of meshGroup.children) {
+      const b = new THREE.Box3().setFromObject(c)
+      maxX = Math.max(maxX, b.max.x)
+    }
+    if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
+  }
+  meshGroup.add(wrapper)
+  if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
   if (currentSectionAxis) setSectionAxis(currentSectionAxis)
   else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
   const box = new THREE.Box3().setFromObject(meshGroup)
@@ -1955,27 +2318,70 @@ function loadSTL(arrayBuffer: ArrayBuffer, _filename: string) {
   logger.info('Viewer3D', `STL загружен: ${geometry.attributes.position?.count ?? 0} вершин, габариты ${size.x.toFixed(0)}×${size.y.toFixed(0)}×${size.z.toFixed(0)}`)
   console.log(`${LOG_PREFIX} STL: габариты модели ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)}, центрирование камеры`)
   centerModel(box)
+  if (opts) {
+    const visibleCount = loadedModels.value.filter((m) => m.inScene).length
+    const inScene = visibleCount < MAX_MODELS_IN_SCENE
+    if (!inScene) {
+      meshGroup.remove(wrapper)
+      wrapper.visible = false
+      modelGroupsById.set(opts.modelId, wrapper)
+      logger.info('Viewer3D', `Лимит сцены (${MAX_MODELS_IN_SCENE}): модель добавлена в библиотеку`)
+    }
+    loadedModels.value = [
+      ...loadedModels.value,
+      { id: opts.modelId, name: opts.modelName, thumbnailDataUrl: THUMBNAIL_PLACEHOLDER, inScene },
+    ]
+    loadedFileName = opts.modelName
+    if (inScene && meshGroup.children.length > 0) {
+      const bbox = new THREE.Box3().setFromObject(meshGroup)
+      centerModel(bbox)
+    }
+    const scheduleThumb = () => {
+      const cb = () => {
+        renderModelThumbnail(wrapper).then((thumb) => {
+          if (thumb) {
+            const idx = loadedModels.value.findIndex((m) => m.id === opts.modelId)
+            if (idx >= 0) {
+              const next = [...loadedModels.value]
+              next[idx] = { ...next[idx], thumbnailDataUrl: thumb }
+              loadedModels.value = next
+            }
+          }
+        })
+      }
+      if (typeof requestIdleCallback !== 'undefined') {
+        requestIdleCallback(cb, { timeout: 500 })
+      } else {
+        setTimeout(cb, 100)
+      }
+    }
+    scheduleThumb()
+    if (!inScene) alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
+  }
 }
 
 const LOG_PREFIX = '[Viewer3D]'
 
-function handleFile(file: File) {
-  const ext = (file.name.split('.').pop() || '').toLowerCase()
-  logger.info('Viewer3D', `Загрузка модели: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`)
-  console.groupCollapsed(`${LOG_PREFIX} Загрузка файла: ${file.name}`)
-  console.log('имя:', file.name)
-  console.log('расширение:', ext)
-  console.log('размер (байт):', file.size)
-  console.log('тип MIME:', file.type || '(не задан)')
-  const reader = new FileReader()
-  reader.onload = () => {
-    loadedFileName = file.name
-    const buf = reader.result as ArrayBuffer
+function handleFile(file: File): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ext = (file.name.split('.').pop() || '').toLowerCase()
+    logger.info('Viewer3D', `Загрузка модели: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`)
+    console.groupCollapsed(`${LOG_PREFIX} Загрузка файла: ${file.name}`)
+    console.log('имя:', file.name)
+    console.log('расширение:', ext)
+    console.log('размер (байт):', file.size)
+    console.log('тип MIME:', file.type || '(не задан)')
+    const modelId = nextModelId()
+    const opts = { modelId, modelName: file.name }
+    const reader = new FileReader()
+    reader.onload = async () => {
+      const buf = reader.result as ArrayBuffer
     console.log('ArrayBuffer (байт):', buf?.byteLength ?? 0)
     if (ext === 'stl') {
       console.log('формат: STL — загрузка через STLLoader')
       console.groupEnd()
-      loadSTL(buf, file.name)
+      await loadSTL(buf, file.name, opts)
+      resolve()
       return
     }
     if (['step', 'stp', 'igs', 'iges'].includes(ext)) {
@@ -1983,21 +2389,33 @@ function handleFile(file: File) {
       console.groupEnd()
       isLoading.value = true
       const t0 = performance.now()
-      loadStepOrIgesToGlbUrl(buf, ext)
-        .then((glbUrl) => loadGlbUrl(glbUrl, performance.now()))
-        .then(() => {
-          const totalMs = performance.now() - t0
-          logger.info('Viewer3D', `Модель загружена: ${file.name} за ${(totalMs / 1000).toFixed(2)} с`)
-          console.log(`${LOG_PREFIX} Модель загружена. Всего: ${(totalMs / 1000).toFixed(2)} с`)
-        })
-        .catch((err) => {
-          logger.error('Viewer3D', `Ошибка загрузки STEP/IGES: ${file.name}`, err)
-          console.error(`${LOG_PREFIX} Ошибка загрузки STEP/IGES:`, err)
-          if (err instanceof Error) console.error(`${LOG_PREFIX} message:`, err.message, 'stack:', err.stack)
-        })
-        .finally(() => {
-          isLoading.value = false
-        })
+      try {
+        const glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+        await loadGlbUrl(glbUrl, performance.now(), opts)
+        const totalMs = performance.now() - t0
+        logger.info('Viewer3D', `Модель загружена: ${file.name} за ${(totalMs / 1000).toFixed(2)} с`)
+        console.log(`${LOG_PREFIX} Модель загружена. Всего: ${(totalMs / 1000).toFixed(2)} с`)
+        resolve()
+      } catch (err) {
+        logger.error('Viewer3D', `Ошибка загрузки STEP/IGES: ${file.name}`, err)
+        console.error(`${LOG_PREFIX} Ошибка загрузки STEP/IGES:`, err)
+        if (err instanceof Error) console.error(`${LOG_PREFIX} message:`, err.message, 'stack:', err.stack)
+        reject(err)
+      } finally {
+        isLoading.value = false
+      }
+      return
+    }
+    if (['glb', 'gltf'].includes(ext)) {
+      console.log('формат: GLB/GLTF — загрузка через GLTFLoader')
+      console.groupEnd()
+      const url = URL.createObjectURL(file)
+      try {
+        await loadGlbUrl(url, performance.now(), opts)
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+      resolve()
       return
     }
     if (ext === 'jt') {
@@ -2012,6 +2430,7 @@ function handleFile(file: File) {
         console.error(`${LOG_PREFIX} VITE_CONVERTER_URL не задан`)
         isLoading.value = false
         alert('Конвертер JT не настроен (VITE_CONVERTER_URL)')
+        resolve()
         return
       }
       const formData = new FormData()
@@ -2048,6 +2467,10 @@ function handleFile(file: File) {
           console.error(`${LOG_PREFIX} Ошибка конвертации JT:`, err)
           alert('Ошибка конвертации JT: ' + (err instanceof Error ? err.message : String(err)))
         })
+        .then(() => resolve())
+        .catch((e) => {
+          reject(e)
+        })
         .finally(() => {
           console.log(`${LOG_PREFIX} JT finally, loading=false`)
           isLoading.value = false
@@ -2057,23 +2480,40 @@ function handleFile(file: File) {
     console.warn('формат: неизвестный или не поддерживается, расширение:', ext)
     console.groupEnd()
     alert('Формат не поддерживается')
+    resolve()
   }
   reader.onerror = () => {
     console.error(`${LOG_PREFIX} Ошибка чтения файла:`, file.name, reader.error)
     console.groupEnd()
+    reject(reader.error)
   }
   reader.readAsArrayBuffer(file)
+  })
 }
 
 function openFileDialog() {
   if (!fileInput) {
     fileInput = document.createElement('input')
     fileInput.type = 'file'
-    fileInput.accept = '.stl,.step,.stp,.igs,.iges,.dxf'
-    fileInput.multiple = false
-    fileInput.onchange = () => {
-      const file = fileInput?.files?.[0]
-      if (file) handleFile(file)
+    fileInput.accept = '.stl,.step,.stp,.igs,.iges,.glb,.gltf,.dxf'
+    fileInput.multiple = true
+    fileInput.onchange = async () => {
+      const files = fileInput?.files
+      if (files?.length) {
+        const arr = Array.from(files)
+        if (arr.length > MAX_FILES_SELECT) {
+          logger.warn('Viewer3D', `Выбрано ${arr.length} файлов, загружаем первые ${MAX_FILES_SELECT}`)
+          alert(`Выбрано ${arr.length} файлов. Загружаем первые ${MAX_FILES_SELECT} для стабильной работы.`)
+        }
+        const toLoad = arr.slice(0, MAX_FILES_SELECT)
+        for (const file of toLoad) {
+          try {
+            await handleFile(file)
+          } catch (e) {
+            logger.error('Viewer3D', `Ошибка загрузки ${file.name}`, e)
+          }
+        }
+      }
       if (fileInput) fileInput.value = ''
     }
   }
@@ -2186,12 +2626,18 @@ function exportStl(): void {
 
 onMounted(() => {
   initScene()
+  document.addEventListener('mousedown', onOrientationClickOutside)
+  document.addEventListener('mousedown', onMouseSettingsClickOutside)
+  document.addEventListener('mousedown', onScenePanelOrientationClickOutside)
   getOpenCascade().then(() => {
     console.log(`${LOG_PREFIX} WASM предзагружен (первый STEP/IGES откроется быстрее)`)
   })
 })
 
 onUnmounted(() => {
+  document.removeEventListener('mousedown', onOrientationClickOutside)
+  document.removeEventListener('mousedown', onMouseSettingsClickOutside)
+  document.removeEventListener('mousedown', onScenePanelOrientationClickOutside)
   window.removeEventListener('resize', onResize)
   if (containerRef.value) {
     containerRef.value.removeEventListener('mousemove', onContainerMouseMove, false)
@@ -2251,8 +2697,8 @@ onUnmounted(() => {
   }
 })
 
-function loadModelFile(file: File) {
-  handleFile(file)
+function loadModelFile(file: File): Promise<void> {
+  return handleFile(file)
 }
 
 function getMeasurementReport():
@@ -2296,11 +2742,73 @@ function getMeasurementReport():
   return null
 }
 
+function setModelInScene(id: string, inScene: boolean) {
+  const group = modelGroupsById.get(id)
+  const item = loadedModels.value.find((m) => m.id === id)
+  if (!group || !item) return
+  if (inScene) {
+    const visibleCount = loadedModels.value.filter((m) => m.inScene).length
+    if (visibleCount >= MAX_MODELS_IN_SCENE) {
+      alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Уберите модель из сцены, чтобы добавить другую.`)
+      return
+    }
+    if (!meshGroup.children.includes(group)) {
+      if (meshGroup.children.length > 0) {
+        const box = new THREE.Box3().setFromObject(group)
+        const size = box.getSize(new THREE.Vector3())
+        let maxX = -Infinity
+        for (const c of meshGroup.children) {
+          const b = new THREE.Box3().setFromObject(c)
+          maxX = Math.max(maxX, b.max.x)
+        }
+        if (maxX > -Infinity) group.position.x = maxX + size.x / 2 + 30
+      }
+      meshGroup.add(group)
+    }
+    if (wireframeModeRef.value) applyWireframeToObject(group, true)
+    applyModelTint()
+    group.visible = true
+  } else {
+    meshGroup.remove(group)
+    group.visible = false
+  }
+  loadedModels.value = loadedModels.value.map((m) => (m.id === id ? { ...m, inScene } : m))
+  if (meshGroup.children.length > 0) {
+    const box = new THREE.Box3().setFromObject(meshGroup)
+    centerModel(box)
+  }
+}
+
+function removeModel(id: string) {
+  const group = modelGroupsById.get(id)
+  if (!group || !meshGroup) return
+  meshGroup.remove(group)
+  group.traverse((obj: THREE.Object3D) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.geometry?.dispose()
+      if (obj.material) {
+        const m = obj.material
+        Array.isArray(m) ? m.forEach((mat: THREE.Material) => mat.dispose()) : m.dispose()
+      }
+    }
+  })
+  modelGroupsById.delete(id)
+  loadedModels.value = loadedModels.value.filter((m) => m.id !== id)
+  loadedFileName = loadedModels.value.length > 0 ? loadedModels.value[loadedModels.value.length - 1].name : null
+  if (meshGroup.children.length > 0) {
+    const box = new THREE.Box3().setFromObject(meshGroup)
+    centerModel(box)
+  }
+}
+
 defineExpose({
   openFileDialog,
   loadModelFile,
   takeScreenshot,
   getLoadedFileName: () => loadedFileName,
+  loadedModels,
+  removeModel,
+  setModelInScene,
   getMeasurementReport,
   resetView,
   setSectionAxis,
@@ -2321,9 +2829,343 @@ defineExpose({
 
 <template>
   <div class="viewer-wrap">
-    <div ref="containerRef" class="viewer-container" />
-    <div v-if="isLoading" class="loading-overlay">
-      <span class="loading-text">Загрузка модели…</span>
+    <header class="viewer-3d-header">
+      <span class="viewer-3d-title">3D</span>
+      <div class="viewer-3d-tools">
+        <div class="viewer-header-block">
+          <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть модель</button>
+          <button type="button" class="viewer-3d-btn" @click="resetView">Вид по умолчанию</button>
+        </div>
+        <div class="viewer-header-block">
+          <div ref="orientationDropdownRef" class="viewer-orientation-dropdown">
+          <button
+            type="button"
+            class="viewer-3d-btn viewer-orient-trigger"
+            :class="{ open: orientationDropdownOpen }"
+            :disabled="!loadedModels.some(m => m.inScene)"
+            title="Ориентация вида"
+            @click.stop="orientationDropdownOpen = !orientationDropdownOpen"
+          >
+            <svg class="viewer-orient-cube" viewBox="0 0 24 24" width="18" height="18">
+              <path d="M12 2 L22 8 L22 18 L12 24 L2 18 L2 8 Z" fill="currentColor" opacity="0.4"/>
+              <path d="M2 8 L12 2 L22 8 L12 14 Z" fill="currentColor" opacity="0.7"/>
+              <path d="M12 2 L22 8 L12 14 L2 8 Z" fill="currentColor"/>
+            </svg>
+            Ориентация
+          </button>
+          <Transition name="viewer-orient-fade">
+            <div v-show="orientationDropdownOpen" class="viewer-orientation-menu">
+              <button
+                v-for="opt in ORIENTATION_OPTIONS"
+                :key="opt.id"
+                type="button"
+                class="viewer-orient-item"
+                :title="opt.tooltip"
+                @click="setViewOrientation(opt.id)"
+              >
+                <template v-if="opt.hasIcon">
+                  <svg class="viewer-orient-cube-icon" viewBox="0 0 24 24" width="20" height="20">
+                    <path d="M12 4 L20 8 L12 12 L4 8 Z" fill="currentColor" :opacity="opt.id === 'top' || opt.id === 'bottom' ? 1 : 0.35"/>
+                    <path d="M4 8 L12 4 L12 12 L4 16 Z" fill="currentColor" :opacity="opt.id === 'back' || opt.id === 'left' ? 1 : 0.35"/>
+                    <path d="M12 4 L20 8 L20 20 L12 24 L12 12 Z" fill="currentColor" :opacity="opt.id === 'front' || opt.id === 'right' ? 1 : 0.35"/>
+                  </svg>
+                  <span class="viewer-orient-label">{{ opt.label }}</span>
+                </template>
+                <span v-else class="viewer-orient-text-only">{{ opt.label }}</span>
+              </button>
+            </div>
+          </Transition>
+          </div>
+        </div>
+        <div class="viewer-header-block">
+          <div ref="mouseSettingsDropdownRef" class="viewer-orientation-dropdown viewer-mouse-dropdown">
+          <button
+            type="button"
+            class="viewer-3d-btn viewer-orient-trigger"
+            :class="{ open: mouseSettingsDropdownOpen }"
+            title="Скорость зума, вращения, направление колёсика"
+            @click.stop="mouseSettingsDropdownOpen = !mouseSettingsDropdownOpen"
+          >
+            Настройки мыши
+          </button>
+          <Transition name="viewer-orient-fade">
+            <div v-show="mouseSettingsDropdownOpen" class="viewer-orientation-menu viewer-mouse-menu">
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Максимальная дистанция камеры (отдаление)">Макс. отдаление</label>
+                <input
+                  v-model.number="mouseMaxDistance"
+                  type="number"
+                  min="1000"
+                  max="500000"
+                  step="1000"
+                  class="viewer-mouse-input"
+                  @change="applyMouseSettings"
+                />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Минимальная дистанция (приближение)">Мин. приближение</label>
+                <input
+                  v-model.number="mouseMinDistance"
+                  type="number"
+                  min="1"
+                  max="500"
+                  class="viewer-mouse-input"
+                  @change="applyMouseSettings"
+                />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Шаг зума при прокрутке колёсика">Скорость зума</label>
+                <input
+                  v-model.number="mouseZoomSpeed"
+                  type="number"
+                  min="0.005"
+                  max="0.2"
+                  step="0.005"
+                  class="viewer-mouse-input"
+                />
+              </div>
+              <div class="viewer-mouse-row viewer-mouse-row-check">
+                <label class="viewer-mouse-label">Колёсико: к себе = отдаление</label>
+                <input v-model="mouseInvertWheel" type="checkbox" class="viewer-mouse-check" />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Скорость вращения правой кнопкой">Скорость вращения</label>
+                <input
+                  v-model.number="mouseRotateSpeed"
+                  type="number"
+                  min="1"
+                  max="20"
+                  step="0.5"
+                  class="viewer-mouse-input"
+                  @change="applyMouseSettings"
+                />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Скорость панорамирования средней кнопкой">Скорость панорамирования</label>
+                <input
+                  v-model.number="mousePanSpeed"
+                  type="number"
+                  min="0.5"
+                  max="10"
+                  step="0.5"
+                  class="viewer-mouse-input"
+                  @change="applyMouseSettings"
+                />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Затухание инерции вращения">Затухание вращения</label>
+                <input
+                  v-model.number="mouseDamping"
+                  type="number"
+                  min="0.05"
+                  max="0.8"
+                  step="0.01"
+                  class="viewer-mouse-input"
+                  @change="applyMouseSettings"
+                />
+              </div>
+              <div class="viewer-mouse-row">
+                <label class="viewer-mouse-label" title="Через сколько мс без прокрутки сбрасывается точка зума">Сброс точки зума (мс)</label>
+                <input
+                  v-model.number="mouseZoomGestureMs"
+                  type="number"
+                  min="100"
+                  max="2000"
+                  step="50"
+                  class="viewer-mouse-input"
+                />
+              </div>
+              <div class="viewer-mouse-row viewer-mouse-row-check">
+                <label class="viewer-mouse-label" title="Перетаскивание детали в сцене левой кнопкой">Левая кнопка: перемещение модели в сцене</label>
+                <input v-model="leftButtonMoveModel" type="checkbox" class="viewer-mouse-check" />
+              </div>
+            </div>
+          </Transition>
+          </div>
+        </div>
+        <div class="viewer-header-block">
+          <button
+            type="button"
+            class="viewer-3d-btn"
+            :class="{ active: wireframeModeRef }"
+            title="Каркас (проволочный вид)"
+            @click="toggleWireframe"
+          >
+            Каркас
+          </button>
+          <button
+            type="button"
+            class="viewer-3d-btn"
+            :class="{ active: sectionMode }"
+            title="Клик по модели задаёт плоскость сечения"
+            @click="emit('section-mode')"
+          >
+            Сечение
+          </button>
+          <button type="button" class="viewer-3d-btn btn-fix" title="Зафиксировать сечение" @click="emit('fix-section')">✓</button>
+          <button type="button" class="viewer-3d-btn btn-clear" title="Снять сечение" @click="emit('clear-section')">✕</button>
+          <template v-if="sectionActive">
+            <input
+              type="number"
+              class="viewer-3d-offset"
+              :min="SECTION_OFFSET_MIN"
+              :max="SECTION_OFFSET_MAX"
+              :step="SECTION_OFFSET_STEP"
+              :value="sectionOffset ?? 0"
+              @input="onHeaderOffsetInput"
+              @wheel.prevent="onHeaderOffsetWheel($event, sectionOffset ?? 0)"
+            />
+            <input
+              type="range"
+              class="viewer-3d-slider"
+              :min="SECTION_OFFSET_MIN"
+              :max="SECTION_OFFSET_MAX"
+              :step="SECTION_OFFSET_STEP"
+              :value="sectionOffset ?? 0"
+              @input="onHeaderOffsetInput"
+            />
+          </template>
+        </div>
+        <div class="viewer-header-block">
+          <button
+            type="button"
+            class="viewer-3d-btn"
+            :class="{ active: measureMode }"
+            @click="emit('measure')"
+          >
+            Измерение
+          </button>
+          <button type="button" class="viewer-3d-btn" @click="emit('clear-measurements')">Очистить</button>
+        </div>
+        <div class="viewer-header-block">
+          <button type="button" class="viewer-3d-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
+          <button type="button" class="viewer-3d-btn" @click="exportGlb">Экспорт GLB</button>
+          <button type="button" class="viewer-3d-btn" @click="exportStl">Экспорт STL</button>
+        </div>
+      </div>
+    </header>
+    <div class="viewer-body">
+      <div class="viewer-models-sidebar">
+        <div class="viewer-models-header">
+          <span class="viewer-models-title">Модели</span>
+          <span class="viewer-models-count">({{ loadedModels.length }})</span>
+          <button type="button" class="viewer-models-add" title="Добавить модель" @click="openFileDialog">+</button>
+        </div>
+        <div v-if="loadedModels.length === 0" class="viewer-models-empty">
+          Откройте модель или перетащите файлы (STL, STEP, IGES). В сцене — до {{ MAX_MODELS_IN_SCENE }}, загрузка — до {{ MAX_FILES_SELECT }} за раз.
+        </div>
+        <div v-else class="viewer-models-list">
+          <div
+            v-for="item in loadedModels"
+            :key="item.id"
+            class="viewer-models-card"
+            :class="{ 'viewer-models-card-hidden': !item.inScene }"
+            @click="!item.inScene && setModelInScene(item.id, true)"
+          >
+            <img :src="item.thumbnailDataUrl" :alt="item.name" class="viewer-models-thumb" />
+            <span class="viewer-models-name" :title="item.name">{{ item.name }}</span>
+            <div class="viewer-models-actions">
+              <button
+                v-if="item.inScene"
+                type="button"
+                class="viewer-models-btn"
+                title="Убрать из сцены"
+                @click.stop="setModelInScene(item.id, false)"
+              >
+                ⊖
+              </button>
+              <button
+                v-else
+                type="button"
+                class="viewer-models-btn viewer-models-btn-add"
+                title="Добавить в сцену"
+                @click.stop="setModelInScene(item.id, true)"
+              >
+                ⊕
+              </button>
+              <button type="button" class="viewer-models-btn viewer-models-btn-remove" title="Удалить модель" @click.stop="removeModel(item.id)">×</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="viewer-main">
+        <div ref="containerRef" class="viewer-container" />
+        <div v-if="isLoading" class="loading-overlay">
+          <span class="loading-text">Загрузка модели…</span>
+        </div>
+        <div class="viewer-scene-panel">
+          <div class="viewer-scene-panel-row">
+            <div ref="scenePanelOrientationRef" class="viewer-scene-dropdown">
+              <button
+                type="button"
+                class="viewer-scene-btn"
+                :class="{ open: scenePanelOrientationOpen }"
+                :disabled="!loadedModels.some(m => m.inScene)"
+                title="Ориентация вида"
+                @click.stop="scenePanelOrientationOpen = !scenePanelOrientationOpen"
+              >
+                <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18">
+                  <path d="M12 2 L22 8 L22 18 L12 24 L2 18 L2 8 Z" fill="currentColor" opacity="0.4"/>
+                  <path d="M2 8 L12 2 L22 8 L12 14 Z" fill="currentColor" opacity="0.7"/>
+                  <path d="M12 2 L22 8 L12 14 L2 8 Z" fill="currentColor"/>
+                </svg>
+              </button>
+              <Transition name="viewer-orient-fade">
+                <div v-show="scenePanelOrientationOpen" class="viewer-scene-menu">
+                  <button
+                    v-for="opt in ORIENTATION_OPTIONS"
+                    :key="opt.id"
+                    type="button"
+                    class="viewer-scene-item"
+                    :title="opt.tooltip"
+                    @click="setViewOrientation(opt.id); scenePanelOrientationOpen = false"
+                  >
+                    <template v-if="opt.hasIcon">
+                      <span class="viewer-scene-item-label">{{ opt.label }}</span>
+                    </template>
+                    <span v-else class="viewer-scene-item-text">{{ opt.label }}</span>
+                  </button>
+                </div>
+              </Transition>
+            </div>
+            <button
+              type="button"
+              class="viewer-scene-btn"
+              :class="{ active: wireframeModeRef }"
+              title="Каркас"
+              @click="toggleWireframe"
+            >
+              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM15 15h6v6h-6z"/>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="viewer-scene-btn"
+              :class="{ active: sectionMode }"
+              title="Сечение"
+              @click="emit('section-mode')"
+            >
+              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M4 4v16M20 4v16M4 12h16"/>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="viewer-scene-btn"
+              :disabled="!selectedFacePoint || !selectedFaceNormal"
+              title="Перпендикулярно"
+              @click="viewPerpendicularToFace"
+            >
+              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="1"/>
+                <path d="M12 3v18M3 12h18"/>
+                <circle cx="12" cy="12" r="2"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -2332,11 +3174,416 @@ defineExpose({
 .viewer-wrap {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+.viewer-3d-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0.6rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  flex-wrap: wrap;
+}
+.viewer-3d-title {
+  font-weight: 600;
+  color: #fff;
+}
+.viewer-3d-tools {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-wrap: wrap;
+}
+.viewer-header-block {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  padding: 0.2rem 0.5rem;
+  margin: 0 0.15rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.viewer-header-block:first-of-type {
+  margin-left: 0;
+}
+.viewer-3d-btn {
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #e0e0e0;
+  background: rgba(80, 110, 150, 0.5);
+}
+.viewer-3d-btn:hover {
+  background: rgba(100, 130, 180, 0.6);
+}
+.viewer-3d-btn.active {
+  background: #4a6fc7;
+  border-color: #5a7fd7;
+}
+.viewer-3d-btn.btn-fix {
+  width: 2rem;
+  color: #0a0;
+  background: rgba(40, 120, 60, 0.6);
+}
+.viewer-3d-btn.btn-clear {
+  width: 2rem;
+  color: #c00;
+  background: rgba(120, 40, 40, 0.6);
+}
+.viewer-orientation-dropdown {
+  position: relative;
+}
+.viewer-orient-trigger {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.viewer-orient-trigger.open {
+  background: rgba(100, 130, 180, 0.6);
+}
+.viewer-orient-trigger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.viewer-orient-cube {
+  flex-shrink: 0;
+}
+.viewer-orientation-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 0.2rem;
+  min-width: 160px;
+  background: #252525;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  padding: 0.3rem;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.viewer-orient-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  color: #e0e0e0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.viewer-orient-item:hover {
+  background: rgba(80, 110, 150, 0.5);
+}
+.viewer-orient-cube-icon {
+  flex-shrink: 0;
+}
+.viewer-orient-label {
+  flex: 1;
+}
+.viewer-orient-text-only {
+  padding-left: 0.25rem;
+}
+.viewer-orient-fade-enter-active,
+.viewer-orient-fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+.viewer-orient-fade-enter-from,
+.viewer-orient-fade-leave-to {
+  opacity: 0;
+}
+.viewer-mouse-dropdown {
+  /* same as orientation dropdown */
+}
+.viewer-mouse-menu {
+  min-width: 260px;
+  padding: 0.5rem;
+}
+.viewer-mouse-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+}
+.viewer-mouse-row-check {
+  align-items: center;
+}
+.viewer-mouse-label {
+  font-size: 0.78rem;
+  color: #b0b8c8;
+  flex: 1;
+  min-width: 0;
+}
+.viewer-mouse-input {
+  width: 5rem;
+  padding: 0.2rem 0.35rem;
+  font-size: 0.8rem;
+  background: rgba(0, 0, 0, 0.35);
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+.viewer-mouse-check {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #6a8bc7;
+}
+.viewer-3d-offset {
+  width: 4rem;
+  padding: 0.25rem 0.35rem;
+  font-size: 0.8rem;
+  background: rgba(0, 0, 0, 0.3);
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+.viewer-3d-slider {
+  width: 5rem;
+  vertical-align: middle;
+}
+.viewer-3d-select {
+  padding: 0.25rem 0.4rem;
+  font-size: 0.78rem;
+  background: rgba(0, 0, 0, 0.3);
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.viewer-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.viewer-models-sidebar {
+  flex-shrink: 0;
+  width: 140px;
+  background: #1e2433;
+  border-right: 1px solid #3a4a6a;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.viewer-models-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid #3a4a6a;
+}
+.viewer-models-title {
+  font-weight: 600;
+  color: #e0e8f0;
+}
+.viewer-models-count {
+  color: #8a9bb5;
+}
+.viewer-models-add {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 1.1rem;
+  line-height: 1;
+  background: #3d4a62;
+  color: #e0e8f0;
+  border: 1px solid #4a5f7a;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.viewer-models-add:hover {
+  background: #4a6fc7;
+}
+.viewer-models-empty {
+  flex: 1;
+  padding: 0.5rem;
+  font-size: 0.75rem;
+  color: #6a7a8a;
+  overflow-y: auto;
+}
+.viewer-models-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.viewer-models-card {
+  flex-shrink: 0;
+  position: relative;
+  background: #252525;
+  border: 1px solid #3a4a6a;
+  border-radius: 6px;
+  padding: 0.25rem;
+  cursor: pointer;
+}
+.viewer-models-card-hidden {
+  opacity: 0.7;
+  border-style: dashed;
+}
+.viewer-models-card-hidden:hover {
+  opacity: 1;
+}
+.viewer-models-thumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4/3;
+  object-fit: contain;
+  background: #1a1a1a;
+  border-radius: 4px;
+}
+.viewer-models-name {
+  display: block;
+  font-size: 0.65rem;
+  color: #a0b0c8;
+  margin-top: 0.2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viewer-models-actions {
+  position: absolute;
+  bottom: 0.4rem;
+  right: 0.4rem;
+  display: flex;
+  gap: 2px;
+}
+.viewer-models-btn {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  background: rgba(60, 80, 120, 0.9);
+  color: #e0e8f0;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.viewer-models-btn:hover {
+  background: #4a6fc7;
+}
+.viewer-models-btn-add {
+  background: rgba(60, 140, 80, 0.9);
+}
+.viewer-models-btn-add:hover {
+  background: #2d8a4a;
+}
+.viewer-models-btn-remove {
+  background: rgba(180, 60, 60, 0.9);
+}
+.viewer-models-btn-remove:hover {
+  background: #b43c3c;
+}
+.viewer-main {
+  flex: 1;
+  min-width: 0;
   position: relative;
 }
 .viewer-container {
   position: absolute;
   inset: 0;
+}
+.viewer-scene-panel {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  background: rgba(30, 36, 51, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+  overflow: visible;
+  isolation: isolate;
+}
+.viewer-scene-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.viewer-scene-dropdown {
+  position: relative;
+}
+.viewer-scene-btn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  background: rgba(60, 80, 120, 0.4);
+  color: #e0e0e0;
+  cursor: pointer;
+}
+.viewer-scene-btn:hover:not(:disabled) {
+  background: rgba(80, 110, 160, 0.6);
+}
+.viewer-scene-btn.active,
+.viewer-scene-btn.open {
+  background: rgba(90, 130, 200, 0.7);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+.viewer-scene-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.viewer-scene-icon {
+  flex-shrink: 0;
+}
+.viewer-scene-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  min-width: 100px;
+  background: #2a2e38;
+  border: 1px solid #555;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  padding: 4px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.viewer-scene-item,
+.viewer-scene-item-label,
+.viewer-scene-item-text {
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  color: #e0e0e0;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+.viewer-scene-item:hover {
+  background: rgba(80, 110, 150, 0.5);
 }
 .loading-overlay {
   position: absolute;

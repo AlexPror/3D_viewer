@@ -108,38 +108,34 @@ export async function loadStepOrIgesToGlbUrl(
   oc.FS.writeFile(filename, new Uint8Array(arrayBuffer))
   console.log(`${LOG_PREFIX} Файл записан в FS: ${filename}, размер ${arrayBuffer.byteLength}`)
 
-  let reader: any
+  const tTransfer = performance.now()
+  let url: string
+
   if (ext === 'step' || ext === 'stp') {
-    reader = new oc.STEPControl_Reader_1()
+    const reader = new oc.STEPControl_Reader_1()
+    reader.ReadFile(filename)
+    const progress = new oc.Message_ProgressRange_1()
+    reader.TransferRoots(progress)
+    const shape = reader.OneShape()
+    console.log(`${LOG_PREFIX} чтение + перенос: ${((performance.now() - tTransfer) / 1000).toFixed(2)} с`)
+    if (!shape || shape.IsNull()) throw new Error('Не удалось получить геометрию')
+    url = shapeToGlbUrl(oc, shape)
   } else if (ext === 'igs' || ext === 'iges') {
-    reader = new oc.IGESControl_Reader_1()
+    const reader = new oc.IGESControl_Reader_1()
+    const readStatus = reader.ReadFile(filename)
+    console.log(`${LOG_PREFIX} ReadFile статус:`, readStatus)
+    const progress = new oc.Message_ProgressRange_1()
+    reader.TransferRoots(progress)
+    const shape = reader.OneShape()
+    console.log(`${LOG_PREFIX} чтение + перенос: ${((performance.now() - tTransfer) / 1000).toFixed(2)} с`)
+    if (!shape || shape.IsNull()) throw new Error('Не удалось получить геометрию из файла')
+    url = shapeToGlbUrl(oc, shape)
   } else {
     throw new Error(`Неизвестное расширение: ${extension}`)
   }
 
-  const readStatus = reader.ReadFile(filename)
-  console.log(`${LOG_PREFIX} ReadFile статус:`, readStatus)
-
-  const tTransfer = performance.now()
-  const progress = new oc.Message_ProgressRange_1()
-  reader.TransferRoots(progress)
-  const shape = reader.OneShape()
-  console.log(`${LOG_PREFIX} чтение + перенос: ${((performance.now() - tTransfer) / 1000).toFixed(2)} с`)
-
-  if (!shape || shape.IsNull()) {
-    throw new Error('Не удалось получить геометрию из файла')
-  }
-
-  const timings = { tessellateMs: 0, exportMs: 0 }
-  try {
-    const url = shapeToGlbUrl(oc, shape, timings)
-    console.log(
-      `${LOG_PREFIX} конвертация STEP/IGES→GLB всего: ${((performance.now() - tTotal) / 1000).toFixed(2)} с`
-    )
-    return url
-  } catch (e) {
-    console.error(`${LOG_PREFIX} Ошибка при создании GLB:`, e)
-    if (e instanceof Error) console.error(`${LOG_PREFIX} message:`, e.message)
-    throw e
-  }
+  console.log(
+    `${LOG_PREFIX} конвертация STEP/IGES→GLB всего: ${((performance.now() - tTotal) / 1000).toFixed(2)} с`
+  )
+  return url
 }
