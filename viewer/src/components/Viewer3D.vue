@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import * as THREE from 'three'
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js'
 import { STLLoader } from 'three/addons/loaders/STLLoader.js'
@@ -11,6 +11,23 @@ import { logger } from '../lib/logger'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
+const activeTab = ref<'viewer' | 'spec'>('viewer')
+const stepMeta = ref<any | null>(null)
+
+/** Разделы спецификации по ГОСТ 2.106-96 с начальным номером позиции для каждого раздела. */
+const gostSpecSections = computed(() => {
+  const spec = stepMeta.value?.spec
+  if (!spec?.sections || typeof spec.sections !== 'object') return []
+  const sections = spec.sections as Record<string, unknown[]>
+  let pos = 1
+  return Object.entries(sections).map(([sectionName, rows]) => {
+    const list = Array.isArray(rows) ? rows : []
+    const startPos = pos
+    pos += list.length
+    return { sectionName, rows: list, startPos }
+  })
+})
+
 const props = defineProps<{
   sectionMode?: boolean
   sectionActive?: boolean
@@ -113,6 +130,8 @@ const DEFAULT_COLOR = 0x888888
 const DEFAULT_SPECULAR = 0x222222
 
 const MODEL_COLOR_LIGHT = 0xf2f4f6
+/** Один светло-серый для модели (на 50% светлее MODEL_COLOR_LIGHT). */
+const MODEL_COLOR_SINGLE = 0xf9f9fa
 
 /** Настройки мыши/камеры: дистанция и скорость. */
 const mouseMaxDistance = ref(50000)
@@ -136,11 +155,12 @@ function applyMouseSettings() {
 }
 
 function applyModelTint() {
+  const colorHex = MODEL_COLOR_SINGLE
   meshGroup.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
     const arr = Array.isArray(obj.material) ? obj.material : [obj.material]
     arr.forEach((m: THREE.Material) => {
-      if ('color' in m) (m as THREE.Material & { color: THREE.Color }).color.setHex(MODEL_COLOR_LIGHT)
+      if ('color' in m) (m as THREE.Material & { color: THREE.Color }).color.setHex(colorHex)
     })
   })
 }
@@ -733,7 +753,11 @@ function setViewOrientation(preset: ViewPreset) {
 }
 
 function viewPerpendicularToFace() {
-  if (!camera || !controls || !meshGroup?.children.length || !selectedFacePoint || !selectedFaceNormal) return
+  if (!camera || !controls || !meshGroup?.children.length) return
+  if (!selectedFacePoint || !selectedFaceNormal) {
+    logger.warn('Viewer3D', 'Сначала кликните по грани модели')
+    return
+  }
   const box = new THREE.Box3().setFromObject(meshGroup)
   const size = box.getSize(new THREE.Vector3())
   const maxDim = Math.max(size.x, size.y, size.z, 1)
@@ -2190,7 +2214,6 @@ function loadGlbUrl(
           loadedModels.value = []
         }
         wrapper.add(gltf.scene)
-        applyModelTint()
         if (opts && meshGroup.children.length > 0) {
           const box = new THREE.Box3().setFromObject(wrapper)
           const size = box.getSize(new THREE.Vector3())
@@ -2202,6 +2225,7 @@ function loadGlbUrl(
           if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
         }
         meshGroup.add(wrapper)
+        applyModelTint()
         if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
         else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
@@ -2362,6 +2386,11 @@ async function loadSTL(
 
 const LOG_PREFIX = '[Viewer3D]'
 
+/** Лимит размера файла для STEP/IGES (байты). 30 МБ. */
+const STEP_IGES_MAX_FILE_BYTES = 30 * 1024 * 1024
+
+/** Для STEP: сначала пробуем конвертацию на сервере; при 501/500/413 — fallback на WASM. */
+
 function handleFile(file: File): Promise<void> {
   return new Promise((resolve, reject) => {
     const ext = (file.name.split('.').pop() || '').toLowerCase()
@@ -2385,12 +2414,52 @@ function handleFile(file: File): Promise<void> {
       return
     }
     if (['step', 'stp', 'igs', 'iges'].includes(ext)) {
-      console.log(`формат: ${ext.toUpperCase()} — загрузка через opencascade.js`)
+      console.log(`формат: ${ext.toUpperCase()} — загрузка через opencascade.js или сервер`)
       console.groupEnd()
+      if (file.size > STEP_IGES_MAX_FILE_BYTES) {
+        const mb = (STEP_IGES_MAX_FILE_BYTES / (1024 * 1024)).toFixed(0)
+        logger.warn('Viewer3D', `Файл больше ${mb} МБ. Лимит загрузки: ${mb} МБ.`)
+        resolve()
+        return
+      }
       isLoading.value = true
+      stepMeta.value = null
       const t0 = performance.now()
       try {
-        const glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+        let metaPromise: Promise<any> | null = null
+        if (ext === 'step' || ext === 'stp') {
+          const fd = new FormData()
+          fd.append('file', file, file.name)
+          metaPromise = fetch('/api/step/metadata', { method: 'POST', body: fd })
+            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`metadata ${r.status} ${r.statusText}`))))
+            .catch((e) => {
+              console.warn(`${LOG_PREFIX} metadata server недоступен:`, e)
+              return null
+            })
+        }
+        let glbUrl: string
+        if (ext === 'step' || ext === 'stp') {
+          try {
+            const fdConvert = new FormData()
+            fdConvert.append('file', file, file.name)
+            const res = await fetch('/api/convert/step-to-glb', { method: 'POST', body: fdConvert })
+            if (res.ok) {
+              const blob = await res.blob()
+              glbUrl = URL.createObjectURL(blob)
+              console.log(`${LOG_PREFIX} конвертация на сервере`)
+            } else {
+              if (res.status === 413) logger.warn('Viewer3D', 'Файл слишком большой для сервера (лимит 100 МБ)')
+              glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+            }
+          } catch (e) {
+            console.warn(`${LOG_PREFIX} серверная конвертация недоступна, используем WASM:`, e)
+            glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+          }
+        } else {
+          glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+        }
+        const meta = metaPromise ? await metaPromise : null
+        stepMeta.value = meta
         await loadGlbUrl(glbUrl, performance.now(), opts)
         const totalMs = performance.now() - t0
         logger.info('Viewer3D', `Модель загружена: ${file.name} за ${(totalMs / 1000).toFixed(2)} с`)
@@ -2829,7 +2898,24 @@ defineExpose({
 
 <template>
   <div class="viewer-wrap">
-    <header class="viewer-3d-header">
+    <div class="viewer-tabs">
+      <button
+        type="button"
+        :class="{ active: activeTab === 'viewer' }"
+        @click="activeTab = 'viewer'"
+      >
+        3D / 2D
+      </button>
+      <button
+        type="button"
+        :class="{ active: activeTab === 'spec' }"
+        @click="activeTab = 'spec'"
+      >
+        Спецификация
+      </button>
+    </div>
+
+    <header class="viewer-3d-header" v-show="activeTab === 'viewer'">
       <span class="viewer-3d-title">3D</span>
       <div class="viewer-3d-tools">
         <div class="viewer-header-block">
@@ -3044,7 +3130,7 @@ defineExpose({
         </div>
       </div>
     </header>
-    <div class="viewer-body">
+    <div class="viewer-body" v-show="activeTab === 'viewer'">
       <div class="viewer-models-sidebar">
         <div class="viewer-models-header">
           <span class="viewer-models-title">Модели</span>
@@ -3153,8 +3239,7 @@ defineExpose({
             <button
               type="button"
               class="viewer-scene-btn"
-              :disabled="!selectedFacePoint || !selectedFaceNormal"
-              title="Перпендикулярно"
+              title="Перпендикулярно (клик по грани модели — затем сюда)"
               @click="viewPerpendicularToFace"
             >
               <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -3167,6 +3252,51 @@ defineExpose({
         </div>
       </div>
     </div>
+
+    <div v-show="activeTab === 'spec'" class="spec-panel">
+      <div v-if="stepMeta && stepMeta.spec" class="spec-section gost-spec" :key="(stepMeta.sha1 || stepMeta.filename || '') + '_' + (stepMeta.spec?.totals?.item_count ?? 0)">
+        <table class="spec-table gost-spec-table">
+          <thead>
+            <tr>
+              <th class="gost-th-pos">Поз.</th>
+              <th class="gost-th-designation">Обозначение</th>
+              <th class="gost-th-name">Наименование</th>
+              <th class="gost-th-qty">Кол.</th>
+              <th class="gost-th-mass-unit">Масса ед., кг</th>
+              <th class="gost-th-mass-total">Масса общ., кг</th>
+              <th class="gost-th-note">Примечание</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template v-for="block in gostSpecSections" :key="block.sectionName">
+              <tr class="gost-section-header">
+                <td colspan="7" class="gost-section-name">{{ block.sectionName }}</td>
+              </tr>
+              <tr
+                v-for="(row, idx) in block.rows"
+                :key="block.sectionName + '|' + (row.designation || '') + '|' + (row.name || '') + '|' + idx"
+                class="gost-data-row"
+              >
+                <td class="gost-pos">{{ block.startPos + idx }}</td>
+                <td class="gost-designation">{{ row.designation || '—' }}</td>
+                <td class="gost-name">{{ row.name || '—' }}</td>
+                <td class="gost-qty">{{ row.qty }}</td>
+                <td class="gost-mass-unit">{{ row.mass_unit != null && row.mass_unit > 0 ? row.mass_unit.toFixed(3) : '—' }}</td>
+                <td class="gost-mass-total">{{ row.mass_total != null && row.mass_total > 0 ? row.mass_total.toFixed(3) : '—' }}</td>
+                <td class="gost-note">{{ row.note || '' }}</td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div class="spec-totals">
+          Итого позиций: {{ stepMeta.spec.totals.item_count }},
+          общая масса: {{ stepMeta.spec.totals.mass_total.toFixed(2) }} кг
+        </div>
+      </div>
+      <div v-else>
+        Загрузите STEP, чтобы увидеть спецификацию.
+      </div>
+    </div>
   </div>
 </template>
 
@@ -3177,6 +3307,26 @@ defineExpose({
   display: flex;
   flex-direction: column;
   position: relative;
+}
+.viewer-tabs {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  background: #111;
+  border-bottom: 1px solid #333;
+}
+.viewer-tabs button {
+  border: none;
+  background: #2a2a2a;
+  color: #ccc;
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.viewer-tabs button.active {
+  background: #3d6af2;
+  color: #fff;
 }
 .viewer-3d-header {
   flex-shrink: 0;
@@ -3493,6 +3643,87 @@ defineExpose({
 }
 .viewer-models-btn-remove:hover {
   background: #b43c3c;
+}
+.spec-panel {
+  padding: 0.5rem 0.75rem;
+  overflow: auto;
+  max-height: 100%;
+  background: #1a1a1a;
+  color: #eee;
+}
+.spec-section {
+  margin-bottom: 1rem;
+}
+.spec-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  table-layout: fixed;
+}
+.spec-table th,
+.spec-table td {
+  border: 1px solid #444;
+  padding: 4px 8px;
+  vertical-align: middle;
+}
+.spec-totals {
+  margin-top: 0.5rem;
+  font-weight: 500;
+}
+
+/* ГОСТ 2.106-96: размеры граф по усмотрению разработчика */
+.gost-spec-table {
+  font-size: 0.9rem;
+}
+.gost-th-pos,
+.gost-pos {
+  width: 40px;
+  min-width: 40px;
+  text-align: center;
+}
+.gost-th-designation,
+.gost-designation {
+  width: 140px;
+  min-width: 120px;
+}
+.gost-th-name,
+.gost-name {
+  width: auto;
+  min-width: 180px;
+}
+.gost-th-qty,
+.gost-qty {
+  width: 50px;
+  min-width: 50px;
+  text-align: center;
+}
+.gost-th-mass-unit,
+.gost-mass-unit {
+  width: 90px;
+  min-width: 80px;
+  text-align: right;
+}
+.gost-th-mass-total,
+.gost-mass-total {
+  width: 95px;
+  min-width: 85px;
+  text-align: right;
+}
+.gost-th-note,
+.gost-note {
+  width: 120px;
+  min-width: 80px;
+}
+.gost-section-header td {
+  font-weight: 600;
+  padding: 6px 8px;
+  border-bottom: 1px solid #666;
+}
+.gost-section-name {
+  text-decoration: underline;
+}
+.gost-data-row td {
+  background: rgba(30, 30, 30, 0.5);
 }
 .viewer-main {
   flex: 1;

@@ -8,6 +8,8 @@ dist/
 # Env
 .env
 .env.*
+.venv/
+venv/
 
 # IDE / OS
 .idea/

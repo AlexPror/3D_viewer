@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-multipart
+numpy>=1.20,<2
+trimesh
+cadquery
