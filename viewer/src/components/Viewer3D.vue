@@ -90,6 +90,32 @@ let lastHoverPoint: THREE.Vector3 | null = null
 const measureModeRef = ref(false)
 const sectionModeRef = ref(false)
 const wireframeModeRef = ref(false)
+/** Прозрачность граней в режиме «Каркас» (0.25 — видно углы и рёбра). Регулируется с панели. */
+const frameOpacityRef = ref(0.25)
+const FRAME_OPACITY_MIN = 0.05
+const FRAME_OPACITY_MAX = 0.95
+const FRAME_OPACITY_STEP = 0.05
+
+function clampFrameOpacity(v: number): number {
+  return Math.max(FRAME_OPACITY_MIN, Math.min(FRAME_OPACITY_MAX, v))
+}
+
+function onFrameOpacityInput(ev: Event) {
+  const val = Number((ev.target as HTMLInputElement).value)
+  if (Number.isFinite(val)) {
+    const next = clampFrameOpacity(val)
+    frameOpacityRef.value = next
+    if (wireframeModeRef.value) applyWireframeToObject(meshGroup, true, next)
+  }
+}
+
+function onFrameOpacityWheel(ev: WheelEvent) {
+  const delta = ev.deltaY > 0 ? -FRAME_OPACITY_STEP : FRAME_OPACITY_STEP
+  const next = clampFrameOpacity(frameOpacityRef.value + delta)
+  frameOpacityRef.value = next
+  if (wireframeModeRef.value) applyWireframeToObject(meshGroup, true, next)
+}
+
 /** Выбранная грань для кнопки «Перпендикулярно» (центр и нормаль в мировой СК). */
 let selectedFacePoint: THREE.Vector3 | null = null
 let selectedFaceNormal: THREE.Vector3 | null = null
@@ -778,12 +804,18 @@ function viewPerpendicularToFace() {
   controls.update()
 }
 
-function applyWireframeToObject(obj: THREE.Object3D, enabled: boolean) {
+function applyWireframeToObject(obj: THREE.Object3D, enabled: boolean, opacityValue?: number) {
+  const opacity = opacityValue ?? frameOpacityRef.value
   obj.traverse((o: THREE.Object3D) => {
     if (o instanceof THREE.Mesh && o.material) {
       const arr = Array.isArray(o.material) ? o.material : [o.material]
       arr.forEach((m: THREE.Material) => {
-        if ('wireframe' in m) (m as THREE.Material & { wireframe: boolean }).wireframe = enabled
+        const mat = m as THREE.Material & { wireframe?: boolean; transparent?: boolean; opacity?: number; depthWrite?: boolean }
+        if ('wireframe' in mat) mat.wireframe = false
+        if ('transparent' in mat) mat.transparent = enabled
+        if ('opacity' in mat) mat.opacity = enabled ? opacity : 1
+        if (enabled && 'depthWrite' in mat) mat.depthWrite = false
+        if (!enabled && 'depthWrite' in mat) mat.depthWrite = true
       })
     }
   })
@@ -3069,16 +3101,38 @@ defineExpose({
           </Transition>
           </div>
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block viewer-header-block-frame">
           <button
             type="button"
             class="viewer-3d-btn"
             :class="{ active: wireframeModeRef }"
-            title="Каркас (проволочный вид)"
+            :title="`Каркас (прозрачные грани, opacity ${frameOpacityRef})`"
             @click="toggleWireframe"
           >
             Каркас
           </button>
+          <input
+            type="number"
+            class="viewer-frame-opacity-input"
+            :min="FRAME_OPACITY_MIN"
+            :max="FRAME_OPACITY_MAX"
+            :step="FRAME_OPACITY_STEP"
+            :value="frameOpacityRef"
+            title="Прозрачность граней (колёсико или ввод)"
+            @input="onFrameOpacityInput"
+            @wheel.prevent="onFrameOpacityWheel"
+          />
+          <input
+            type="range"
+            class="viewer-frame-opacity-slider"
+            :min="FRAME_OPACITY_MIN"
+            :max="FRAME_OPACITY_MAX"
+            :step="FRAME_OPACITY_STEP"
+            :value="frameOpacityRef"
+            @input="onFrameOpacityInput"
+          />
+        </div>
+        <div class="viewer-header-block">
           <button
             type="button"
             class="viewer-3d-btn"
@@ -3214,17 +3268,30 @@ defineExpose({
                 </div>
               </Transition>
             </div>
-            <button
-              type="button"
-              class="viewer-scene-btn"
-              :class="{ active: wireframeModeRef }"
-              title="Каркас"
-              @click="toggleWireframe"
-            >
-              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM15 15h6v6h-6z"/>
-              </svg>
-            </button>
+            <div class="viewer-scene-frame-block">
+              <button
+                type="button"
+                class="viewer-scene-btn"
+                :class="{ active: wireframeModeRef }"
+                :title="`Каркас (прозрачные грани ${frameOpacityRef})`"
+                @click="toggleWireframe"
+              >
+                <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM15 15h6v6h-6z"/>
+                </svg>
+              </button>
+              <input
+                type="number"
+                class="viewer-scene-frame-opacity-input"
+                :min="FRAME_OPACITY_MIN"
+                :max="FRAME_OPACITY_MAX"
+                :step="FRAME_OPACITY_STEP"
+                :value="frameOpacityRef"
+                title="Прозрачность (колёсико или ввод)"
+                @input="onFrameOpacityInput"
+                @wheel.prevent="onFrameOpacityWheel"
+              />
+            </div>
             <button
               type="button"
               class="viewer-scene-btn"
@@ -3361,6 +3428,28 @@ defineExpose({
 }
 .viewer-header-block:first-of-type {
   margin-left: 0;
+}
+.viewer-header-block-frame {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.viewer-frame-opacity-input {
+  width: 2.8rem;
+  padding: 0.2rem 0.25rem;
+  font-size: 0.75rem;
+  color: #e0e0e0;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  text-align: center;
+}
+.viewer-frame-opacity-input::-webkit-inner-spin-button {
+  opacity: 1;
+}
+.viewer-frame-opacity-slider {
+  width: 4rem;
+  vertical-align: middle;
 }
 .viewer-3d-btn {
   padding: 0.3rem 0.55rem;
@@ -3783,6 +3872,24 @@ defineExpose({
 }
 .viewer-scene-icon {
   flex-shrink: 0;
+}
+.viewer-scene-frame-block {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.viewer-scene-frame-opacity-input {
+  width: 2.2rem;
+  padding: 2px 4px;
+  font-size: 0.7rem;
+  color: #e0e0e0;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  text-align: center;
+}
+.viewer-scene-frame-opacity-input::-webkit-inner-spin-button {
+  opacity: 1;
 }
 .viewer-scene-menu {
   position: absolute;
