@@ -1,8 +1,16 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { logger } from '../lib/logger'
+import type { LogLevel } from '../lib/logger'
 
 const logText = ref('')
+const logMode = ref<'full' | 'normal' | 'quiet'>(
+  logger.getMinLevel() === 'debug'
+    ? 'full'
+    : logger.getMinLevel() === 'warn'
+      ? 'quiet'
+      : 'normal'
+)
 let unbind: (() => void) | null = null
 
 function appendLine(line: string) {
@@ -39,6 +47,15 @@ function clearLog() {
   logText.value = ''
 }
 
+function onChangeLogMode() {
+  const map: Record<'full' | 'normal' | 'quiet', LogLevel> = {
+    full: 'debug',
+    normal: 'info',
+    quiet: 'warn',
+  }
+  logger.setMinLevel(map[logMode.value])
+}
+
 onMounted(() => {
   loadInitial()
   logger.setUiCallback(appendLine)
@@ -53,6 +70,12 @@ onUnmounted(() => {
 <template>
   <div class="log-panel">
     <div class="log-toolbar">
+      <label class="log-mode-label">Режим:</label>
+      <select v-model="logMode" class="log-mode-select" @change="onChangeLogMode">
+        <option value="full">Полный</option>
+        <option value="normal">Обычный</option>
+        <option value="quiet">Тихий</option>
+      </select>
       <button type="button" class="log-btn" @click="saveLog">Сохранить лог</button>
       <button type="button" class="log-btn log-btn-clear" @click="clearLog">Очистить</button>
     </div>
@@ -81,6 +104,19 @@ onUnmounted(() => {
   border-bottom: 1px solid #333;
   display: flex;
   gap: 0.5rem;
+}
+.log-mode-label {
+  color: #d5dce8;
+  font-size: 0.82rem;
+  align-self: center;
+}
+.log-mode-select {
+  padding: 0.25rem 0.45rem;
+  background: #1f2b3f;
+  color: #e7edf7;
+  border: 1px solid #4a5f7a;
+  border-radius: 4px;
+  font-size: 0.82rem;
 }
 .log-btn {
   padding: 0.3rem 0.6rem;

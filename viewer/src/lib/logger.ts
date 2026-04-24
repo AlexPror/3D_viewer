@@ -15,6 +15,13 @@ export interface LogEntry {
 const LEVEL_PAD = 8
 const entries: LogEntry[] = []
 let uiCallback: ((line: string) => void) | null = null
+const LEVEL_RANK: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+}
+let minLevel: LogLevel = 'info'
 
 function formatTime(): string {
   const d = new Date()
@@ -33,6 +40,7 @@ function formatLine(entry: LogEntry): string {
 }
 
 function emit(level: LogLevel, name: string, message: string): void {
+  if (LEVEL_RANK[level] < LEVEL_RANK[minLevel]) return
   const entry: LogEntry = {
     time: formatTime(),
     level,
@@ -68,6 +76,12 @@ export const logger = {
   /** Подписка UI: при каждой новой записи вызывается callback с отформатированной строкой */
   setUiCallback(cb: ((line: string) => void) | null): void {
     uiCallback = cb
+  },
+  setMinLevel(level: LogLevel): void {
+    minLevel = level
+  },
+  getMinLevel(): LogLevel {
+    return minLevel
   },
   /** Все записи за сессию (для панели при открытии вкладки) */
   getEntries(): LogEntry[] {

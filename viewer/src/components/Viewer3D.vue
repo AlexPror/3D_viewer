@@ -65,8 +65,16 @@ let meshGroup: THREE.Group
 let measureGroup: THREE.Group
 let highlightGroup: THREE.Group
 let axesHelper: THREE.Group | null = null
+let groundGrid: THREE.GridHelper | null = null
 let raycaster: THREE.Raycaster
 let mouse: THREE.Vector2
+const HOVER_UPDATE_INTERVAL_MS = 80
+let hoverDirty = true
+let lastHoverUpdateAt = 0
+let isCameraInteracting = false
+const INTERACTION_PIXEL_RATIO = 0.75
+let idlePixelRatio = 1
+const showGroundGrid = ref(true)
 let measurementPoints: THREE.Vector3[] = []
 let measurementPointNormals: (THREE.Vector3 | null)[] = []
 let measurementLine: THREE.Line | null = null
@@ -143,11 +151,32 @@ export interface LoadedModelItem {
   inScene: boolean
 }
 
+type SavedMeasureType = 'distance'
+type SavedVec3 = { x: number; y: number; z: number }
+
+interface SavedMeasurement {
+  id: string
+  type: SavedMeasureType
+  createdAt: string
+  lengthMm: number
+  parallelMm: number
+  trianglePerpMm: number
+  surfacePerpMm: number | null
+  p1: SavedVec3
+  p2: SavedVec3
+  n1: SavedVec3 | null
+  n2: SavedVec3 | null
+}
+
 const MAX_MODELS_IN_SCENE = 8
 const MAX_FILES_SELECT = 5
 const THUMBNAIL_PLACEHOLDER = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="160" height="120"><rect fill="%23252" width="160" height="120"/><text x="80" y="60" fill="%238a9bb5" text-anchor="middle" font-size="12">…</text></svg>'
 
 const loadedModels = ref<LoadedModelItem[]>([])
+const measurementHistory = ref<SavedMeasurement[]>([])
+const selectedMeasurementId = ref<string | null>(null)
+const measurementsPanelPos = ref({ x: 14, y: 14 })
+let measurementsPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
 const modelGroupsById = new Map<string, THREE.Group>()
 const savedCameraPosition = new THREE.Vector3(500, 400, 500)
 const savedCameraTarget = new THREE.Vector3(0, 0, 0)
@@ -158,6 +187,15 @@ const DEFAULT_SPECULAR = 0x222222
 const MODEL_COLOR_LIGHT = 0xf2f4f6
 /** Один светло-серый для модели (на 50% светлее MODEL_COLOR_LIGHT). */
 const MODEL_COLOR_SINGLE = 0xf9f9fa
+const TINT_BRIGHTNESS_MIN = 0.65
+const TINT_BRIGHTNESS_MAX = 1.35
+const TINT_BRIGHTNESS_STEP = 0.05
+const tintBrightness = ref(1)
+const sceneSurfaceAreaMm2 = ref<number | null>(null)
+const sceneVolumeMm3 = ref<number | null>(null)
+const sceneTriangles = ref<number>(0)
+const isMetricsCalculating = ref(false)
+let metricsJobSeq = 0
 
 /** Настройки мыши/камеры: дистанция и скорость. */
 const mouseMaxDistance = ref(50000)
@@ -181,7 +219,12 @@ function applyMouseSettings() {
 }
 
 function applyModelTint() {
-  const colorHex = MODEL_COLOR_SINGLE
+  if (!meshGroup) return
+  const base = new THREE.Color(MODEL_COLOR_SINGLE)
+  const hsl = { h: 0, s: 0, l: 0 }
+  base.getHSL(hsl)
+  const lightness = Math.max(0, Math.min(1, hsl.l * tintBrightness.value))
+  const colorHex = new THREE.Color().setHSL(hsl.h, hsl.s, lightness).getHex()
   meshGroup.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
     const arr = Array.isArray(obj.material) ? obj.material : [obj.material]
@@ -191,8 +234,233 @@ function applyModelTint() {
   })
 }
 
+function clampTintBrightness(v: number): number {
+  return Math.min(TINT_BRIGHTNESS_MAX, Math.max(TINT_BRIGHTNESS_MIN, v))
+}
+
+function onTintBrightnessInput(ev: Event) {
+  const val = Number((ev.target as HTMLInputElement).value)
+  if (!Number.isFinite(val)) return
+  tintBrightness.value = clampTintBrightness(val)
+  applyModelTint()
+}
+
+function onTintBrightnessWheel(ev: WheelEvent) {
+  const delta = ev.deltaY > 0 ? -TINT_BRIGHTNESS_STEP : TINT_BRIGHTNESS_STEP
+  tintBrightness.value = clampTintBrightness(tintBrightness.value + delta)
+  applyModelTint()
+}
+
+function calculateSceneMetrics(): { areaMm2: number; volumeMm3: number; triangles: number } {
+  if (!meshGroup) return { areaMm2: 0, volumeMm3: 0, triangles: 0 }
+  meshGroup.updateMatrixWorld(true)
+  let area = 0
+  let volume = 0
+  let triangles = 0
+  const va = new THREE.Vector3()
+  const vb = new THREE.Vector3()
+  const vc = new THREE.Vector3()
+  const ab = new THREE.Vector3()
+  const ac = new THREE.Vector3()
+  const cross = new THREE.Vector3()
+
+  const accumulateTriangle = (ia: number, ib: number, ic: number, pos: THREE.BufferAttribute, mw: THREE.Matrix4) => {
+    va.fromBufferAttribute(pos, ia).applyMatrix4(mw)
+    vb.fromBufferAttribute(pos, ib).applyMatrix4(mw)
+    vc.fromBufferAttribute(pos, ic).applyMatrix4(mw)
+    ab.subVectors(vb, va)
+    ac.subVectors(vc, va)
+    cross.crossVectors(ab, ac)
+    area += 0.5 * cross.length()
+    volume += va.dot(cross) / 6
+    triangles++
+  }
+
+  meshGroup.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.visible) return
+    const geom = obj.geometry
+    if (!(geom instanceof THREE.BufferGeometry)) return
+    const pos = geom.getAttribute('position')
+    if (!(pos instanceof THREE.BufferAttribute)) return
+    const idx = geom.getIndex()
+    const mw = obj.matrixWorld
+    if (idx) {
+      const arr = idx.array
+      for (let i = 0; i < arr.length; i += 3) {
+        accumulateTriangle(arr[i] as number, arr[i + 1] as number, arr[i + 2] as number, pos, mw)
+      }
+    } else {
+      for (let i = 0; i < pos.count; i += 3) {
+        accumulateTriangle(i, i + 1, i + 2, pos, mw)
+      }
+    }
+  })
+
+  return { areaMm2: area, volumeMm3: Math.abs(volume), triangles }
+}
+
+function scheduleSceneMetricsRecalc() {
+  const jobId = ++metricsJobSeq
+  if (!meshGroup || meshGroup.children.length === 0) {
+    sceneSurfaceAreaMm2.value = null
+    sceneVolumeMm3.value = null
+    sceneTriangles.value = 0
+    isMetricsCalculating.value = false
+    return
+  }
+  isMetricsCalculating.value = true
+  setTimeout(() => {
+    if (jobId !== metricsJobSeq) return
+    const m = calculateSceneMetrics()
+    if (jobId !== metricsJobSeq) return
+    sceneSurfaceAreaMm2.value = m.areaMm2
+    sceneVolumeMm3.value = m.volumeMm3
+    sceneTriangles.value = m.triangles
+    isMetricsCalculating.value = false
+  }, 0)
+}
+
+const sceneMetricsText = computed(() => {
+  if (isMetricsCalculating.value) return 'Расчет площади/объема...'
+  if (sceneSurfaceAreaMm2.value == null || sceneVolumeMm3.value == null) return 'Площадь/объем: —'
+  const areaM2 = sceneSurfaceAreaMm2.value / 1_000_000
+  const volumeL = sceneVolumeMm3.value / 1_000_000
+  return `S: ${areaM2.toFixed(3)} м² | V: ${volumeL.toFixed(3)} л | △ ${sceneTriangles.value.toLocaleString('ru-RU')}`
+})
+
+function vecToSaved(v: THREE.Vector3): SavedVec3 {
+  return { x: v.x, y: v.y, z: v.z }
+}
+
+function savedToVec(v: SavedVec3): THREE.Vector3 {
+  return new THREE.Vector3(v.x, v.y, v.z)
+}
+
+function saveDistanceMeasurement() {
+  if (measurementPoints.length !== 2) return
+  const [a, b] = measurementPoints
+  const delta = b.clone().sub(a)
+  const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
+  const bPrime = b.clone().sub(perpComp)
+  const parallelMm = a.distanceTo(bPrime)
+  const trianglePerpMm = bPrime.distanceTo(b)
+  const nA = measurementPointNormals[0] ?? null
+  const nB = measurementPointNormals[1] ?? null
+  let surfacePerpMm: number | null = null
+  if (nA || nB) {
+    const baseNormal = (nB || nA)!.clone().normalize()
+    const basePoint = nB ? b : a
+    const otherPoint = nB ? a : b
+    surfacePerpMm = Math.abs(otherPoint.clone().sub(basePoint).dot(baseNormal))
+  }
+  const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const row: SavedMeasurement = {
+    id,
+    type: 'distance',
+    createdAt: new Date().toLocaleTimeString('ru-RU'),
+    lengthMm: a.distanceTo(b),
+    parallelMm,
+    trianglePerpMm,
+    surfacePerpMm,
+    p1: vecToSaved(a),
+    p2: vecToSaved(b),
+    n1: measurementPointNormals[0] ? vecToSaved(measurementPointNormals[0]!) : null,
+    n2: measurementPointNormals[1] ? vecToSaved(measurementPointNormals[1]!) : null,
+  }
+  measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+  selectedMeasurementId.value = row.id
+}
+
+function restoreMeasurement(row: SavedMeasurement) {
+  if (row.type !== 'distance') return
+  measureType = 'distance'
+  measureModeRef.value = true
+  clearMeasurements()
+  measurementPoints = [savedToVec(row.p1), savedToVec(row.p2)]
+  measurementPointNormals = [row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null]
+  updateMeasurementGraphics()
+  selectedMeasurementId.value = row.id
+  const mid = measurementPoints[0].clone().add(measurementPoints[1]).multiplyScalar(0.5)
+  controls.target.copy(mid)
+  controls.update()
+}
+
+function clearMeasurementHistory() {
+  measurementHistory.value = []
+  selectedMeasurementId.value = null
+}
+
+function removeMeasurement(id: string) {
+  measurementHistory.value = measurementHistory.value.filter((m) => m.id !== id)
+  if (selectedMeasurementId.value === id) {
+    selectedMeasurementId.value = null
+  }
+}
+
+function onMeasurementsPanelMouseDown(ev: MouseEvent) {
+  measurementsPanelDragStart = {
+    x: ev.clientX,
+    y: ev.clientY,
+    startX: measurementsPanelPos.value.x,
+    startY: measurementsPanelPos.value.y,
+  }
+  window.addEventListener('mousemove', onMeasurementsPanelMouseMove)
+  window.addEventListener('mouseup', onMeasurementsPanelMouseUp)
+}
+
+function onMeasurementsPanelMouseMove(ev: MouseEvent) {
+  if (!measurementsPanelDragStart) return
+  const dx = ev.clientX - measurementsPanelDragStart.x
+  const dy = ev.clientY - measurementsPanelDragStart.y
+  measurementsPanelPos.value = {
+    x: Math.max(0, measurementsPanelDragStart.startX + dx),
+    y: Math.max(0, measurementsPanelDragStart.startY + dy),
+  }
+}
+
+function onMeasurementsPanelMouseUp() {
+  measurementsPanelDragStart = null
+  window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
+  window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
+}
+
 const SNAP_SCREEN_THRESHOLD = 0.08
 const snapProj = new THREE.Vector3()
+
+function updateGroundGrid(box?: THREE.Box3) {
+  if (!scene) return
+  if (groundGrid) {
+    scene.remove(groundGrid)
+    groundGrid.geometry.dispose()
+    const mat = groundGrid.material
+    if (Array.isArray(mat)) mat.forEach((m) => m.dispose())
+    else mat.dispose()
+    groundGrid = null
+  }
+  if (!showGroundGrid.value) return
+
+  const sizeVec = box ? box.getSize(new THREE.Vector3()) : new THREE.Vector3(2000, 2000, 2000)
+  const maxDim = Math.max(sizeVec.x, sizeVec.y, sizeVec.z)
+  const gridSize = Math.max(1000, Math.ceil(maxDim * 1.6 / 100) * 100)
+  const divisions = Math.min(100, Math.max(20, Math.round(gridSize / 100)))
+  const y = box ? box.min.y : 0
+  groundGrid = new THREE.GridHelper(gridSize, divisions, 0x9aa7bb, 0xd7dee8)
+  groundGrid.position.set(0, y, 0)
+  ;(groundGrid.material as THREE.Material).transparent = true
+  ;(groundGrid.material as THREE.Material).opacity = 0.45
+  scene.add(groundGrid)
+}
+
+function toggleGroundGrid() {
+  showGroundGrid.value = !showGroundGrid.value
+  if (!showGroundGrid.value) {
+    updateGroundGrid()
+    return
+  }
+  const hasModels = meshGroup && meshGroup.children.length > 0
+  const box = hasModels ? new THREE.Box3().setFromObject(meshGroup) : undefined
+  updateGroundGrid(box)
+}
 
 function initScene() {
   if (!containerRef.value) return
@@ -210,7 +478,8 @@ function initScene() {
 
   renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
   renderer.setSize(containerRef.value.clientWidth, containerRef.value.clientHeight)
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+  idlePixelRatio = Math.min(window.devicePixelRatio, 2)
+  renderer.setPixelRatio(idlePixelRatio)
   renderer.outputColorSpace = THREE.SRGBColorSpace
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1
@@ -227,6 +496,8 @@ function initScene() {
     MIDDLE: THREE.MOUSE.PAN,
     RIGHT: THREE.MOUSE.ROTATE,
   }
+  controls.addEventListener('start', onControlsStart)
+  controls.addEventListener('end', onControlsEnd)
   applyMouseSettings()
   controls.handleResize()
   savedCameraPosition.copy(camera.position)
@@ -256,6 +527,7 @@ function initScene() {
   const axes = new THREE.AxesHelper(axesSize)
   axesHelper.add(axes)
   scene.add(axesHelper)
+  updateGroundGrid()
 
   raycaster = new THREE.Raycaster()
   mouse = new THREE.Vector2()
@@ -313,16 +585,19 @@ function initScene() {
     controls.update()
     let hits: THREE.Intersection[] = []
     if (measureModeRef.value && meshGroup.children.length && containerRef.value) {
-      const rect = renderer.domElement.getBoundingClientRect()
-      raycaster.setFromCamera(mouse, camera)
-      hits = raycaster.intersectObject(meshGroup, true)
-      while (highlightGroup.children.length) {
-        const c = highlightGroup.children[0]
-        highlightGroup.remove(c)
-        if ('geometry' in c && c.geometry) c.geometry.dispose()
-        if ('material' in c && c.material) (c.material as THREE.Material).dispose()
-      }
-      if (hits.length > 0) {
+      const now = performance.now()
+      const shouldUpdateHover = !isCameraInteracting && (hoverDirty || now - lastHoverUpdateAt >= HOVER_UPDATE_INTERVAL_MS)
+      if (shouldUpdateHover) {
+        const rect = renderer.domElement.getBoundingClientRect()
+        raycaster.setFromCamera(mouse, camera)
+        hits = raycaster.intersectObject(meshGroup, true)
+        while (highlightGroup.children.length) {
+          const c = highlightGroup.children[0]
+          highlightGroup.remove(c)
+          if ('geometry' in c && c.geometry) c.geometry.dispose()
+          if ('material' in c && c.material) (c.material as THREE.Material).dispose()
+        }
+        if (hits.length > 0) {
         const hit = hits[0]
         const mesh = hit.object as THREE.Mesh
         const face = hit.face!
@@ -334,44 +609,54 @@ function initScene() {
           const worldNormal = hit.face!.normal.clone().transformDirection(mesh.matrixWorld).normalize()
           lastHoverNormal = worldNormal.clone()
           lastHoverPoint = hit.point.clone()
-          let holeInfo = getHoverHoleInfo(mesh, hit.point)
-          let radiusInfo: { center: THREE.Vector3; radius: number } | null =
-            holeInfo ? null : getHoverRadiusInfo(mesh, faceIndex, worldNormal)
-          if (!holeInfo && radiusInfo && isCylinderAHole(mesh, radiusInfo.center, radiusInfo.radius, worldNormal, raycaster)) {
-            holeInfo = { center: radiusInfo.center.clone(), radius: radiusInfo.radius, normal: worldNormal.clone() }
-            radiusInfo = null
+          // Для distance-режима исключаем тяжёлую цилиндрическую аналитику (миллионы граней).
+          const needsHoleAnalysis =
+            measureType === 'radius' || measureType === 'diameter' || measureType === 'hole-center-distance'
+          const skipHeavyHover = draggedModelGroup !== null
+          let holeInfo: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
+          let radiusInfo: { center: THREE.Vector3; radius: number } | null = null
+          if (needsHoleAnalysis && !skipHeavyHover) {
+            holeInfo = getHoverHoleInfo(mesh, hit.point)
+            radiusInfo = holeInfo ? null : getHoverRadiusInfo(mesh, faceIndex, worldNormal)
+            if (!holeInfo && radiusInfo && isCylinderAHole(mesh, radiusInfo.center, radiusInfo.radius, worldNormal, raycaster)) {
+              holeInfo = { center: radiusInfo.center.clone(), radius: radiusInfo.radius, normal: worldNormal.clone() }
+              radiusInfo = null
+            }
           }
-          // 1) Всегда подсвечиваем поверхность под курсором (валидация выбора)
-          const surfaceZoneGeom = getCylindricalZoneGeometry(mesh, faceIndex, worldNormal)
+          // 1) Подсветка поверхности под курсором. Дорогую зону считаем только для режимов отверстий.
+          const surfaceZoneGeom = needsHoleAnalysis && !skipHeavyHover
+            ? getCylindricalZoneGeometry(mesh, faceIndex, worldNormal)
+            : null
+          const buildFastFaceTriangle = () => {
+            const vA = new THREE.Vector3(
+              pos.getX(face.a),
+              pos.getY(face.a),
+              pos.getZ(face.a),
+            ).applyMatrix4(mesh.matrixWorld)
+            const vB = new THREE.Vector3(
+              pos.getX(face.b),
+              pos.getY(face.b),
+              pos.getZ(face.b),
+            ).applyMatrix4(mesh.matrixWorld)
+            const vC = new THREE.Vector3(
+              pos.getX(face.c),
+              pos.getY(face.c),
+              pos.getZ(face.c),
+            ).applyMatrix4(mesh.matrixWorld)
+            const g = new THREE.BufferGeometry().setAttribute(
+              'position',
+              new THREE.Float32BufferAttribute(
+                [vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z],
+                3,
+              ),
+            )
+            g.computeVertexNormals()
+            return g
+          }
           const surfaceFaceGeom =
             surfaceZoneGeom ??
-            getCoplanarFaceGeometry(mesh, faceIndex) ??
-            (() => {
-              const vA = new THREE.Vector3(
-                pos.getX(face.a),
-                pos.getY(face.a),
-                pos.getZ(face.a),
-              ).applyMatrix4(mesh.matrixWorld)
-              const vB = new THREE.Vector3(
-                pos.getX(face.b),
-                pos.getY(face.b),
-                pos.getZ(face.b),
-              ).applyMatrix4(mesh.matrixWorld)
-              const vC = new THREE.Vector3(
-                pos.getX(face.c),
-                pos.getY(face.c),
-                pos.getZ(face.c),
-              ).applyMatrix4(mesh.matrixWorld)
-              const g = new THREE.BufferGeometry().setAttribute(
-                'position',
-                new THREE.Float32BufferAttribute(
-                  [vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z],
-                  3,
-                ),
-              )
-              g.computeVertexNormals()
-              return g
-            })()
+            (needsHoleAnalysis ? getCoplanarFaceGeometry(mesh, faceIndex) : null) ??
+            buildFastFaceTriangle()
           const surfaceMat = new THREE.MeshBasicMaterial({
             color: 0x4488ff,
             transparent: true,
@@ -383,8 +668,7 @@ function initScene() {
           highlightGroup.add(new THREE.Mesh(surfaceFaceGeom, surfaceMat))
 
           let candidates = getSnapCandidates(hit)
-          const showHoleCylinderHighlight =
-            measureType === 'radius' || measureType === 'diameter' || measureType === 'hole-center-distance'
+          const showHoleCylinderHighlight = needsHoleAnalysis
           if (holeInfo) {
             const n = holeInfo.normal
             const u = new THREE.Vector3().crossVectors(n, new THREE.Vector3(1, 0, 0)).normalize()
@@ -452,13 +736,13 @@ function initScene() {
             highlightGroup.add(sphereMesh)
           }
 
-          if (holeInfo && hoverTooltipEl) {
+          if (needsHoleAnalysis && holeInfo && hoverTooltipEl) {
             const screen = hit.point.clone().project(camera)
             hoverTooltipEl.style.left = (screen.x * 0.5 + 0.5) * rect.width + 'px'
             hoverTooltipEl.style.top = (-screen.y * 0.5 + 0.5) * rect.height + 'px'
             hoverTooltipEl.textContent = `Отверстие · D = ${(2 * holeInfo.radius).toFixed(2)}`
             hoverTooltipEl.style.display = 'block'
-          } else if (radiusInfo && hoverTooltipEl) {
+          } else if (needsHoleAnalysis && radiusInfo && hoverTooltipEl) {
             const screen = hit.point.clone().project(camera)
             hoverTooltipEl.style.left = (screen.x * 0.5 + 0.5) * rect.width + 'px'
             hoverTooltipEl.style.top = (-screen.y * 0.5 + 0.5) * rect.height + 'px'
@@ -475,8 +759,18 @@ function initScene() {
         lastHoverNormal = null
         lastHoverPoint = null
       }
+      hoverDirty = false
+      lastHoverUpdateAt = now
       }
-    if (measurementPoints.length === 3 && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
+    if (isCameraInteracting) {
+      if (measurementLabelEl) measurementLabelEl.style.display = 'none'
+      if (measurementLabelEl0) measurementLabelEl0.style.display = 'none'
+      if (measurementLabelEl1) measurementLabelEl1.style.display = 'none'
+      if (measurementLabelEl2) measurementLabelEl2.style.display = 'none'
+      if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
+      if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
+      if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
+    } else if (measurementPoints.length === 3 && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
       const rect = containerRef.value.getBoundingClientRect()
       const p0 = measurementPoints[0]
       const p1 = measurementPoints[1]
@@ -657,6 +951,7 @@ function initScene() {
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
       if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
     }
+    }
     renderer.render(scene, camera)
   }
   animate()
@@ -670,6 +965,8 @@ function onResize() {
   const h = containerRef.value.clientHeight
   camera.aspect = w / h
   camera.updateProjectionMatrix()
+  idlePixelRatio = Math.min(window.devicePixelRatio, 2)
+  renderer.setPixelRatio(isCameraInteracting ? Math.min(INTERACTION_PIXEL_RATIO, idlePixelRatio) : idlePixelRatio)
   renderer.setSize(w, h)
   controls?.handleResize()
 }
@@ -688,6 +985,7 @@ function centerModel(box: THREE.Box3) {
     const axesLen = Math.max(maxDim * 0.15, 10)
     axesHelper.scale.setScalar(axesLen / 100)
   }
+  updateGroundGrid(box)
 }
 
 function resetView() {
@@ -972,10 +1270,28 @@ function updateMouseFromClient(clientX: number, clientY: number) {
 
 function onCanvasMouseMove(ev: MouseEvent) {
   updateMouseFromClient(ev.clientX, ev.clientY)
+  hoverDirty = true
 }
 
 function onContainerMouseMove(ev: MouseEvent) {
   updateMouseFromClient(ev.clientX, ev.clientY)
+  hoverDirty = true
+}
+
+function onControlsStart() {
+  isCameraInteracting = true
+  if (hoverTooltipEl) hoverTooltipEl.style.display = 'none'
+  if (renderer) {
+    renderer.setPixelRatio(Math.min(INTERACTION_PIXEL_RATIO, idlePixelRatio))
+  }
+}
+
+function onControlsEnd() {
+  isCameraInteracting = false
+  hoverDirty = true
+  if (renderer) {
+    renderer.setPixelRatio(idlePixelRatio)
+  }
 }
 
 const zoomToCursorPlane = new THREE.Plane()
@@ -1110,9 +1426,17 @@ function onCanvasClick(ev: MouseEvent) {
     }
     return
   }
-  logger.info('Viewer3D', `Клик в режиме измерений: measureType=${measureType}, hitsCount=${hits.length}`)
+  const clickId = ++measureClickSeq
+  const clickT0 = performance.now()
+  logger.info(
+    'Viewer3D',
+    `MeasureClick#${clickId} start: type=${measureType}, hits=${hits.length}, points=${measurementPoints.length}, mode=${measureModeRef.value ? 'on' : 'off'}`
+  )
   if (measureType === 'radius') {
-    if (hits.length === 0) return
+    if (hits.length === 0) {
+      logger.info('Viewer3D', `MeasureClick#${clickId} radius: no hits`)
+      return
+    }
     const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
@@ -1127,12 +1451,22 @@ function onCanvasClick(ev: MouseEvent) {
     }
     if (fit) {
       radiusOrDiameterResult = { center: fit.center, radius: fit.radius, normal, isDiameter: false }
+      logger.info(
+        'Viewer3D',
+        `MeasureClick#${clickId} radius fit: center=${formatVec3(fit.center)}, r=${fit.radius.toFixed(2)}`
+      )
       updateMeasurementGraphics()
+      logger.info('Viewer3D', `MeasureClick#${clickId} done radius: ${(performance.now() - clickT0).toFixed(1)} ms`)
+    } else {
+      logger.warn('Viewer3D', `MeasureClick#${clickId} radius: fit failed`)
     }
     return
   }
   if (measureType === 'diameter') {
-    if (hits.length === 0) return
+    if (hits.length === 0) {
+      logger.info('Viewer3D', `MeasureClick#${clickId} diameter: no hits`)
+      return
+    }
     if (firstClickHole && measurementPoints.length === 2) {
       firstClickHole = null
       secondHoleResult = null
@@ -1163,6 +1497,10 @@ function onCanvasClick(ev: MouseEvent) {
       firstClickHole = { center: hole.center.clone(), radius: hole.radius, normal: hole.normal.clone() }
       radiusOrDiameterResult = { center: hole.center, radius: hole.radius, normal: hole.normal, isDiameter: true }
       updateMeasurementGraphics()
+      logger.info(
+        'Viewer3D',
+        `MeasureClick#${clickId} diameter first hole: center=${formatVec3(hole.center)}, r=${hole.radius.toFixed(2)}`
+      )
       return
     }
     if (hole) {
@@ -1178,10 +1516,17 @@ function onCanvasClick(ev: MouseEvent) {
       measurementPointNormals = [firstClickHole.normal.clone(), worldNormal]
     }
     updateMeasurementGraphics()
+    logger.info(
+      'Viewer3D',
+      `MeasureClick#${clickId} done diameter: points=${measurementPoints.length}, ${(performance.now() - clickT0).toFixed(1)} ms`
+    )
     return
   }
   if (measureType === 'arc') {
-    if (hits.length === 0) return
+    if (hits.length === 0) {
+      logger.info('Viewer3D', `MeasureClick#${clickId} arc: no hits`)
+      return
+    }
     const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const candidates = getSnapCandidates(hit)
@@ -1190,6 +1535,7 @@ function onCanvasClick(ev: MouseEvent) {
     if (arcFirstPoint === null) {
       arcFirstPoint = point
       arcMesh = mesh
+      logger.info('Viewer3D', `MeasureClick#${clickId} arc: first point=${formatVec3(point)}`)
       return
     }
     const result = shortestPathOnMesh(arcMesh!, arcFirstPoint, point)
@@ -1198,11 +1544,20 @@ function onCanvasClick(ev: MouseEvent) {
     if (result) {
       arcResult = result
       updateMeasurementGraphics()
+      logger.info(
+        'Viewer3D',
+        `MeasureClick#${clickId} done arc: pathPts=${result.path.length}, len=${result.length.toFixed(2)}, ${(performance.now() - clickT0).toFixed(1)} ms`
+      )
+    } else {
+      logger.warn('Viewer3D', `MeasureClick#${clickId} arc: path not found`)
     }
     return
   }
   if (measureType === 'hole-center-distance') {
-    if (hits.length === 0) return
+    if (hits.length === 0) {
+      logger.info('Viewer3D', `MeasureClick#${clickId} hole-center-distance: no hits`)
+      return
+    }
     const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
@@ -1229,25 +1584,33 @@ function onCanvasClick(ev: MouseEvent) {
           ).normalize()
         : new THREE.Vector3(0, 1, 0)
       const fit = fitCircleToPoints(bestLoop, n)
-      if (!fit) return
+      if (!fit) {
+        logger.warn('Viewer3D', `MeasureClick#${clickId} hole-center-distance: circle fit failed`)
+        return
+      }
       center = fit.center.clone()
     } else {
       const radiusInfo = getHoverRadiusInfo(mesh, faceIndex, worldNormalHit)
-      if (!radiusInfo || !isCylinderAHole(mesh, radiusInfo.center, radiusInfo.radius, worldNormalHit, raycaster)) return
+      if (!radiusInfo || !isCylinderAHole(mesh, radiusInfo.center, radiusInfo.radius, worldNormalHit, raycaster)) {
+        logger.warn('Viewer3D', `MeasureClick#${clickId} hole-center-distance: no valid hole`)
+        return
+      }
       center = radiusInfo.center.clone()
     }
     if (holeCenterFirst === null) {
       holeCenterFirst = center
+      logger.info('Viewer3D', `MeasureClick#${clickId} hole-center-distance first center=${formatVec3(center)}`)
       return
     }
     measurementPoints = [holeCenterFirst, center]
     measurementPointNormals = [null, null]
     holeCenterFirst = null
     updateMeasurementGraphics()
+    logger.info('Viewer3D', `MeasureClick#${clickId} done hole-center-distance: ${(performance.now() - clickT0).toFixed(1)} ms`)
     return
   }
   if (hits.length === 0) {
-    logger.info('Viewer3D', 'Клик в режиме измерений: луч не попал в модель (hits.length === 0)')
+    logger.info('Viewer3D', `MeasureClick#${clickId} distance: no hits`)
     return
   }
   const hit = hits[0]
@@ -1264,8 +1627,10 @@ function onCanvasClick(ev: MouseEvent) {
   const point = (closest ?? getPointFromHit(hit)).clone()
 
   const buildFaceGeometryForHighlight = (): THREE.BufferGeometry | null => {
+    const tFace = performance.now()
+    const useCoplanarFace = measureType !== 'distance'
     const geom =
-      getCoplanarFaceGeometry(mesh, faceIndex) ??
+      (useCoplanarFace ? getCoplanarFaceGeometry(mesh, faceIndex) : null) ??
       (pos
         ? (() => {
             const vA = new THREE.Vector3(
@@ -1294,7 +1659,12 @@ function onCanvasClick(ev: MouseEvent) {
             return g
           })()
         : null)
-    return geom ? geom.clone() : null
+    const out = geom ? geom.clone() : null
+    const elapsed = performance.now() - tFace
+    if (elapsed > 100) {
+      logger.info('Viewer3D', `MeasureClick#${clickId} face geometry build: ${elapsed.toFixed(1)} ms`)
+    }
+    return out
   }
 
   if (measurementPoints.length >= 2) {
@@ -1309,11 +1679,26 @@ function onCanvasClick(ev: MouseEvent) {
     measurementPointNormals.push(normalToPush)
     const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
-    logger.info('Viewer3D', `Точка измерения добавлена (distance), всего точек: ${measurementPoints.length}`)
+    logger.info(
+      'Viewer3D',
+      `MeasureClick#${clickId} distance point added: p=${formatVec3(point)}, total=${measurementPoints.length}`
+    )
   }
   if (measurementPoints.length === 2 || measurementPoints.length === 3) {
+    const tGraphics = performance.now()
     updateMeasurementGraphics()
+    logger.info(
+      'Viewer3D',
+      `MeasureClick#${clickId} graphics updated: ${(performance.now() - tGraphics).toFixed(1)} ms`
+    )
+    if (measureType === 'distance' && measurementPoints.length === 2) {
+      saveDistanceMeasurement()
+    }
   }
+  logger.info(
+    'Viewer3D',
+    `MeasureClick#${clickId} done distance: points=${measurementPoints.length}, normals=${measurementPointNormals.length}, ${(performance.now() - clickT0).toFixed(1)} ms`
+  )
 }
 
 const AXIS_COLOR_X = 0xff0000
@@ -1329,6 +1714,11 @@ let holeCenterFirst: THREE.Vector3 | null = null
 let firstClickHole: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
 let secondHoleResult: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
 let diameterSecondLabelEl: HTMLDivElement | null = null
+let measureClickSeq = 0
+
+function formatVec3(v: THREE.Vector3): string {
+  return `${v.x.toFixed(1)},${v.y.toFixed(1)},${v.z.toFixed(1)}`
+}
 
 /** Fit circle to coplanar points (in plane with given normal). Returns center (world) and radius. */
 function fitCircleToPoints(points: THREE.Vector3[], normal: THREE.Vector3): { center: THREE.Vector3; radius: number } | null {
@@ -1710,6 +2100,11 @@ function shortestPathOnMesh(mesh: THREE.Mesh, from: THREE.Vector3, to: THREE.Vec
 }
 
 function updateMeasurementGraphics() {
+  const t0 = performance.now()
+  logger.info(
+    'Viewer3D',
+    `updateMeasurementGraphics start: type=${measureType}, points=${measurementPoints.length}, faces=${measurementFaceGeometries.length}`
+  )
   if (measurementLine) {
     measureGroup.remove(measurementLine)
     measurementLine.geometry.dispose()
@@ -1781,7 +2176,10 @@ function updateMeasurementGraphics() {
     measurementArcPathLine = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xff8800 }))
     measureGroup.add(measurementArcPathLine)
   }
-  if (measureType !== 'distance' && measureType !== 'hole-center-distance' && !(measureType === 'diameter' && measurementPoints.length === 2)) return
+  if (measureType !== 'distance' && measureType !== 'hole-center-distance' && !(measureType === 'diameter' && measurementPoints.length === 2)) {
+    logger.info('Viewer3D', `updateMeasurementGraphics done (non-distance): ${(performance.now() - t0).toFixed(1)} ms`)
+    return
+  }
   while (measurementPlanesGroup.children.length) {
     const c = measurementPlanesGroup.children[0]
     measurementPlanesGroup.remove(c)
@@ -1816,15 +2214,20 @@ function updateMeasurementGraphics() {
       measureGroup.add(line)
       measurementTriangleLines.push(line)
     }
+    logger.info('Viewer3D', `updateMeasurementGraphics done (triangle): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
-  if (measurementPoints.length !== 2) return
+  if (measurementPoints.length !== 2) {
+    logger.info('Viewer3D', `updateMeasurementGraphics done (points!=2): ${(performance.now() - t0).toFixed(1)} ms`)
+    return
+  }
   const [A, B] = measurementPoints
   if (measureType === 'hole-center-distance') {
     const geom = new THREE.BufferGeometry().setFromPoints([A, B])
     const mat = new THREE.LineBasicMaterial({ color: AXIS_COLOR_X })
     measurementLine = new THREE.Line(geom, mat)
     measureGroup.add(measurementLine)
+    logger.info('Viewer3D', `updateMeasurementGraphics done (hole-center): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
   {
@@ -1867,6 +2270,7 @@ function updateMeasurementGraphics() {
       measureGroup.add(measurementPerpLine)
     }
   }
+  logger.info('Viewer3D', `updateMeasurementGraphics done: ${(performance.now() - t0).toFixed(1)} ms`)
 }
 
 function clearMeasurements() {
@@ -1935,6 +2339,7 @@ function clearMeasurements() {
 function setMeasureMode(enabled: boolean) {
   logger.info('Viewer3D', `setMeasureMode вызван: enabled=${enabled}`)
   measureModeRef.value = enabled
+  hoverDirty = true
   if (!enabled) clearMeasurements()
   logger.info('Viewer3D', `Режим измерения: ${enabled ? 'вкл' : 'выкл'}`)
 }
@@ -2315,6 +2720,7 @@ function loadGlbUrl(
             alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
           }
         }
+        scheduleSceneMetricsRecalc()
         resolve()
       },
       undefined,
@@ -2414,6 +2820,7 @@ async function loadSTL(
     scheduleThumb()
     if (!inScene) alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
   }
+  scheduleSceneMetricsRecalc()
 }
 
 const LOG_PREFIX = '[Viewer3D]'
@@ -2421,7 +2828,29 @@ const LOG_PREFIX = '[Viewer3D]'
 /** Лимит размера файла для STEP/IGES (байты). 30 МБ. */
 const STEP_IGES_MAX_FILE_BYTES = 30 * 1024 * 1024
 
+/** Таймаут серверной конвертации STEP->GLB (мс). */
+const STEP_SERVER_CONVERT_TIMEOUT_MS = 45_000
+/** Таймаут запроса метаданных STEP (мс). */
+const STEP_METADATA_TIMEOUT_MS = 20_000
+/** Таймаут fallback-конвертации STEP/IGES в браузере (мс). */
+const STEP_WASM_CONVERT_TIMEOUT_MS = 90_000
+
 /** Для STEP: сначала пробуем конвертацию на сервере; при 501/500/413 — fallback на WASM. */
+function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => window.clearTimeout(timeoutId))
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs)
+    promise
+      .then((value) => resolve(value))
+      .catch((err) => reject(err))
+      .finally(() => window.clearTimeout(timeoutId))
+  })
+}
 
 function handleFile(file: File): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -2462,7 +2891,7 @@ function handleFile(file: File): Promise<void> {
         if (ext === 'step' || ext === 'stp') {
           const fd = new FormData()
           fd.append('file', file, file.name)
-          metaPromise = fetch('/api/step/metadata', { method: 'POST', body: fd })
+          metaPromise = fetchWithTimeout('/api/step/metadata', { method: 'POST', body: fd }, STEP_METADATA_TIMEOUT_MS)
             .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`metadata ${r.status} ${r.statusText}`))))
             .catch((e) => {
               console.warn(`${LOG_PREFIX} metadata server недоступен:`, e)
@@ -2474,21 +2903,37 @@ function handleFile(file: File): Promise<void> {
           try {
             const fdConvert = new FormData()
             fdConvert.append('file', file, file.name)
-            const res = await fetch('/api/convert/step-to-glb', { method: 'POST', body: fdConvert })
+            const res = await fetchWithTimeout(
+              '/api/convert/step-to-glb',
+              { method: 'POST', body: fdConvert },
+              STEP_SERVER_CONVERT_TIMEOUT_MS
+            )
             if (res.ok) {
               const blob = await res.blob()
               glbUrl = URL.createObjectURL(blob)
               console.log(`${LOG_PREFIX} конвертация на сервере`)
             } else {
               if (res.status === 413) logger.warn('Viewer3D', 'Файл слишком большой для сервера (лимит 100 МБ)')
-              glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+              glbUrl = await withTimeout(
+                loadStepOrIgesToGlbUrl(buf, ext),
+                STEP_WASM_CONVERT_TIMEOUT_MS,
+                'Превышено время браузерной конвертации STEP/IGES'
+              )
             }
           } catch (e) {
             console.warn(`${LOG_PREFIX} серверная конвертация недоступна, используем WASM:`, e)
-            glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+            glbUrl = await withTimeout(
+              loadStepOrIgesToGlbUrl(buf, ext),
+              STEP_WASM_CONVERT_TIMEOUT_MS,
+              'Превышено время браузерной конвертации STEP/IGES'
+            )
           }
         } else {
-          glbUrl = await loadStepOrIgesToGlbUrl(buf, ext)
+          glbUrl = await withTimeout(
+            loadStepOrIgesToGlbUrl(buf, ext),
+            STEP_WASM_CONVERT_TIMEOUT_MS,
+            'Превышено время браузерной конвертации STEP/IGES'
+          )
         }
         const meta = metaPromise ? await metaPromise : null
         stepMeta.value = meta
@@ -2501,6 +2946,7 @@ function handleFile(file: File): Promise<void> {
         logger.error('Viewer3D', `Ошибка загрузки STEP/IGES: ${file.name}`, err)
         console.error(`${LOG_PREFIX} Ошибка загрузки STEP/IGES:`, err)
         if (err instanceof Error) console.error(`${LOG_PREFIX} message:`, err.message, 'stack:', err.stack)
+        alert(`Не удалось загрузить ${file.name}. ${err instanceof Error ? err.message : 'Проверьте сервер и формат файла.'}`)
         reject(err)
       } finally {
         isLoading.value = false
@@ -2736,6 +3182,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
+  window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
   document.removeEventListener('mousedown', onOrientationClickOutside)
   document.removeEventListener('mousedown', onMouseSettingsClickOutside)
   document.removeEventListener('mousedown', onScenePanelOrientationClickOutside)
@@ -2752,6 +3200,8 @@ onUnmounted(() => {
     window.removeEventListener('mouseup', onCanvasMouseUp, true)
     renderer.domElement.removeEventListener('wheel', onCanvasWheel)
   }
+  controls?.removeEventListener('start', onControlsStart)
+  controls?.removeEventListener('end', onControlsEnd)
   while (highlightGroup?.children.length) {
     const c = highlightGroup.children[0]
     highlightGroup.remove(c)
@@ -2763,6 +3213,14 @@ onUnmounted(() => {
     sectionPlaneMesh.geometry.dispose()
     ;(sectionPlaneMesh.material as THREE.Material).dispose()
     sectionPlaneMesh = null
+  }
+  if (groundGrid) {
+    scene.remove(groundGrid)
+    groundGrid.geometry.dispose()
+    const gm = groundGrid.material
+    if (Array.isArray(gm)) gm.forEach((m) => m.dispose())
+    else gm.dispose()
+    groundGrid = null
   }
   if (measurementLabelEl && containerRef.value?.contains(measurementLabelEl)) {
     containerRef.value.removeChild(measurementLabelEl)
@@ -2878,6 +3336,7 @@ function setModelInScene(id: string, inScene: boolean) {
     const box = new THREE.Box3().setFromObject(meshGroup)
     centerModel(box)
   }
+  scheduleSceneMetricsRecalc()
 }
 
 function removeModel(id: string) {
@@ -2900,6 +3359,7 @@ function removeModel(id: string) {
     const box = new THREE.Box3().setFromObject(meshGroup)
     centerModel(box)
   }
+  scheduleSceneMetricsRecalc()
 }
 
 defineExpose({
@@ -3191,6 +3651,9 @@ defineExpose({
           <span class="viewer-models-count">({{ loadedModels.length }})</span>
           <button type="button" class="viewer-models-add" title="Добавить модель" @click="openFileDialog">+</button>
         </div>
+        <div class="viewer-models-metrics">
+          {{ sceneMetricsText }}
+        </div>
         <div v-if="loadedModels.length === 0" class="viewer-models-empty">
           Откройте модель или перетащите файлы (STL, STEP, IGES). В сцене — до {{ MAX_MODELS_IN_SCENE }}, загрузка — до {{ MAX_FILES_SELECT }} за раз.
         </div>
@@ -3230,6 +3693,47 @@ defineExpose({
       </div>
       <div class="viewer-main">
         <div ref="containerRef" class="viewer-container" />
+        <div
+          class="viewer-measurements-float"
+          :style="{ left: measurementsPanelPos.x + 'px', top: measurementsPanelPos.y + 'px' }"
+        >
+          <div class="viewer-measurements-float-header" @mousedown.prevent="onMeasurementsPanelMouseDown">
+            <span>Измерения</span>
+            <button type="button" class="viewer-measurements-clear" @click="clearMeasurementHistory">очистить</button>
+          </div>
+          <div v-if="measurementHistory.length === 0" class="viewer-measurements-empty">
+            Пока нет измерений.
+          </div>
+          <div v-else class="viewer-measurements-list">
+            <div class="viewer-measurements-table-head">
+              <span>#</span>
+              <span>L, мм</span>
+              <span>⟂, мм</span>
+              <span>△ (P/⊥)</span>
+              <span></span>
+            </div>
+            <div
+              v-for="(m, idx) in measurementHistory"
+              :key="m.id"
+              class="viewer-measurements-row"
+              :class="{ active: selectedMeasurementId === m.id }"
+              @click="restoreMeasurement(m)"
+            >
+              <span class="viewer-measurements-cell-id">#{{ measurementHistory.length - idx }}</span>
+              <span>{{ m.lengthMm.toFixed(2) }}</span>
+              <span class="viewer-measurements-row-perp">{{ m.surfacePerpMm != null ? m.surfacePerpMm.toFixed(2) : '—' }}</span>
+              <span>{{ m.parallelMm.toFixed(1) }} / {{ m.trianglePerpMm.toFixed(1) }}</span>
+              <button
+                type="button"
+                class="viewer-measurements-row-del"
+                title="Удалить измерение"
+                @click.stop="removeMeasurement(m.id)"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        </div>
         <div v-if="isLoading" class="loading-overlay">
           <span class="loading-text">Загрузка модели…</span>
         </div>
@@ -3292,6 +3796,19 @@ defineExpose({
                 @wheel.prevent="onFrameOpacityWheel"
               />
             </div>
+            <div class="viewer-scene-tint-block" title="Яркость оттенка модели">
+              <span class="viewer-scene-tint-label">Тон</span>
+              <input
+                type="range"
+                class="viewer-scene-tint-range"
+                :min="TINT_BRIGHTNESS_MIN"
+                :max="TINT_BRIGHTNESS_MAX"
+                :step="TINT_BRIGHTNESS_STEP"
+                :value="tintBrightness"
+                @input="onTintBrightnessInput"
+                @wheel.prevent="onTintBrightnessWheel"
+              />
+            </div>
             <button
               type="button"
               class="viewer-scene-btn"
@@ -3301,6 +3818,17 @@ defineExpose({
             >
               <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
                 <path d="M4 4v16M20 4v16M4 12h16"/>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="viewer-scene-btn"
+              :class="{ active: showGroundGrid }"
+              title="Сетка пола"
+              @click="toggleGroundGrid"
+            >
+              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M3 7h18M3 12h18M3 17h18M7 3v18M12 3v18M17 3v18"/>
               </svg>
             </button>
             <button
@@ -3658,6 +4186,124 @@ defineExpose({
   color: #6a7a8a;
   overflow-y: auto;
 }
+.viewer-models-metrics {
+  margin: 0.1rem 0.2rem 0.4rem;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid #3a4a6a;
+  border-radius: 6px;
+  background: rgba(30, 36, 51, 0.9);
+  color: #b7c7db;
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+.viewer-measurements-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0.1rem 0.2rem 0.25rem;
+  color: #c5d2e6;
+  font-size: 0.72rem;
+}
+.viewer-measurements-float {
+  position: absolute;
+  width: 290px;
+  max-height: 320px;
+  z-index: 1200;
+  background: rgba(18, 24, 35, 0.95);
+  border: 1px solid #4a5f7a;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.viewer-measurements-float-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  background: rgba(39, 56, 84, 0.95);
+  color: #dce8f8;
+  font-size: 0.76rem;
+  cursor: move;
+}
+.viewer-measurements-clear {
+  border: 1px solid #4a5f7a;
+  background: #2d3a52;
+  color: #d7e1ef;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.viewer-measurements-clear:hover {
+  background: #3a4f70;
+}
+.viewer-measurements-empty {
+  margin: 0.25rem 0.35rem 0.4rem;
+  color: #6f8098;
+  font-size: 0.72rem;
+}
+.viewer-measurements-list {
+  max-height: 270px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0.2rem 0.4rem;
+}
+.viewer-measurements-table-head {
+  display: grid;
+  grid-template-columns: 34px 64px 64px 1fr 24px;
+  gap: 6px;
+  align-items: center;
+  font-size: 0.64rem;
+  color: #9db2cf;
+  padding: 2px 6px 4px;
+  border-bottom: 1px solid rgba(90, 110, 140, 0.35);
+}
+.viewer-measurements-row {
+  display: grid;
+  grid-template-columns: 34px 64px 64px 1fr 24px;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid #3a4a6a;
+  background: rgba(32, 40, 58, 0.9);
+  color: #d7e1ef;
+  border-radius: 6px;
+  padding: 5px 6px;
+  cursor: pointer;
+  font-size: 0.72rem;
+}
+.viewer-measurements-row:hover {
+  background: rgba(48, 63, 92, 0.95);
+}
+.viewer-measurements-row.active {
+  border-color: #6d8fd0;
+  box-shadow: inset 0 0 0 1px rgba(109, 143, 208, 0.35);
+}
+.viewer-measurements-cell-id {
+  color: #9db2cf;
+  font-size: 0.68rem;
+}
+.viewer-measurements-row-perp {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #9fe2ff;
+}
+.viewer-measurements-row-del {
+  width: 20px;
+  height: 20px;
+  border: 1px solid #5b6f90;
+  border-radius: 4px;
+  background: rgba(70, 80, 110, 0.9);
+  color: #dce8f8;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0;
+}
+.viewer-measurements-row-del:hover {
+  background: rgba(173, 66, 66, 0.95);
+  border-color: #b35f5f;
+}
 .viewer-models-list {
   flex: 1;
   overflow-y: auto;
@@ -3877,6 +4523,22 @@ defineExpose({
   display: flex;
   align-items: center;
   gap: 2px;
+}
+.viewer-scene-tint-block {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 2px;
+  padding: 0 4px;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+}
+.viewer-scene-tint-label {
+  font-size: 0.68rem;
+  color: #c6d4e8;
+  text-transform: uppercase;
+}
+.viewer-scene-tint-range {
+  width: 90px;
 }
 .viewer-scene-frame-opacity-input {
   width: 2.2rem;
