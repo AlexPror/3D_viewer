@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import * as THREE from 'three'
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js'
 import { STLLoader } from 'three/addons/loaders/STLLoader.js'
@@ -66,6 +66,12 @@ let measureGroup: THREE.Group
 let highlightGroup: THREE.Group
 let axesHelper: THREE.Group | null = null
 let groundGrid: THREE.GridHelper | null = null
+let ambientLight: THREE.AmbientLight | null = null
+let hemiLight: THREE.HemisphereLight | null = null
+let keyLight: THREE.DirectionalLight | null = null
+let fillLightA: THREE.DirectionalLight | null = null
+let fillLightB: THREE.DirectionalLight | null = null
+let fillLightC: THREE.DirectionalLight | null = null
 let raycaster: THREE.Raycaster
 let mouse: THREE.Vector2
 const HOVER_UPDATE_INTERVAL_MS = 80
@@ -86,6 +92,8 @@ let measurementArcPathLine: THREE.Line | null = null
 /** Геометрии двух плоскостей для режима «расстояние» (в мировых координатах), чтобы подсвечивать их на скриншоте */
 let measurementFaceGeometries: THREE.BufferGeometry[] = []
 let measurementPlanesGroup: THREE.Group
+/** Подсветка выбранных плоскостей сборки и связей из таблицы (после initScene) */
+let assemblyHighlightGroup: THREE.Group | undefined
 let measurementLabelEl: HTMLDivElement | null = null
 let measurementPerpLabelEl: HTMLDivElement | null = null
 let measurementExtraLabelEl: HTMLDivElement | null = null
@@ -153,6 +161,63 @@ export interface LoadedModelItem {
 
 type SavedMeasureType = 'distance'
 type SavedVec3 = { x: number; y: number; z: number }
+type AssemblyMateType = 'plane' | 'distance' | 'symmetric'
+type AssemblyAxis = 'x' | 'y' | 'z'
+type AssemblyPlaneSide = 'min' | 'max'
+type AssemblyPickTarget =
+  | 'source'
+  | 'target'
+  | 'symBase1'
+  | 'symBase2'
+  | 'symPart1'
+  | 'symPart2'
+  | null
+
+interface AssemblyPlaneSelection {
+  modelId: string
+  localPoint: THREE.Vector3
+  point: THREE.Vector3
+  normal: THREE.Vector3
+  /** Треугольник выбранной грани в мировых координатах (для подсветки). */
+  previewGeometry?: THREE.BufferGeometry
+}
+
+type StoredAssemblyVec3 = { x: number; y: number; z: number }
+
+interface StoredAssemblyPlane {
+  modelId: string
+  localPoint: StoredAssemblyVec3
+  normal: StoredAssemblyVec3
+}
+
+type StoredAssemblyMate =
+  | {
+      id: string
+      type: 'plane'
+      sourceId: string
+      targetId: string
+      sourcePlane: StoredAssemblyPlane
+      targetPlane: StoredAssemblyPlane
+    }
+  | {
+      id: string
+      type: 'distance'
+      sourceId: string
+      targetId: string
+      sourcePlane: StoredAssemblyPlane
+      targetPlane: StoredAssemblyPlane
+      distanceMm: number
+    }
+  | {
+      id: string
+      type: 'symmetric'
+      sourceId: string
+      targetId: string
+      base1: StoredAssemblyPlane
+      base2: StoredAssemblyPlane
+      part1: StoredAssemblyPlane
+      part2: StoredAssemblyPlane
+    }
 
 interface SavedMeasurement {
   id: string
@@ -175,9 +240,50 @@ const THUMBNAIL_PLACEHOLDER = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/
 const loadedModels = ref<LoadedModelItem[]>([])
 const measurementHistory = ref<SavedMeasurement[]>([])
 const selectedMeasurementId = ref<string | null>(null)
+const originalMaterials = new WeakMap<THREE.Mesh, THREE.Material | THREE.Material[]>()
+const assemblyPanelOpen = ref(false)
+const assemblyMateType = ref<AssemblyMateType>('plane')
+const assemblySourceModelId = ref('')
+const assemblyTargetModelId = ref('')
+const assemblyAxis = ref<AssemblyAxis>('x')
+const assemblySourceSide = ref<AssemblyPlaneSide>('max')
+const assemblyTargetSide = ref<AssemblyPlaneSide>('min')
+const assemblyDistanceMm = ref(0)
+const assemblyStatus = ref('')
+const assemblyPickTarget = ref<AssemblyPickTarget>(null)
+const assemblySourcePlane = ref<AssemblyPlaneSelection | null>(null)
+const assemblyTargetPlane = ref<AssemblyPlaneSelection | null>(null)
+/** Симметрия по ширине: две плоскости базы (опорная модель) и две плоскости детали (источник). */
+const assemblySymBase1 = ref<AssemblyPlaneSelection | null>(null)
+const assemblySymBase2 = ref<AssemblyPlaneSelection | null>(null)
+const assemblySymPart1 = ref<AssemblyPlaneSelection | null>(null)
+const assemblySymPart2 = ref<AssemblyPlaneSelection | null>(null)
+const assemblyMates = ref<StoredAssemblyMate[]>([])
+/** Выбранная строка в таблице связей — подсветка зафиксированных плоскостей. */
+const selectedAssemblyMateId = ref<string | null>(null)
 const measurementsPanelPos = ref({ x: 14, y: 14 })
 let measurementsPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
 const modelGroupsById = new Map<string, THREE.Group>()
+const visibleAssemblyModels = computed(() => loadedModels.value.filter((m) => m.inScene))
+const assemblySourcePlaneText = computed(() =>
+  assemblySourcePlane.value
+    ? `${loadedModels.value.find((m) => m.id === assemblySourcePlane.value!.modelId)?.name ?? assemblySourcePlane.value.modelId}`
+    : 'не выбрана'
+)
+const assemblyTargetPlaneText = computed(() =>
+  assemblyTargetPlane.value
+    ? `${loadedModels.value.find((m) => m.id === assemblyTargetPlane.value!.modelId)?.name ?? assemblyTargetPlane.value.modelId}`
+    : 'не выбрана'
+)
+function assemblyPlaneShortLabel(p: AssemblyPlaneSelection | null): string {
+  if (!p) return 'не выбрана'
+  const name = loadedModels.value.find((m) => m.id === p.modelId)?.name ?? p.modelId
+  return `${name}`
+}
+const assemblySymBase1Text = computed(() => assemblyPlaneShortLabel(assemblySymBase1.value))
+const assemblySymBase2Text = computed(() => assemblyPlaneShortLabel(assemblySymBase2.value))
+const assemblySymPart1Text = computed(() => assemblyPlaneShortLabel(assemblySymPart1.value))
+const assemblySymPart2Text = computed(() => assemblyPlaneShortLabel(assemblySymPart2.value))
 const savedCameraPosition = new THREE.Vector3(500, 400, 500)
 const savedCameraTarget = new THREE.Vector3(0, 0, 0)
 
@@ -188,9 +294,10 @@ const MODEL_COLOR_LIGHT = 0xf2f4f6
 /** Один светло-серый для модели (на 50% светлее MODEL_COLOR_LIGHT). */
 const MODEL_COLOR_SINGLE = 0xf9f9fa
 const TINT_BRIGHTNESS_MIN = 0.65
-const TINT_BRIGHTNESS_MAX = 1.35
+const TINT_BRIGHTNESS_MAX = 2.03
 const TINT_BRIGHTNESS_STEP = 0.05
 const tintBrightness = ref(1)
+const shadingMode = ref<'lit' | 'unlit'>('lit')
 const sceneSurfaceAreaMm2 = ref<number | null>(null)
 const sceneVolumeMm3 = ref<number | null>(null)
 const sceneTriangles = ref<number>(0)
@@ -208,6 +315,18 @@ const mouseDamping = ref(0.22)
 const mouseZoomGestureMs = ref(450)
 /** Левая кнопка: перемещение модели в сцене (перетаскивание детали) */
 const leftButtonMoveModel = ref(true)
+const autoNavLimitsEnabled = ref(true)
+
+function applyAutoNavigationLimits(box: THREE.Box3) {
+  if (!autoNavLimitsEnabled.value) return
+  const size = box.getSize(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z, 1)
+  const autoMin = Math.max(1, Math.min(250, maxDim * 0.015))
+  const autoMax = Math.max(autoMin + 500, maxDim * 10)
+  mouseMinDistance.value = Number(autoMin.toFixed(1))
+  mouseMaxDistance.value = Number(autoMax.toFixed(1))
+  applyMouseSettings()
+}
 
 function applyMouseSettings() {
   if (!controls) return
@@ -223,7 +342,9 @@ function applyModelTint() {
   const base = new THREE.Color(MODEL_COLOR_SINGLE)
   const hsl = { h: 0, s: 0, l: 0 }
   base.getHSL(hsl)
-  const lightness = Math.max(0, Math.min(1, hsl.l * tintBrightness.value))
+  // В "светлом" режиме оставляем небольшой запас контраста, чтобы не терялись грани.
+  const maxLightness = shadingMode.value === 'unlit' ? 0.9 : 1
+  const lightness = Math.max(0, Math.min(maxLightness, hsl.l * tintBrightness.value))
   const colorHex = new THREE.Color().setHSL(hsl.h, hsl.s, lightness).getHex()
   meshGroup.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
@@ -232,6 +353,417 @@ function applyModelTint() {
       if ('color' in m) (m as THREE.Material & { color: THREE.Color }).color.setHex(colorHex)
     })
   })
+}
+
+function cloneAsUnlitMaterial(mat: THREE.Material): THREE.Material {
+  const src = mat as THREE.Material & { color?: THREE.Color; opacity?: number; transparent?: boolean }
+  return new THREE.MeshLambertMaterial({
+    color: src.color ? src.color.getHex() : MODEL_COLOR_SINGLE,
+    emissive: 0x111111,
+    transparent: !!src.transparent,
+    opacity: typeof src.opacity === 'number' ? src.opacity : 1,
+  })
+}
+
+function applySceneLightingForShadingMode() {
+  const lit = shadingMode.value === 'lit'
+  if (ambientLight) ambientLight.intensity = lit ? 0.22 : 0.38
+  if (hemiLight) hemiLight.intensity = lit ? 0.32 : 0.45
+  if (keyLight) keyLight.intensity = lit ? 0.58 : 0.42
+  if (fillLightA) fillLightA.intensity = lit ? 0.12 : 0.3
+  if (fillLightB) fillLightB.intensity = lit ? 0.09 : 0.24
+  if (fillLightC) fillLightC.intensity = lit ? 0.07 : 0.2
+  if (renderer) renderer.shadowMap.enabled = lit
+}
+
+function setMeshGroupShadowState(enabled: boolean) {
+  if (!meshGroup) return
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.castShadow = enabled
+      obj.receiveShadow = enabled
+    }
+  })
+}
+
+function applyShadingMode() {
+  if (!meshGroup) return
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    if (shadingMode.value === 'unlit') {
+      if (!originalMaterials.has(obj)) originalMaterials.set(obj, obj.material)
+      const source = originalMaterials.get(obj) ?? obj.material
+      obj.material = Array.isArray(source)
+        ? source.map((m) => cloneAsUnlitMaterial(m))
+        : cloneAsUnlitMaterial(source)
+      return
+    }
+    const original = originalMaterials.get(obj)
+    if (original) obj.material = original
+  })
+  applyModelTint()
+  applySceneLightingForShadingMode()
+  const lit = shadingMode.value === 'lit'
+  setMeshGroupShadowState(lit)
+  if (renderer) renderer.shadowMap.needsUpdate = true
+}
+
+function onShadingModeChange(ev: Event) {
+  const value = (ev.target as HTMLSelectElement).value
+  shadingMode.value = value === 'unlit' ? 'unlit' : 'lit'
+  applyShadingMode()
+}
+
+function onAutoNavLimitsChange() {
+  if (!autoNavLimitsEnabled.value || !meshGroup || meshGroup.children.length === 0) return
+  applyAutoNavigationLimits(new THREE.Box3().setFromObject(meshGroup))
+}
+
+function getAssemblyModelBox(modelId: string): THREE.Box3 | null {
+  const group = modelGroupsById.get(modelId)
+  if (!group || !group.visible) return null
+  const box = new THREE.Box3().setFromObject(group)
+  return box.isEmpty() ? null : box
+}
+
+function getAxisCenter(box: THREE.Box3, axis: AssemblyAxis): number {
+  return axis === 'x' ? (box.min.x + box.max.x) * 0.5 : axis === 'y' ? (box.min.y + box.max.y) * 0.5 : (box.min.z + box.max.z) * 0.5
+}
+
+function getAxisSideValue(box: THREE.Box3, axis: AssemblyAxis, side: AssemblyPlaneSide): number {
+  if (axis === 'x') return side === 'min' ? box.min.x : box.max.x
+  if (axis === 'y') return side === 'min' ? box.min.y : box.max.y
+  return side === 'min' ? box.min.z : box.max.z
+}
+
+function moveGroupAlongAxis(group: THREE.Group, axis: AssemblyAxis, delta: number) {
+  if (axis === 'x') group.position.x += delta
+  else if (axis === 'y') group.position.y += delta
+  else group.position.z += delta
+}
+
+function newAssemblyMateId(): string {
+  return `mate_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+}
+
+function persistAssemblyPlane(p: AssemblyPlaneSelection): StoredAssemblyPlane {
+  return {
+    modelId: p.modelId,
+    localPoint: { x: p.localPoint.x, y: p.localPoint.y, z: p.localPoint.z },
+    normal: { x: p.normal.x, y: p.normal.y, z: p.normal.z },
+  }
+}
+
+function storedToAssemblyPlane(sp: StoredAssemblyPlane): AssemblyPlaneSelection {
+  return {
+    modelId: sp.modelId,
+    localPoint: new THREE.Vector3(sp.localPoint.x, sp.localPoint.y, sp.localPoint.z),
+    point: new THREE.Vector3(),
+    normal: new THREE.Vector3(sp.normal.x, sp.normal.y, sp.normal.z),
+  }
+}
+
+/** Сдвиг источника вдоль общей нормали, чтобы выполнить зазор/совмещение плоскостей. */
+function matePlaneDeltaVector(
+  sourceGroup: THREE.Group,
+  targetGroup: THREE.Group,
+  src: AssemblyPlaneSelection,
+  dst: AssemblyPlaneSelection,
+  distanceMm: number,
+): THREE.Vector3 | null {
+  const axis = dst.normal.clone().normalize()
+  const srcN = src.normal.clone().normalize()
+  if (Math.abs(axis.dot(srcN)) < 0.85) return null
+  if (axis.dot(srcN) < 0) axis.negate()
+  const pwSrc = sourceGroup.localToWorld(src.localPoint.clone())
+  const pwDst = targetGroup.localToWorld(dst.localPoint.clone())
+  const signed = pwSrc.clone().sub(pwDst).dot(axis)
+  const delta = -(signed - distanceMm)
+  return axis.clone().multiplyScalar(delta)
+}
+
+/** Симметрия по ширине: середина между двумя плоскостями детали совпадает с серединой между двумя плоскостями базы. */
+function mateSymmetricDeltaVector(
+  sourceGroup: THREE.Group,
+  targetGroup: THREE.Group,
+  base1: AssemblyPlaneSelection,
+  base2: AssemblyPlaneSelection,
+  part1: AssemblyPlaneSelection,
+  part2: AssemblyPlaneSelection,
+): THREE.Vector3 | null {
+  const n1 = base1.normal.clone().normalize()
+  const n2 = base2.normal.clone().normalize()
+  if (Math.abs(n1.dot(n2)) < 0.85) return null
+  const n = n1.clone()
+  if (n.dot(n2) < 0) n.negate()
+  const p1n = part1.normal.clone().normalize()
+  const p2n = part2.normal.clone().normalize()
+  if (Math.abs(p1n.dot(p2n)) < 0.85) return null
+  if (Math.abs(p1n.dot(n)) < 0.45 || Math.abs(p2n.dot(n)) < 0.45) return null
+  const B1w = targetGroup.localToWorld(base1.localPoint.clone())
+  const B2w = targetGroup.localToWorld(base2.localPoint.clone())
+  const P1w = sourceGroup.localToWorld(part1.localPoint.clone())
+  const P2w = sourceGroup.localToWorld(part2.localPoint.clone())
+  const d = (v: THREE.Vector3) => n.dot(v)
+  const midBase = (d(B1w) + d(B2w)) * 0.5
+  const midPart = (d(P1w) + d(P2w)) * 0.5
+  return n.clone().multiplyScalar(midBase - midPart)
+}
+
+function refreshAfterAssemblyMove() {
+  if (!meshGroup?.children.length) return
+  meshGroup.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(meshGroup)
+  updateGroundGrid(box)
+  updateSceneLighting(box)
+  scheduleSceneMetricsRecalc()
+}
+
+function solveStoredMate(m: StoredAssemblyMate): void {
+  const sourceGroup = modelGroupsById.get(m.sourceId)
+  const targetGroup = modelGroupsById.get(m.targetId)
+  if (!sourceGroup || !targetGroup || !sourceGroup.visible || !targetGroup.visible) return
+  if (m.type === 'plane') {
+    const src = storedToAssemblyPlane(m.sourcePlane)
+    const dst = storedToAssemblyPlane(m.targetPlane)
+    const dv = matePlaneDeltaVector(sourceGroup, targetGroup, src, dst, 0)
+    if (dv) sourceGroup.position.add(dv)
+  } else if (m.type === 'distance') {
+    const src = storedToAssemblyPlane(m.sourcePlane)
+    const dst = storedToAssemblyPlane(m.targetPlane)
+    const dv = matePlaneDeltaVector(sourceGroup, targetGroup, src, dst, m.distanceMm)
+    if (dv) sourceGroup.position.add(dv)
+  } else {
+    const b1 = storedToAssemblyPlane(m.base1)
+    const b2 = storedToAssemblyPlane(m.base2)
+    const p1 = storedToAssemblyPlane(m.part1)
+    const p2 = storedToAssemblyPlane(m.part2)
+    const dv = mateSymmetricDeltaVector(sourceGroup, targetGroup, b1, b2, p1, p2)
+    if (dv) sourceGroup.position.add(dv)
+  }
+}
+
+function reapplyAllAssemblyMates(): void {
+  if (assemblyMates.value.length === 0) return
+  meshGroup.updateMatrixWorld(true)
+  for (const m of assemblyMates.value) {
+    solveStoredMate(m)
+  }
+  refreshAfterAssemblyMove()
+  stripStaleAssemblyFaceTriangles()
+  refreshAllAssemblyVisuals()
+}
+
+function assemblyMateTypeLabel(m: StoredAssemblyMate): string {
+  if (m.type === 'plane') return 'Плоскость'
+  if (m.type === 'distance') return 'Расстояние'
+  return 'Симметрия'
+}
+
+function removeAssemblyMate(id: string) {
+  if (selectedAssemblyMateId.value === id) selectedAssemblyMateId.value = null
+  assemblyMates.value = assemblyMates.value.filter((x) => x.id !== id)
+  if (assemblyMates.value.length > 0) reapplyAllAssemblyMates()
+  else refreshAllAssemblyVisuals()
+}
+
+function startAssemblyPlanePick(target: Exclude<AssemblyPickTarget, null>) {
+  selectedAssemblyMateId.value = null
+  assemblyPickTarget.value = target
+  const hints: Record<Exclude<AssemblyPickTarget, null>, string> = {
+    source: 'Плоскость детали (модель 1): кликните по грани.',
+    target: 'Плоскость базы (модель 2): кликните по грани.',
+    symBase1: 'База — плоскость 1 (опорная модель): кликните по грани.',
+    symBase2: 'База — плоскость 2 (опорная модель): кликните по грани.',
+    symPart1: 'Деталь — плоскость 1 (источник): кликните по грани.',
+    symPart2: 'Деталь — плоскость 2 (источник): кликните по грани.',
+  }
+  assemblyStatus.value = hints[target]
+  refreshAllAssemblyVisuals()
+}
+
+function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
+  const wrapper = findWrapperGroup(hit.object)
+  const modelId = String(wrapper?.userData?.modelId ?? '')
+  if (!modelId) {
+    assemblyStatus.value = 'Не удалось определить модель для выбранной грани.'
+    assemblyPickTarget.value = null
+    return
+  }
+  const face = hit.face
+  if (!face) {
+    assemblyStatus.value = 'Грань не определена. Попробуйте кликнуть в другое место.'
+    assemblyPickTarget.value = null
+    return
+  }
+  const normal = face.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
+  const localPoint = wrapper.worldToLocal(hit.point.clone())
+  const tri = buildWorldFaceTriangleFromHit(hit)
+  const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
+  if (tri) pick.previewGeometry = tri
+  const t = assemblyPickTarget.value
+  const srcId = assemblySourceModelId.value
+  const tgtId = assemblyTargetModelId.value
+  if (t === 'source' || t === 'symPart1' || t === 'symPart2') {
+    if (!srcId || modelId !== srcId) {
+      assemblyStatus.value = 'Кликните по грани модели-источника (модель 1).'
+      assemblyPickTarget.value = null
+      return
+    }
+  }
+  if (t === 'target' || t === 'symBase1' || t === 'symBase2') {
+    if (!tgtId || modelId !== tgtId) {
+      assemblyStatus.value = 'Кликните по грани опорной модели (модель 2 / база).'
+      assemblyPickTarget.value = null
+      return
+    }
+  }
+  if (t === 'source') {
+    disposePlanePreviewGeometry(assemblySourcePlane.value ?? undefined)
+    assemblySourcePlane.value = pick
+    assemblyStatus.value = 'Плоскость детали (модель 1) выбрана.'
+  } else if (t === 'target') {
+    disposePlanePreviewGeometry(assemblyTargetPlane.value ?? undefined)
+    assemblyTargetPlane.value = pick
+    assemblyStatus.value = 'Плоскость базы (модель 2) выбрана.'
+  } else if (t === 'symBase1') {
+    disposePlanePreviewGeometry(assemblySymBase1.value ?? undefined)
+    assemblySymBase1.value = pick
+    assemblyStatus.value = 'База: плоскость 1 выбрана.'
+  } else if (t === 'symBase2') {
+    disposePlanePreviewGeometry(assemblySymBase2.value ?? undefined)
+    assemblySymBase2.value = pick
+    assemblyStatus.value = 'База: плоскость 2 выбрана.'
+  } else if (t === 'symPart1') {
+    disposePlanePreviewGeometry(assemblySymPart1.value ?? undefined)
+    assemblySymPart1.value = pick
+    assemblyStatus.value = 'Деталь: плоскость 1 выбрана.'
+  } else if (t === 'symPart2') {
+    disposePlanePreviewGeometry(assemblySymPart2.value ?? undefined)
+    assemblySymPart2.value = pick
+    assemblyStatus.value = 'Деталь: плоскость 2 выбрана.'
+  }
+  assemblyPickTarget.value = null
+  selectedAssemblyMateId.value = null
+  refreshAllAssemblyVisuals()
+}
+
+function applyAssemblyMate() {
+  const sourceId = assemblySourceModelId.value
+  const targetId = assemblyTargetModelId.value
+  if (!sourceId || !targetId) {
+    assemblyStatus.value = 'Выберите обе модели в списках «Источник» и «Опорная».'
+    return
+  }
+  if (sourceId === targetId) {
+    assemblyStatus.value = 'Источник и опорная модель должны отличаться.'
+    return
+  }
+  const sourceGroup = modelGroupsById.get(sourceId)
+  const targetGroup = modelGroupsById.get(targetId)
+  const sourceBox = getAssemblyModelBox(sourceId)
+  const targetBox = getAssemblyModelBox(targetId)
+  if (!sourceGroup || !targetGroup || !sourceBox || !targetBox) {
+    assemblyStatus.value = 'Одна из моделей не в сцене или не имеет геометрии.'
+    return
+  }
+  const axis = assemblyAxis.value
+  let delta = 0
+  if (assemblyMateType.value === 'symmetric') {
+    const b1 = assemblySymBase1.value
+    const b2 = assemblySymBase2.value
+    const p1 = assemblySymPart1.value
+    const p2 = assemblySymPart2.value
+    if (!b1 || !b2 || !p1 || !p2) {
+      assemblyStatus.value = 'Симметрия: выберите 4 плоскости (2 базы + 2 детали).'
+      return
+    }
+    if (b1.modelId !== targetId || b2.modelId !== targetId) {
+      assemblyStatus.value = 'Плоскости базы должны принадлежать опорной модели.'
+      return
+    }
+    if (p1.modelId !== sourceId || p2.modelId !== sourceId) {
+      assemblyStatus.value = 'Плоскости детали должны принадлежать модели-источнику.'
+      return
+    }
+    const dv = mateSymmetricDeltaVector(sourceGroup, targetGroup, b1, b2, p1, p2)
+    if (!dv) {
+      assemblyStatus.value = 'Не удалось вычислить симметрию: плоскости должны быть параллельны (пара базы и пара детали).'
+      return
+    }
+    sourceGroup.position.add(dv)
+    assemblyMates.value = [
+      ...assemblyMates.value,
+      {
+        id: newAssemblyMateId(),
+        type: 'symmetric',
+        sourceId,
+        targetId,
+        base1: persistAssemblyPlane(b1),
+        base2: persistAssemblyPlane(b2),
+        part1: persistAssemblyPlane(p1),
+        part2: persistAssemblyPlane(p2),
+      },
+    ]
+    refreshAfterAssemblyMove()
+    assemblyStatus.value = `Сопряжение зафиксировано: симметрия по ширине, |Δ|=${dv.length().toFixed(2)} мм`
+    clearAssemblyPickStateAfterMateApply()
+    return
+  }
+  if (assemblySourcePlane.value && assemblyTargetPlane.value) {
+    const srcPlane = assemblySourcePlane.value
+    const dstPlane = assemblyTargetPlane.value
+    if (srcPlane.modelId !== sourceId || dstPlane.modelId !== targetId) {
+      assemblyStatus.value = 'Плоскости должны соответствовать источнику и опорной модели.'
+      return
+    }
+    const distance = assemblyMateType.value === 'distance' ? Math.max(0, Number(assemblyDistanceMm.value) || 0) : 0
+    const dv = matePlaneDeltaVector(sourceGroup, targetGroup, srcPlane, dstPlane, distance)
+    if (!dv) {
+      assemblyStatus.value = 'Плоскости не параллельны или слишком наклонены — выберите другие грани.'
+      return
+    }
+    sourceGroup.position.add(dv)
+    if (assemblyMateType.value === 'distance') {
+      assemblyMates.value = [
+        ...assemblyMates.value,
+        {
+          id: newAssemblyMateId(),
+          type: 'distance',
+          sourceId,
+          targetId,
+          sourcePlane: persistAssemblyPlane(srcPlane),
+          targetPlane: persistAssemblyPlane(dstPlane),
+          distanceMm: distance,
+        },
+      ]
+    } else {
+      assemblyMates.value = [
+        ...assemblyMates.value,
+        {
+          id: newAssemblyMateId(),
+          type: 'plane',
+          sourceId,
+          targetId,
+          sourcePlane: persistAssemblyPlane(srcPlane),
+          targetPlane: persistAssemblyPlane(dstPlane),
+        },
+      ]
+    }
+    refreshAfterAssemblyMove()
+    assemblyStatus.value = `Сопряжение зафиксировано: сдвиг ${dv.length().toFixed(2)} мм вдоль нормали`
+    clearAssemblyPickStateAfterMateApply()
+    return
+  }
+  const sourceSideValue = getAxisSideValue(sourceBox, axis, assemblySourceSide.value)
+  const targetSideValue = getAxisSideValue(targetBox, axis, assemblyTargetSide.value)
+  const distance = assemblyMateType.value === 'distance' ? Math.max(0, Number(assemblyDistanceMm.value) || 0) : 0
+  const sideSign = assemblySourceSide.value === 'min' ? 1 : -1
+  const desiredSourceValue = targetSideValue + sideSign * distance
+  delta = desiredSourceValue - sourceSideValue
+  moveGroupAlongAxis(sourceGroup, axis, delta)
+  refreshAfterAssemblyMove()
+  assemblyStatus.value = `Применено (по габаритам bbox): Δ${axis.toUpperCase()}=${delta.toFixed(2)} мм — не сохраняется как связь; для связи выберите плоскости.`
 }
 
 function clampTintBrightness(v: number): number {
@@ -451,6 +983,42 @@ function updateGroundGrid(box?: THREE.Box3) {
   scene.add(groundGrid)
 }
 
+function updateKeyLightShadowCamera(box?: THREE.Box3) {
+  if (!keyLight) return
+  const cam = keyLight.shadow.camera as THREE.OrthographicCamera
+  let b: THREE.Box3 | null = null
+  if (box && !box.isEmpty()) b = box
+  else if (meshGroup && meshGroup.children.length > 0) {
+    const tmp = new THREE.Box3().setFromObject(meshGroup)
+    if (!tmp.isEmpty()) b = tmp
+  }
+  if (!b) return
+  const center = b.getCenter(new THREE.Vector3())
+  const size = b.getSize(new THREE.Vector3())
+  keyLight.target.position.copy(center)
+  keyLight.target.updateMatrixWorld(true)
+  const maxDim = Math.max(size.x, size.y, size.z, 80)
+  const half = maxDim * 0.85
+  cam.left = -half
+  cam.right = half
+  cam.top = half
+  cam.bottom = -half
+  cam.near = Math.max(1, maxDim * 0.02)
+  cam.far = Math.max(maxDim * 24, 5000)
+  cam.updateProjectionMatrix()
+}
+
+function updateSceneLighting(box?: THREE.Box3) {
+  const sizeVec = box ? box.getSize(new THREE.Vector3()) : new THREE.Vector3(2000, 2000, 2000)
+  const center = box ? box.getCenter(new THREE.Vector3()) : new THREE.Vector3()
+  const scale = Math.max(sizeVec.x, sizeVec.y, sizeVec.z, 200)
+  if (keyLight) keyLight.position.set(center.x + scale * 0.9, center.y + scale * 1.25, center.z + scale * 0.8)
+  if (fillLightA) fillLightA.position.set(center.x - scale * 0.8, center.y + scale * 0.75, center.z + scale * 0.6)
+  if (fillLightB) fillLightB.position.set(center.x + scale * 0.65, center.y + scale * 0.6, center.z - scale * 0.95)
+  if (fillLightC) fillLightC.position.set(center.x - scale * 0.7, center.y + scale * 0.5, center.z - scale * 0.8)
+  updateKeyLightShadowCamera(box)
+}
+
 function toggleGroundGrid() {
   showGroundGrid.value = !showGroundGrid.value
   if (!showGroundGrid.value) {
@@ -484,6 +1052,8 @@ function initScene() {
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1
   renderer.localClippingEnabled = true
+  renderer.shadowMap.enabled = true
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap
   containerRef.value.appendChild(renderer.domElement)
 
   controls = new TrackballControls(camera, renderer.domElement)
@@ -503,14 +1073,25 @@ function initScene() {
   savedCameraPosition.copy(camera.position)
   savedCameraTarget.copy(controls.target)
 
-  const ambient = new THREE.AmbientLight(0xffffff, 0.6)
-  scene.add(ambient)
-  const dir = new THREE.DirectionalLight(0xffffff, 0.8)
-  dir.position.set(400, 600, 400)
-  scene.add(dir)
-  const dir2 = new THREE.DirectionalLight(0xffffff, 0.3)
-  dir2.position.set(-300, 200, -300)
-  scene.add(dir2)
+  ambientLight = new THREE.AmbientLight(0xffffff, 0.38)
+  scene.add(ambientLight)
+  hemiLight = new THREE.HemisphereLight(0xffffff, 0xe9edf7, 0.45)
+  scene.add(hemiLight)
+  keyLight = new THREE.DirectionalLight(0xffffff, 0.42)
+  keyLight.castShadow = true
+  keyLight.shadow.mapSize.set(2048, 2048)
+  keyLight.shadow.bias = -0.00025
+  keyLight.shadow.normalBias = 0.04
+  keyLight.shadow.radius = 3.5
+  fillLightA = new THREE.DirectionalLight(0xffffff, 0.3)
+  fillLightB = new THREE.DirectionalLight(0xffffff, 0.24)
+  fillLightC = new THREE.DirectionalLight(0xffffff, 0.2)
+  fillLightA.castShadow = false
+  fillLightB.castShadow = false
+  fillLightC.castShadow = false
+  scene.add(keyLight, fillLightA, fillLightB, fillLightC)
+  scene.add(keyLight.target)
+  applySceneLightingForShadingMode()
 
   meshGroup = new THREE.Group()
   scene.add(meshGroup)
@@ -521,6 +1102,10 @@ function initScene() {
   scene.add(highlightGroup)
   measurementPlanesGroup = new THREE.Group()
   scene.add(measurementPlanesGroup)
+  assemblyHighlightGroup = new THREE.Group()
+  scene.add(assemblyHighlightGroup)
+
+  updateSceneLighting()
 
   const axesSize = 100
   axesHelper = new THREE.Group()
@@ -972,6 +1557,8 @@ function onResize() {
 }
 
 function centerModel(box: THREE.Box3) {
+  applyAutoNavigationLimits(box)
+  updateSceneLighting(box)
   const center = box.getCenter(new THREE.Vector3())
   const size = box.getSize(new THREE.Vector3())
   const maxDim = Math.max(size.x, size.y, size.z)
@@ -993,6 +1580,33 @@ function resetView() {
   camera.position.copy(savedCameraPosition)
   controls.target.copy(savedCameraTarget)
   controls.update()
+}
+
+function focusModelInView() {
+  if (!camera || !controls || !meshGroup || meshGroup.children.length === 0) return
+  const box = new THREE.Box3().setFromObject(meshGroup)
+  if (box.isEmpty()) return
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z, 1)
+  const direction = camera.position.clone().sub(controls.target)
+  if (direction.lengthSq() < 1e-8) direction.set(1, 0.75, 1)
+  direction.normalize()
+  camera.position.copy(center).add(direction.multiplyScalar(maxDim * 1.45))
+  controls.target.copy(center)
+  controls.update()
+}
+
+function onWindowKeyDown(ev: KeyboardEvent) {
+  const target = ev.target as HTMLElement | null
+  if (target) {
+    const tag = target.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable) return
+  }
+  if (ev.code === 'KeyF') {
+    ev.preventDefault()
+    focusModelInView()
+  }
 }
 
 type ViewPreset = 'front' | 'back' | 'top' | 'bottom' | 'left' | 'right' | 'iso' | 'dimetric'
@@ -1314,6 +1928,171 @@ function findWrapperGroup(obj: THREE.Object3D): THREE.Group | null {
   return o && o.parent === meshGroup ? (o as THREE.Group) : null
 }
 
+function disposeAssemblyHighlightGroupMeshes() {
+  if (!assemblyHighlightGroup) return
+  while (assemblyHighlightGroup.children.length > 0) {
+    const c = assemblyHighlightGroup.children[0] as THREE.Mesh
+    assemblyHighlightGroup.remove(c)
+    c.geometry?.dispose()
+    const m = c.material
+    if (Array.isArray(m)) m.forEach((x) => x.dispose())
+    else if (m) m.dispose()
+  }
+}
+
+function disposePlanePreviewGeometry(p: AssemblyPlaneSelection | null | undefined) {
+  if (!p) return
+  p.previewGeometry?.dispose()
+  p.previewGeometry = undefined
+}
+
+function stripStaleAssemblyFaceTriangles() {
+  disposePlanePreviewGeometry(assemblySourcePlane.value ?? undefined)
+  disposePlanePreviewGeometry(assemblyTargetPlane.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymBase1.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymBase2.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymPart1.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymPart2.value ?? undefined)
+}
+
+function buildWorldFaceTriangleFromHit(hit: THREE.Intersection): THREE.BufferGeometry | null {
+  const mesh = hit.object as THREE.Mesh
+  const face = hit.face
+  const pos = mesh.geometry?.attributes?.position as THREE.BufferAttribute | undefined
+  if (!face || !pos) return null
+  const vA = new THREE.Vector3(pos.getX(face.a), pos.getY(face.a), pos.getZ(face.a)).applyMatrix4(mesh.matrixWorld)
+  const vB = new THREE.Vector3(pos.getX(face.b), pos.getY(face.b), pos.getZ(face.b)).applyMatrix4(mesh.matrixWorld)
+  const vC = new THREE.Vector3(pos.getX(face.c), pos.getY(face.c), pos.getZ(face.c)).applyMatrix4(mesh.matrixWorld)
+  const g = new THREE.BufferGeometry().setAttribute(
+    'position',
+    new THREE.Float32BufferAttribute([vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z], 3),
+  )
+  g.computeVertexNormals()
+  return g
+}
+
+function assemblyIndicatorSizeForModel(modelId: string): number {
+  const box = getAssemblyModelBox(modelId)
+  if (!box) return 24
+  const s = box.getSize(new THREE.Vector3())
+  return Math.max(8, Math.min(100, Math.max(s.x, s.y, s.z) * 0.07))
+}
+
+/** Маркер плоскости по сохранённой точке и нормали (после перемещения модели остаётся корректным). */
+function addAssemblyPlaneDiskIndicator(modelId: string, localPoint: THREE.Vector3, normalWorld: THREE.Vector3, color: number, opacity: number) {
+  const g = modelGroupsById.get(modelId)
+  if (!g || !assemblyHighlightGroup) return
+  const nw = normalWorld.clone().normalize()
+  const wp = g.localToWorld(localPoint.clone())
+  const size = assemblyIndicatorSizeForModel(modelId)
+  const geom = new THREE.PlaneGeometry(size, size)
+  const mat = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  })
+  const mesh = new THREE.Mesh(geom, mat)
+  mesh.position.copy(wp)
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), nw)
+  assemblyHighlightGroup.add(mesh)
+}
+
+function addStoredPlaneIndicator(sp: StoredAssemblyPlane, color: number, opacity = 0.5) {
+  const grp = modelGroupsById.get(sp.modelId)
+  if (!grp) return
+  const local = new THREE.Vector3(sp.localPoint.x, sp.localPoint.y, sp.localPoint.z)
+  const nLocal = new THREE.Vector3(sp.normal.x, sp.normal.y, sp.normal.z)
+  const nw = nLocal.clone().transformDirection(grp.matrixWorld).normalize()
+  addAssemblyPlaneDiskIndicator(sp.modelId, local, nw, color, opacity)
+}
+
+function addPickPlaneVisual(p: AssemblyPlaneSelection, color: number, opacity: number) {
+  if (p.previewGeometry && assemblyHighlightGroup) {
+    const mat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+    assemblyHighlightGroup.add(new THREE.Mesh(p.previewGeometry.clone(), mat))
+    return
+  }
+  const grp = modelGroupsById.get(p.modelId)
+  if (!grp) return
+  addAssemblyPlaneDiskIndicator(p.modelId, p.localPoint.clone(), p.normal.clone(), color, opacity * 0.85)
+}
+
+function refreshAllAssemblyVisuals() {
+  if (!assemblyHighlightGroup) return
+  disposeAssemblyHighlightGroupMeshes()
+  const selId = selectedAssemblyMateId.value
+  if (selId) {
+    const m = assemblyMates.value.find((x) => x.id === selId)
+    if (m) {
+      if (m.type === 'symmetric') {
+        addStoredPlaneIndicator(m.base1, 0x55cc77, 0.55)
+        addStoredPlaneIndicator(m.base2, 0x228844, 0.55)
+        addStoredPlaneIndicator(m.part1, 0xaa77ff, 0.55)
+        addStoredPlaneIndicator(m.part2, 0x6633cc, 0.55)
+      } else {
+        addStoredPlaneIndicator(m.sourcePlane, 0x3399ff, 0.55)
+        addStoredPlaneIndicator(m.targetPlane, 0xff8833, 0.55)
+      }
+      return
+    }
+  }
+  if (assemblyMateType.value === 'symmetric') {
+    if (assemblySymBase1.value) addPickPlaneVisual(assemblySymBase1.value, 0x55dd88, 0.45)
+    if (assemblySymBase2.value) addPickPlaneVisual(assemblySymBase2.value, 0x33aa55, 0.45)
+    if (assemblySymPart1.value) addPickPlaneVisual(assemblySymPart1.value, 0xbb88ff, 0.45)
+    if (assemblySymPart2.value) addPickPlaneVisual(assemblySymPart2.value, 0x8866dd, 0.45)
+  } else {
+    if (assemblySourcePlane.value) addPickPlaneVisual(assemblySourcePlane.value, 0x44aaff, 0.45)
+    if (assemblyTargetPlane.value) addPickPlaneVisual(assemblyTargetPlane.value, 0xffaa44, 0.45)
+  }
+}
+
+function selectAssemblyMateRow(id: string | null) {
+  selectedAssemblyMateId.value = selectedAssemblyMateId.value === id ? null : id
+  refreshAllAssemblyVisuals()
+}
+
+function clearAssemblyPickStateAfterMateApply() {
+  disposePlanePreviewGeometry(assemblySourcePlane.value ?? undefined)
+  disposePlanePreviewGeometry(assemblyTargetPlane.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymBase1.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymBase2.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymPart1.value ?? undefined)
+  disposePlanePreviewGeometry(assemblySymPart2.value ?? undefined)
+  assemblySourcePlane.value = null
+  assemblyTargetPlane.value = null
+  assemblySymBase1.value = null
+  assemblySymBase2.value = null
+  assemblySymPart1.value = null
+  assemblySymPart2.value = null
+  selectedAssemblyMateId.value = null
+  refreshAllAssemblyVisuals()
+}
+
+watch(
+  assemblyMateType,
+  () => {
+    stripStaleAssemblyFaceTriangles()
+    assemblySymBase1.value = null
+    assemblySymBase2.value = null
+    assemblySymPart1.value = null
+    assemblySymPart2.value = null
+    assemblySourcePlane.value = null
+    assemblyTargetPlane.value = null
+    selectedAssemblyMateId.value = null
+    refreshAllAssemblyVisuals()
+  },
+  { flush: 'post' },
+)
+
 function onCanvasMouseDown(ev: MouseEvent) {
   if (!camera || !controls || !meshGroup) return
   if (ev.button === 0 && leftButtonMoveModel.value) {
@@ -1357,12 +2136,16 @@ function onCanvasMouseMovePan(ev: MouseEvent) {
 
 function onCanvasMouseUp(ev: MouseEvent) {
   if (ev.button === 0 && draggedModelGroup) {
+    const movedId = String(draggedModelGroup.userData?.modelId ?? '')
     draggedModelGroup = null
     dragStartModelPos = null
     dragStartIntersection = null
     if (controls) controls.enabled = true
     ev.preventDefault()
     ev.stopPropagation()
+    if (movedId && assemblyMates.value.length) {
+      reapplyAllAssemblyMates()
+    }
   }
 }
 
@@ -1410,6 +2193,14 @@ function onCanvasClick(ev: MouseEvent) {
   mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(mouse, camera)
   const hits = raycaster.intersectObject(meshGroup, true)
+  if (assemblyPickTarget.value) {
+    if (hits.length === 0) {
+      assemblyStatus.value = 'Не попали в модель. Кликните по нужной плоскости.'
+      return
+    }
+    pickAssemblyPlaneFromHit(hits[0])
+    return
+  }
   if (sectionModeRef.value) {
     if (hits.length === 0) return
     const hit = hits[0]
@@ -2662,7 +3453,7 @@ function loadGlbUrl(
           if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
         }
         meshGroup.add(wrapper)
-        applyModelTint()
+        applyShadingMode()
         if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
         else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
@@ -2760,7 +3551,7 @@ async function loadSTL(
     loadedModels.value = []
   }
   wrapper.add(mesh)
-  applyModelTint()
+  applyShadingMode()
   if (opts && meshGroup.children.length > 0) {
     const box = new THREE.Box3().setFromObject(wrapper)
     const size = box.getSize(new THREE.Vector3())
@@ -3176,6 +3967,7 @@ onMounted(() => {
   document.addEventListener('mousedown', onOrientationClickOutside)
   document.addEventListener('mousedown', onMouseSettingsClickOutside)
   document.addEventListener('mousedown', onScenePanelOrientationClickOutside)
+  window.addEventListener('keydown', onWindowKeyDown)
   getOpenCascade().then(() => {
     console.log(`${LOG_PREFIX} WASM предзагружен (первый STEP/IGES откроется быстрее)`)
   })
@@ -3187,6 +3979,7 @@ onUnmounted(() => {
   document.removeEventListener('mousedown', onOrientationClickOutside)
   document.removeEventListener('mousedown', onMouseSettingsClickOutside)
   document.removeEventListener('mousedown', onScenePanelOrientationClickOutside)
+  window.removeEventListener('keydown', onWindowKeyDown)
   window.removeEventListener('resize', onResize)
   if (containerRef.value) {
     containerRef.value.removeEventListener('mousemove', onContainerMouseMove, false)
@@ -3249,6 +4042,12 @@ onUnmounted(() => {
   }
   hoverTooltipEl = null
   if (animationId) cancelAnimationFrame(animationId)
+  stripStaleAssemblyFaceTriangles()
+  disposeAssemblyHighlightGroupMeshes()
+  if (assemblyHighlightGroup && scene) {
+    scene.remove(assemblyHighlightGroup)
+    assemblyHighlightGroup = undefined
+  }
   controls?.dispose()
   renderer?.dispose()
   if (containerRef.value && renderer?.domElement) {
@@ -3325,7 +4124,7 @@ function setModelInScene(id: string, inScene: boolean) {
       meshGroup.add(group)
     }
     if (wireframeModeRef.value) applyWireframeToObject(group, true)
-    applyModelTint()
+    applyShadingMode()
     group.visible = true
   } else {
     meshGroup.remove(group)
@@ -3354,6 +4153,13 @@ function removeModel(id: string) {
   })
   modelGroupsById.delete(id)
   loadedModels.value = loadedModels.value.filter((m) => m.id !== id)
+  assemblyMates.value = assemblyMates.value.filter(
+    (m) => m.sourceId !== id && m.targetId !== id,
+  )
+  if (selectedAssemblyMateId.value && !assemblyMates.value.some((m) => m.id === selectedAssemblyMateId.value)) {
+    selectedAssemblyMateId.value = null
+  }
+  refreshAllAssemblyVisuals()
   loadedFileName = loadedModels.value.length > 0 ? loadedModels.value[loadedModels.value.length - 1].name : null
   if (meshGroup.children.length > 0) {
     const box = new THREE.Box3().setFromObject(meshGroup)
@@ -3410,11 +4216,11 @@ defineExpose({
     <header class="viewer-3d-header" v-show="activeTab === 'viewer'">
       <span class="viewer-3d-title">3D</span>
       <div class="viewer-3d-tools">
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Файл">
           <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть модель</button>
           <button type="button" class="viewer-3d-btn" @click="resetView">Вид по умолчанию</button>
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Вид">
           <div ref="orientationDropdownRef" class="viewer-orientation-dropdown">
           <button
             type="button"
@@ -3455,7 +4261,7 @@ defineExpose({
           </Transition>
           </div>
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Мышь">
           <div ref="mouseSettingsDropdownRef" class="viewer-orientation-dropdown viewer-mouse-dropdown">
           <button
             type="button"
@@ -3477,7 +4283,7 @@ defineExpose({
                   max="500000"
                   step="1000"
                   class="viewer-mouse-input"
-                  @change="applyMouseSettings"
+                  @change="autoNavLimitsEnabled = false; applyMouseSettings()"
                 />
               </div>
               <div class="viewer-mouse-row">
@@ -3488,7 +4294,16 @@ defineExpose({
                   min="1"
                   max="500"
                   class="viewer-mouse-input"
-                  @change="applyMouseSettings"
+                  @change="autoNavLimitsEnabled = false; applyMouseSettings()"
+                />
+              </div>
+              <div class="viewer-mouse-row viewer-mouse-row-check">
+                <label class="viewer-mouse-label" title="Автоматически подстраивать пределы зума под размер модели">Автолимиты навигации</label>
+                <input
+                  v-model="autoNavLimitsEnabled"
+                  type="checkbox"
+                  class="viewer-mouse-check"
+                  @change="onAutoNavLimitsChange"
                 />
               </div>
               <div class="viewer-mouse-row">
@@ -3561,7 +4376,7 @@ defineExpose({
           </Transition>
           </div>
         </div>
-        <div class="viewer-header-block viewer-header-block-frame">
+        <div class="viewer-header-block viewer-header-block-frame" data-group="Отображение">
           <button
             type="button"
             class="viewer-3d-btn"
@@ -3592,7 +4407,7 @@ defineExpose({
             @input="onFrameOpacityInput"
           />
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Сечение">
           <button
             type="button"
             class="viewer-3d-btn"
@@ -3626,7 +4441,7 @@ defineExpose({
             />
           </template>
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Измерение">
           <button
             type="button"
             class="viewer-3d-btn"
@@ -3637,7 +4452,7 @@ defineExpose({
           </button>
           <button type="button" class="viewer-3d-btn" @click="emit('clear-measurements')">Очистить</button>
         </div>
-        <div class="viewer-header-block">
+        <div class="viewer-header-block" data-group="Экспорт">
           <button type="button" class="viewer-3d-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
           <button type="button" class="viewer-3d-btn" @click="exportGlb">Экспорт GLB</button>
           <button type="button" class="viewer-3d-btn" @click="exportStl">Экспорт STL</button>
@@ -3734,11 +4549,130 @@ defineExpose({
             </div>
           </div>
         </div>
+        <div class="viewer-assembly-panel" :class="{ open: assemblyPanelOpen }">
+          <div class="viewer-assembly-header">
+            <span>Сборка</span>
+            <button type="button" class="viewer-assembly-toggle" @click="assemblyPanelOpen = !assemblyPanelOpen">
+              {{ assemblyPanelOpen ? '−' : '+' }}
+            </button>
+          </div>
+          <div v-if="assemblyPanelOpen" class="viewer-assembly-body">
+            <div class="viewer-assembly-row">
+              <label>Тип</label>
+              <select v-model="assemblyMateType" class="viewer-assembly-select">
+                <option value="plane">Плоскость ↔ плоскость</option>
+                <option value="distance">По расстоянию</option>
+                <option value="symmetric">Симметрия по ширине</option>
+              </select>
+            </div>
+            <div class="viewer-assembly-row">
+              <label>Источник</label>
+              <select v-model="assemblySourceModelId" class="viewer-assembly-select">
+                <option value="">— выберите —</option>
+                <option v-for="m in visibleAssemblyModels" :key="'src-' + m.id" :value="m.id">{{ m.name }}</option>
+              </select>
+            </div>
+            <div class="viewer-assembly-row">
+              <label>Опорная</label>
+              <select v-model="assemblyTargetModelId" class="viewer-assembly-select">
+                <option value="">— выберите —</option>
+                <option v-for="m in visibleAssemblyModels" :key="'dst-' + m.id" :value="m.id">{{ m.name }}</option>
+              </select>
+            </div>
+            <div v-show="assemblyMateType !== 'symmetric'" class="viewer-assembly-row">
+              <label>Ось (bbox)</label>
+              <select v-model="assemblyAxis" class="viewer-assembly-select">
+                <option value="x">X</option>
+                <option value="y">Y</option>
+                <option value="z">Z</option>
+              </select>
+            </div>
+            <template v-if="assemblyMateType !== 'symmetric'">
+              <div class="viewer-assembly-row">
+                <label>Плоскость модели 1</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblySourcePlaneText" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('source')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Плоскость модели 2</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblyTargetPlaneText" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('target')">Выбрать</button>
+                </div>
+              </div>
+            </template>
+            <template v-else>
+              <div class="viewer-assembly-row">
+                <label>База пл. 1</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblySymBase1Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase1')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>База пл. 2</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblySymBase2Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase2')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Деталь пл. 1</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblySymPart1Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart1')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Деталь пл. 2</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input" :value="assemblySymPart2Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart2')">Выбрать</button>
+                </div>
+              </div>
+            </template>
+            <div v-if="assemblyMateType === 'distance'" class="viewer-assembly-row">
+              <label>Расстояние, мм</label>
+              <input v-model.number="assemblyDistanceMm" class="viewer-assembly-input" type="number" min="0" step="1" />
+            </div>
+            <button type="button" class="viewer-assembly-apply" @click="applyAssemblyMate">Применить сопряжение</button>
+            <div v-if="assemblyMates.length" class="viewer-assembly-mates">
+              <div class="viewer-assembly-mates-title">Зафиксированные связи</div>
+              <div
+                v-for="(row, idx) in assemblyMates"
+                :key="row.id"
+                class="viewer-assembly-mate-row"
+                :class="{ 'viewer-assembly-mate-row-active': selectedAssemblyMateId === row.id }"
+                role="button"
+                tabindex="0"
+                @click="selectAssemblyMateRow(row.id)"
+                @keydown.enter.prevent="selectAssemblyMateRow(row.id)"
+                @keydown.space.prevent="selectAssemblyMateRow(row.id)"
+              >
+                <span class="viewer-assembly-mate-no">#{{ idx + 1 }}</span>
+                <span class="viewer-assembly-mate-type">{{ assemblyMateTypeLabel(row) }}</span>
+                <button
+                  type="button"
+                  class="viewer-assembly-mate-del"
+                  title="Удалить связь"
+                  @click.stop="removeAssemblyMate(row.id)"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div class="viewer-assembly-note">Связи по выбранным плоскостям сохраняются и снова применяются после перетаскивания детали. Оси отверстий — отдельный этап.</div>
+            <div v-if="assemblyStatus" class="viewer-assembly-status">{{ assemblyStatus }}</div>
+          </div>
+        </div>
         <div v-if="isLoading" class="loading-overlay">
           <span class="loading-text">Загрузка модели…</span>
         </div>
         <div class="viewer-scene-panel">
           <div class="viewer-scene-panel-row">
+            <div class="viewer-scene-group" data-group="Вид">
             <div ref="scenePanelOrientationRef" class="viewer-scene-dropdown">
               <button
                 type="button"
@@ -3772,6 +4706,8 @@ defineExpose({
                 </div>
               </Transition>
             </div>
+            </div>
+            <div class="viewer-scene-group" data-group="Отображение">
             <div class="viewer-scene-frame-block">
               <button
                 type="button"
@@ -3809,6 +4745,15 @@ defineExpose({
                 @wheel.prevent="onTintBrightnessWheel"
               />
             </div>
+            <label class="viewer-scene-shading" title="Режим шейдинга модели">
+              <span>Свет</span>
+              <select class="viewer-scene-select" :value="shadingMode" @change="onShadingModeChange">
+                <option value="lit">Обычный</option>
+                <option value="unlit">Светлый (мягкие тени)</option>
+              </select>
+            </label>
+            </div>
+            <div class="viewer-scene-group" data-group="Инструменты">
             <button
               type="button"
               class="viewer-scene-btn"
@@ -3834,6 +4779,17 @@ defineExpose({
             <button
               type="button"
               class="viewer-scene-btn"
+              title="Фокус на модели (F)"
+              @click="focusModelInView"
+            >
+              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M4 8V4h4M16 4h4v4M20 16v4h-4M8 20H4v-4"/>
+                <circle cx="12" cy="12" r="2.2"/>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="viewer-scene-btn"
               title="Перпендикулярно (клик по грани модели — затем сюда)"
               @click="viewPerpendicularToFace"
             >
@@ -3843,6 +4799,7 @@ defineExpose({
                 <circle cx="12" cy="12" r="2"/>
               </svg>
             </button>
+            </div>
           </div>
         </div>
       </div>
@@ -3948,11 +4905,22 @@ defineExpose({
   align-items: center;
   gap: 0.35rem;
   flex-wrap: wrap;
-  padding: 0.2rem 0.5rem;
+  padding: 0.9rem 0.5rem 0.25rem;
   margin: 0 0.15rem;
   border-radius: 6px;
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  position: relative;
+}
+.viewer-header-block[data-group]::before {
+  content: attr(data-group);
+  position: absolute;
+  top: 0.15rem;
+  left: 0.45rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.03em;
+  color: #8da2c9;
+  text-transform: uppercase;
 }
 .viewer-header-block:first-of-type {
   margin-left: 0;
@@ -4304,6 +5272,161 @@ defineExpose({
   background: rgba(173, 66, 66, 0.95);
   border-color: #b35f5f;
 }
+.viewer-assembly-panel {
+  position: absolute;
+  right: 10px;
+  top: 56px;
+  z-index: 12;
+  width: 300px;
+  background: rgba(18, 24, 35, 0.95);
+  border: 1px solid rgba(115, 145, 200, 0.4);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  color: #e7efff;
+}
+.viewer-assembly-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(115, 145, 200, 0.22);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.viewer-assembly-toggle {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(80, 110, 160, 0.45);
+  color: #e6eefb;
+  cursor: pointer;
+}
+.viewer-assembly-body {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.viewer-assembly-row {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+}
+.viewer-assembly-select,
+.viewer-assembly-input {
+  width: 100%;
+  height: 28px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(40, 52, 78, 0.92);
+  color: #ecf2ff;
+  padding: 0 7px;
+  font-size: 0.72rem;
+}
+.viewer-assembly-pick {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.viewer-assembly-pick-btn {
+  height: 28px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(86, 122, 194, 0.9);
+  color: #fff;
+  padding: 0 9px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.viewer-assembly-pick-btn:hover {
+  background: rgba(105, 143, 218, 0.95);
+}
+.viewer-assembly-apply {
+  margin-top: 2px;
+  height: 30px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(76, 114, 190, 0.9);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+.viewer-assembly-apply:hover {
+  background: rgba(92, 132, 214, 0.95);
+}
+.viewer-assembly-note {
+  font-size: 0.66rem;
+  color: #a9bddf;
+}
+.viewer-assembly-status {
+  font-size: 0.68rem;
+  color: #dce8ff;
+  background: rgba(26, 38, 58, 0.8);
+  border: 1px solid rgba(125, 155, 220, 0.25);
+  border-radius: 5px;
+  padding: 4px 6px;
+}
+.viewer-assembly-mates {
+  margin-top: 6px;
+  border-top: 1px solid rgba(125, 155, 220, 0.2);
+  padding-top: 6px;
+}
+.viewer-assembly-mates-title {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #c8daf8;
+  margin-bottom: 4px;
+}
+.viewer-assembly-mate-row {
+  display: grid;
+  grid-template-columns: 2rem 1fr 1.6rem;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.68rem;
+  padding: 3px 6px;
+  margin: 0 -4px;
+  border-radius: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  outline: none;
+}
+.viewer-assembly-mate-row:hover {
+  background: rgba(125, 155, 220, 0.12);
+}
+.viewer-assembly-mate-row-active {
+  background: rgba(80, 140, 255, 0.22);
+  border-bottom-color: rgba(125, 155, 220, 0.2);
+}
+.viewer-assembly-mate-row-active:hover {
+  background: rgba(80, 140, 255, 0.28);
+}
+.viewer-assembly-mate-no {
+  color: #9db2cf;
+}
+.viewer-assembly-mate-type {
+  color: #e8f0ff;
+}
+.viewer-assembly-mate-del {
+  justify-self: end;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(150, 70, 70, 0.85);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+.viewer-assembly-mate-del:hover {
+  background: rgba(180, 60, 60, 0.95);
+}
 .viewer-models-list {
   flex: 1;
   overflow-y: auto;
@@ -4487,6 +5610,27 @@ defineExpose({
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
+}
+.viewer-scene-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0.85rem 4px 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(20, 24, 35, 0.45);
+  position: relative;
+}
+.viewer-scene-group[data-group]::before {
+  content: attr(data-group);
+  position: absolute;
+  top: 0.12rem;
+  left: 0.35rem;
+  font-size: 0.58rem;
+  letter-spacing: 0.03em;
+  color: #9aaccf;
+  text-transform: uppercase;
 }
 .viewer-scene-dropdown {
   position: relative;
@@ -4536,6 +5680,22 @@ defineExpose({
   font-size: 0.68rem;
   color: #c6d4e8;
   text-transform: uppercase;
+}
+.viewer-scene-shading {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.7rem;
+  color: #d0d6e6;
+}
+.viewer-scene-select {
+  height: 24px;
+  font-size: 0.68rem;
+  color: #e8edf6;
+  background: rgba(40, 50, 75, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  padding: 0 0.35rem;
 }
 .viewer-scene-tint-range {
   width: 90px;
