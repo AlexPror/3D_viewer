@@ -2,6 +2,11 @@
   "name": "viewer",
   "private": true,
   "version": "1.4.0",
+  "author": "Alexandr Vorobjev <vorobjev.alexandr-2017@yandex.ru>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AlexPror/3D_viewer.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
