@@ -36,8 +36,10 @@ Endpoints:
 - `POST /api/projects/{project_id}/channels`
 - `GET /api/projects/{project_id}/channels/{channel_id}/messages`
 - `POST /api/projects/{project_id}/channels/{channel_id}/messages`
+- `POST /api/projects/{project_id}/channels/{channel_id}/read`
 - `POST /api/projects/{project_id}/attachments/upload`
 - `GET /api/projects/{project_id}/attachments/{attachment_id}`
+- `WS /api/projects/{project_id}/ws?token=<bearer-token>`
 
 Для защищенных endpoint используйте:
 `Authorization: Bearer <token>`

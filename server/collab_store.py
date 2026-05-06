@@ -122,12 +122,26 @@ def init_collab_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS message_reads (
+                project_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                last_read_at TEXT NOT NULL,
+                last_read_msg_id TEXT,
+                PRIMARY KEY(project_id, channel_id, user_id),
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(channel_id) REFERENCES chat_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(last_read_msg_id) REFERENCES chat_messages(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pm_user ON project_members(user_id);
             CREATE INDEX IF NOT EXISTS idx_channels_project ON chat_channels(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_channel ON chat_messages(channel_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_messages_project ON chat_messages(project_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_attach_message ON chat_attachments(message_id, created_at ASC);
             CREATE INDEX IF NOT EXISTS idx_attach_project ON chat_attachments(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reads_project_channel ON message_reads(project_id, channel_id, last_read_at DESC);
             """
         )
 
@@ -368,6 +382,30 @@ def get_attachment(project_id: str, attachment_id: str) -> dict[str, Any] | None
             (project_id, attachment_id),
         ).fetchone()
         return _attachment_row_to_dict(row) if row else None
+
+
+def upsert_message_read(project_id: str, channel_id: str, user_id: str, last_read_msg_id: str | None = None) -> dict[str, Any]:
+    now = _utc_now_iso()
+    with _tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO message_reads (project_id, channel_id, user_id, last_read_at, last_read_msg_id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_id, channel_id, user_id)
+            DO UPDATE SET
+                last_read_at = excluded.last_read_at,
+                last_read_msg_id = excluded.last_read_msg_id
+            """,
+            (project_id, channel_id, user_id, now, last_read_msg_id),
+        )
+        row = conn.execute(
+            """
+            SELECT * FROM message_reads
+            WHERE project_id = ? AND channel_id = ? AND user_id = ?
+            """,
+            (project_id, channel_id, user_id),
+        ).fetchone()
+    return dict(row) if row else {}
 
 
 def _attachment_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:

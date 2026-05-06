@@ -180,6 +180,52 @@ class CollabApiTestCase(unittest.TestCase):
         self.assertEqual(dl.status_code, 200, dl.text)
         self.assertEqual(dl.headers.get("content-type"), "image/png")
 
+    def test_mark_read_endpoint(self) -> None:
+        token = self.register_and_login("read1@example.com", "Read One")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        project_resp = self.client.post("/api/projects", json={"name": "Read Project"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+        channels = self.client.get(f"/api/projects/{project_id}/channels", headers=headers).json()["channels"]
+        channel_id = channels[0]["id"]
+        msg = self.client.post(
+            f"/api/projects/{project_id}/channels/{channel_id}/messages",
+            headers=headers,
+            json={"body": "msg for read"},
+        ).json()["message"]
+
+        mark = self.client.post(
+            f"/api/projects/{project_id}/channels/{channel_id}/read",
+            headers=headers,
+            json={"lastReadMsgId": msg["id"]},
+        )
+        self.assertEqual(mark.status_code, 200, mark.text)
+        self.assertTrue(mark.json().get("ok"))
+        self.assertEqual(mark.json()["readState"]["last_read_msg_id"], msg["id"])
+
+    def test_websocket_receives_message_event(self) -> None:
+        token = self.register_and_login("ws1@example.com", "Ws One")
+        headers = {"Authorization": f"Bearer {token}"}
+        project_resp = self.client.post("/api/projects", json={"name": "Ws Project"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+        channels = self.client.get(f"/api/projects/{project_id}/channels", headers=headers).json()["channels"]
+        channel_id = channels[0]["id"]
+
+        with self.client.websocket_connect(f"/api/projects/{project_id}/ws?token={token}") as ws:
+            connected_evt = ws.receive_json()
+            self.assertEqual(connected_evt.get("type"), "ws.connected")
+            create_msg = self.client.post(
+                f"/api/projects/{project_id}/channels/{channel_id}/messages",
+                headers=headers,
+                json={"body": "hello ws"},
+            )
+            self.assertEqual(create_msg.status_code, 200, create_msg.text)
+            evt = ws.receive_json()
+            self.assertEqual(evt.get("type"), "chat.message.created")
+            self.assertEqual(evt.get("channelId"), channel_id)
+
 
 if __name__ == "__main__":
     unittest.main()

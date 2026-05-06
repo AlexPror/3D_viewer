@@ -8,7 +8,9 @@ import json
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+import asyncio
+
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
@@ -32,6 +34,7 @@ from collab_store import (
     list_channels,
     list_messages,
     list_projects_for_user,
+    upsert_message_read,
     write_audit,
 )
 
@@ -597,6 +600,42 @@ class CreateMessageRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, alias="attachmentIds")
 
 
+class MarkReadRequest(BaseModel):
+    last_read_msg_id: str | None = Field(default=None, alias="lastReadMsgId")
+
+
+class RealtimeHub:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._by_project: dict[str, set[WebSocket]] = {}
+
+    async def connect(self, project_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        async with self._lock:
+            self._by_project.setdefault(project_id, set()).add(ws)
+
+    async def disconnect(self, project_id: str, ws: WebSocket) -> None:
+        async with self._lock:
+            conns = self._by_project.get(project_id)
+            if not conns:
+                return
+            conns.discard(ws)
+            if not conns:
+                self._by_project.pop(project_id, None)
+
+    async def broadcast(self, project_id: str, event: dict[str, Any]) -> None:
+        async with self._lock:
+            targets = list(self._by_project.get(project_id, set()))
+        for ws in targets:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                await self.disconnect(project_id, ws)
+
+
+_hub = RealtimeHub()
+
+
 def _extract_token(authorization: str | None) -> str:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -736,7 +775,7 @@ def messages_list(project_id: str, channel_id: str, limit: int = 50, before: str
 
 
 @app.post("/api/projects/{project_id}/channels/{channel_id}/messages")
-def messages_create(project_id: str, channel_id: str, payload: CreateMessageRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+async def messages_create(project_id: str, channel_id: str, payload: CreateMessageRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
     membership = _require_project_member(project_id, str(user["id"]))
     if membership.get("role") == "viewer":
         raise HTTPException(status_code=403, detail="Viewer cannot send messages")
@@ -751,7 +790,34 @@ def messages_create(project_id: str, channel_id: str, payload: CreateMessageRequ
         if msgs:
             msg = msgs[-1]
     write_audit(project_id, user.get("id"), "chat.message.create", "message", msg.get("id"), {"channelId": channel_id})
+    await _hub.broadcast(
+        project_id,
+        {
+            "type": "chat.message.created",
+            "projectId": project_id,
+            "channelId": channel_id,
+            "message": msg,
+        },
+    )
     return {"ok": True, "message": msg}
+
+
+@app.post("/api/projects/{project_id}/channels/{channel_id}/read")
+async def mark_channel_read(project_id: str, channel_id: str, payload: MarkReadRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    rec = upsert_message_read(project_id, channel_id, str(user["id"]), payload.last_read_msg_id)
+    await _hub.broadcast(
+        project_id,
+        {
+            "type": "chat.read.updated",
+            "projectId": project_id,
+            "channelId": channel_id,
+            "userId": str(user["id"]),
+            "lastReadAt": rec.get("last_read_at"),
+            "lastReadMsgId": rec.get("last_read_msg_id"),
+        },
+    )
+    return {"ok": True, "readState": rec}
 
 
 _ATTACH_ROOT = Path(__file__).resolve().parent / "uploads" / "chat"
@@ -817,4 +883,58 @@ def get_attachment_file(project_id: str, attachment_id: str, user: dict[str, Any
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Attachment file is missing")
     return FileResponse(path=path, media_type=str(rec.get("mime_type") or "application/octet-stream"), filename=str(rec.get("file_name") or "attachment"))
+
+
+@app.websocket("/api/projects/{project_id}/ws")
+async def project_ws(project_id: str, ws: WebSocket) -> None:
+    token = ws.query_params.get("token", "").strip()
+    if not token:
+        await ws.close(code=4401)
+        return
+    try:
+        payload = decode_token(token)
+    except Exception:
+        await ws.close(code=4401)
+        return
+    user_id = str(payload.get("sub", ""))
+    user = get_user_by_id(user_id)
+    if not user:
+        await ws.close(code=4401)
+        return
+    if not get_membership(project_id, user_id):
+        await ws.close(code=4403)
+        return
+    await _hub.connect(project_id, ws)
+    try:
+        await ws.send_json(
+            {
+                "type": "ws.connected",
+                "projectId": project_id,
+                "userId": user_id,
+            }
+        )
+        while True:
+            data = await ws.receive_json()
+            action = str(data.get("type", ""))
+            if action == "ping":
+                await ws.send_json({"type": "pong"})
+            elif action == "chat.read":
+                channel_id = str(data.get("channelId", "")).strip()
+                if channel_id:
+                    rec = upsert_message_read(project_id, channel_id, user_id, str(data.get("lastReadMsgId") or "") or None)
+                    await _hub.broadcast(
+                        project_id,
+                        {
+                            "type": "chat.read.updated",
+                            "projectId": project_id,
+                            "channelId": channel_id,
+                            "userId": user_id,
+                            "lastReadAt": rec.get("last_read_at"),
+                            "lastReadMsgId": rec.get("last_read_msg_id"),
+                        },
+                    )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await _hub.disconnect(project_id, ws)
 
