@@ -582,7 +582,14 @@ defineExpose({
           <button type="button" class="pdf-zoom-btn" title="100%" @click="setZoomPreset(1)">100%</button>
           <button type="button" class="pdf-zoom-btn" title="6400%" @click="setZoomPreset(64)">6400%</button>
         </div>
-        <button type="button" class="pdf-screenshot-btn" @click="emit('screenshot-2d')">Скриншот 2D</button>
+        <button
+          type="button"
+          class="pdf-screenshot-btn"
+          title="Текущая страница PDF → редактор (как скриншот 3D, без захвата экрана Windows)"
+          @click="emit('screenshot-2d')"
+        >
+          Скриншот 2D
+        </button>
       </div>
       <div class="pdf-content">
         <aside class="pdf-thumbs">

@@ -16,7 +16,7 @@ Health check: `http://localhost:8000/api/health`
 
 ## API
 
-### Auth + collaboration (этап 1, каркас)
+### Auth + collaboration (этап 1 — каркас; состав проекта; связки PDF↔3D)
 
 Локальная SQLite БД создается автоматически: `server/collab.sqlite3`  
 Путь можно переопределить переменной `COLLAB_DB_PATH`.
@@ -24,6 +24,7 @@ Health check: `http://localhost:8000/api/health`
 Доп. переменные:
 - `COLLAB_AUTH_SECRET` — секрет подписи токена (обязательно сменить в проде)
 - `COLLAB_TOKEN_TTL_SECONDS` — TTL токена (по умолчанию 43200)
+- `YANDEX_TELEMOST_OAUTH` — OAuth-токен для [API Яндекс Телемоста](https://yandex.ru/dev/telemost/doc/) (создание комнаты по запросу `GET /api/projects/{id}/telemost`; без токена вкладка Телемоста показывает подсказку администратору)
 
 Endpoints:
 - `POST /api/auth/register`
@@ -32,6 +33,15 @@ Endpoints:
 - `GET /api/projects`
 - `POST /api/projects`
 - `POST /api/projects/{project_id}/members`
+- `GET /api/projects/{project_id}/members` — участники с ролями и имя/email
+- `PATCH /api/projects/{project_id}/members/{user_id}` — смена роли (как у приглашения; роль «ГИП» задаёт только ГИП)
+- `DELETE /api/projects/{project_id}/members/{user_id}` — выход из проекта (себя) или исключение участника; нельзя исключить/уйти, оставив проект без ГИПа при одном ГИПе
+- `GET /api/projects/{project_id}/telemost` — ссылка для входа в звонок Телемоста по проекту (одна комната на проект; первое обращение создаёт конференцию через API Яндекс при наличии `YANDEX_TELEMOST_OAUTH`)
+- `GET /api/projects/{project_id}/attachments` — список вложений чата проекта (метаданные)
+- `GET /api/projects/{project_id}/asset-pairs` — реестр связок PDF ↔ 3D по проекту
+- `GET /api/projects/{project_id}/asset-pairs/suggestions` — кандидаты на связку (одинаковое имя без расширения у PDF и модели в вложениях)
+- `POST /api/projects/{project_id}/asset-pairs` — добавить связку (вложения чата и/или только имена `pdfStem` / `modelStem`)
+- `DELETE /api/projects/{project_id}/asset-pairs/{pair_id}`
 - `GET /api/projects/{project_id}/channels`
 - `POST /api/projects/{project_id}/channels`
 - `GET /api/projects/{project_id}/channels/{channel_id}/messages`
@@ -39,7 +49,7 @@ Endpoints:
 - `POST /api/projects/{project_id}/channels/{channel_id}/read`
 - `POST /api/projects/{project_id}/attachments/upload`
 - `GET /api/projects/{project_id}/attachments/{attachment_id}`
-- `WS /api/projects/{project_id}/ws?token=<bearer-token>`
+- `WS /api/projects/{project_id}/ws?token=<bearer-token>` — после `ws.connected` сервер шлёт цепочку `yjs.sync` (история CRDT для совместных заметок); клиенты шлют `yjs.update` и `yjs.awareness` (курсоры), сервер ретранслирует участникам проекта
 
 Для защищенных endpoint используйте:
 `Authorization: Bearer <token>`

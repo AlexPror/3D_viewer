@@ -6818,6 +6818,10 @@ function removeModel(id: string) {
   scheduleSceneMetricsRecalc()
 }
 
+function resizeViewport() {
+  onResize()
+}
+
 defineExpose({
   openFileDialog,
   loadModelFile,
@@ -6841,6 +6845,7 @@ defineExpose({
   clearMeasurements,
   exportGlb,
   exportStl,
+  resizeViewport,
 })
 </script>
 

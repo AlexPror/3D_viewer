@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, shallowRef, watch } from 'vue'
+import * as Y from 'yjs'
+import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from 'y-protocols/awareness'
 import { logger } from './lib/logger'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -9,6 +11,8 @@ import ViewerToolbar from './components/ViewerToolbar.vue'
 import PdfViewer from './components/PdfViewer.vue'
 import LogPanel from './components/LogPanel.vue'
 import ScreenshotEditorModal from './components/ScreenshotEditorModal.vue'
+import CollabRoleIcon from './components/CollabRoleIcon.vue'
+import CollaborativeEditor from './components/CollaborativeEditor.vue'
 
 const viewMode = ref<ViewMode>('split')
 const viewerRef = ref<InstanceType<typeof Viewer3D> | null>(null)
@@ -22,6 +26,10 @@ interface ReportScreenshotItem {
   pdfFileName?: string
   /** для 2d: номер страницы скриншота */
   pageNumber?: number
+  /** для 2d: шифр альбома на момент снимка (поле «Название проекта» или с 1-го листа) */
+  albumCode?: string
+  /** для 2d: номер модуля на момент снимка */
+  moduleNumber?: string
 }
 const screenshotImageUrl = ref<string | null>(null)
 const screenshotSuggestedFileName = ref<string | null>(null)
@@ -30,6 +38,7 @@ const screenshotSourceType = ref<'2d' | '3d'>('2d')
 const editingScreenshotId = ref<string | null>(null)
 const reportScreenshots = ref<ReportScreenshotItem[]>([])
 const reportProjectName = ref('')
+const reportModuleNumber = ref('')
 const reportSheetNumber = ref('')
 const reportAuthor = ref('')
 /** Номер страницы PDF в момент создания 2D-скриншота (берём из вьюера при открытии захвата) */
@@ -126,6 +135,510 @@ const measureMode = ref(false)
 const measureSnapMode = ref<MeasureSnapMode>('intersection')
 const measureType = ref<MeasureType>('distance')
 const isDraggingFile = ref(false)
+const collabApiBase = ref((import.meta.env.VITE_COLLAB_API_BASE as string | undefined) || 'http://localhost:8000')
+const collabToken = ref(localStorage.getItem('collabToken') || '')
+const collabUser = ref<{ id: string; email: string; displayName: string } | null>(null)
+const collabEmail = ref('')
+const collabPassword = ref('')
+const collabDisplayName = ref('')
+const collabProjects = ref<any[]>([])
+const collabProjectId = ref('')
+const collabChannels = ref<any[]>([])
+const collabChannelId = ref('')
+const collabMessages = ref<any[]>([])
+const collabMessageText = ref('')
+const collabNewProjectName = ref('')
+const collabNewChannelName = ref('')
+const collabInviteEmail = ref('')
+/** Участники выбранного проекта (GET /api/projects/.../members) */
+const collabMembers = ref<
+  Array<{ id: string; email: string; displayName: string; role: string; joinedAt?: string }>
+>([])
+const collabMembersLoading = ref(false)
+
+type CollabMemberRole = 'gip' | 'chief_designer' | 'designer' | 'installer' | 'assembler' | 'client'
+
+const COLLAB_ROLE_LABELS: Record<CollabMemberRole, string> = {
+  gip: 'ГИП (главный инженер проекта)',
+  chief_designer: 'Главный конструктор',
+  designer: 'Конструктор',
+  installer: 'Монтажник',
+  assembler: 'Сборщик',
+  client: 'Клиент',
+}
+
+/** Порядок в легенде и единые цвета аватаров / подсветки */
+const COLLAB_ROLE_ORDER: CollabMemberRole[] = [
+  'gip',
+  'chief_designer',
+  'designer',
+  'installer',
+  'assembler',
+  'client',
+]
+
+const COLLAB_ROLE_SHORT: Record<CollabMemberRole, string> = {
+  gip: 'ГИП',
+  chief_designer: 'Гл. конструктор',
+  designer: 'Конструктор',
+  installer: 'Монтажник',
+  assembler: 'Сборщик',
+  client: 'Клиент',
+}
+
+const COLLAB_ROLE_AVATAR: Record<CollabMemberRole, { bg: string; ring: string }> = {
+  gip: {
+    bg: 'linear-gradient(145deg, hsl(268 58% 44%) 0%, hsl(285 48% 34%) 100%)',
+    ring: 'hsl(268 85% 68%)',
+  },
+  chief_designer: {
+    bg: 'linear-gradient(145deg, hsl(188 52% 40%) 0%, hsl(195 45% 30%) 100%)',
+    ring: 'hsl(188 80% 58%)',
+  },
+  designer: {
+    bg: 'linear-gradient(145deg, hsl(214 58% 42%) 0%, hsl(225 50% 32%) 100%)',
+    ring: 'hsl(214 85% 62%)',
+  },
+  installer: {
+    bg: 'linear-gradient(145deg, hsl(32 72% 42%) 0%, hsl(22 65% 34%) 100%)',
+    ring: 'hsl(38 95% 58%)',
+  },
+  assembler: {
+    bg: 'linear-gradient(145deg, hsl(152 48% 36%) 0%, hsl(168 42% 28%) 100%)',
+    ring: 'hsl(152 72% 52%)',
+  },
+  client: {
+    bg: 'linear-gradient(145deg, hsl(220 14% 42%) 0%, hsl(228 12% 30%) 100%)',
+    ring: 'hsl(220 35% 62%)',
+  },
+}
+
+function collabRoleLabel(role: string | undefined): string {
+  if (!role) return ''
+  return COLLAB_ROLE_LABELS[role as CollabMemberRole] ?? role
+}
+
+function isCollabMemberRole(r: string): r is CollabMemberRole {
+  return Object.prototype.hasOwnProperty.call(COLLAB_ROLE_LABELS, r)
+}
+
+const collabInviteRole = ref<CollabMemberRole>('designer')
+const collabAuthMode = ref<'login' | 'register'>('login')
+const collabBusy = ref(false)
+const collabStatus = ref('')
+
+/** Правая колонка: чат, совместные заметки (CRDT), Телемост */
+const rightWorkAreaTab = ref<'chat' | 'notes' | 'telemost'>('chat')
+/** Телемост: ссылка выдаётся сервером (одна комната на проект), без ручного ввода */
+const telemostLoading = ref(false)
+const telemostJoinUrl = ref('')
+const telemostNeedsOAuth = ref(false)
+const telemostHint = ref('')
+
+/** Этап 2: связки PDF ↔ 3D по проекту (реестр + автоподбор по именам вложений чата) */
+const collabAssetPairs = ref<Array<Record<string, unknown>>>([])
+const collabAssetPairsLoading = ref(false)
+const collabAssetSuggestions = ref<Array<Record<string, unknown>>>([])
+const collabSuggestLoading = ref(false)
+
+/** Заготовка дерева Яндекс.Диска в духе проводника VS Code / Cursor (позже — API Диска) */
+type YandexSampleFolder = { id: string; name: string; children: { id: string; name: string }[] }
+const yandexDiskSampleTree: YandexSampleFolder[] = [
+  {
+    id: 'yd_spec',
+    name: '00_Спецификация',
+    children: [
+      { id: 'yd_f1', name: 'Ведомость_РН.xlsx' },
+      { id: 'yd_f2', name: 'Спецификация_оборудование.pdf' },
+    ],
+  },
+  {
+    id: 'yd_dw',
+    name: '01_Чертежи',
+    children: [
+      { id: 'yd_f3', name: 'КР-01-00_общие_данные.pdf' },
+      { id: 'yd_f4', name: 'КМ_лист_1.dwg' },
+    ],
+  },
+  {
+    id: 'yd_3d',
+    name: '02_Модели',
+    children: [
+      { id: 'yd_f5', name: 'сборка_M1.glb' },
+      { id: 'yd_f6', name: 'узел_клапана.step' },
+    ],
+  },
+]
+const yandexDiskOpen = ref<Record<string, boolean>>({
+  yd_spec: true,
+  yd_dw: false,
+  yd_3d: false,
+})
+
+function yandexDiskToggleFolder(id: string) {
+  yandexDiskOpen.value = { ...yandexDiskOpen.value, [id]: !yandexDiskOpen.value[id] }
+}
+
+const WORKSPACE_LS_SIDEBAR = 'workspace.sidebarWidthPx'
+const WORKSPACE_LS_RIGHT = 'workspace.rightPanelWidthPx'
+const WORKSPACE_LS_CENTER_PDF = 'workspace.centerPdfWidthPx'
+
+const sidebarWidth = ref(248)
+const rightPanelWidth = ref(380)
+/** Ширина панели PDF в режиме «Разделение» (2D | 3D), px */
+const centerPdfWidth = ref(440)
+
+function clampWorkspaceWidth(w: number, min: number, max: number): number {
+  if (!Number.isFinite(w)) return min
+  return Math.min(max, Math.max(min, Math.round(w)))
+}
+
+let workspaceSplitterDrag: { kind: 'left' | 'right'; startX: number; sw: number; rw: number } | null = null
+
+function onWorkspaceSplitterDown(kind: 'left' | 'right', e: MouseEvent) {
+  e.preventDefault()
+  workspaceSplitterDrag = {
+    kind,
+    startX: e.clientX,
+    sw: sidebarWidth.value,
+    rw: rightPanelWidth.value,
+  }
+  document.body.classList.add('workspace-resizing')
+  window.addEventListener('mousemove', onWorkspaceSplitterMove)
+  window.addEventListener('mouseup', onWorkspaceSplitterUp)
+}
+
+function onWorkspaceSplitterMove(e: MouseEvent) {
+  if (!workspaceSplitterDrag) return
+  const dx = e.clientX - workspaceSplitterDrag.startX
+  if (workspaceSplitterDrag.kind === 'left') {
+    sidebarWidth.value = clampWorkspaceWidth(workspaceSplitterDrag.sw + dx, 160, 480)
+  } else {
+    /* Граница между центром и чатом: движение вправо уменьшает чат (центр забирает место) */
+    rightPanelWidth.value = clampWorkspaceWidth(workspaceSplitterDrag.rw - dx, 260, 720)
+  }
+}
+
+function onWorkspaceSplitterUp() {
+  workspaceSplitterDrag = null
+  document.body.classList.remove('workspace-resizing')
+  window.removeEventListener('mousemove', onWorkspaceSplitterMove)
+  window.removeEventListener('mouseup', onWorkspaceSplitterUp)
+  try {
+    localStorage.setItem(WORKSPACE_LS_SIDEBAR, String(sidebarWidth.value))
+    localStorage.setItem(WORKSPACE_LS_RIGHT, String(rightPanelWidth.value))
+  } catch {
+    /* noop */
+  }
+}
+
+let centerSplitterDrag: { startX: number; startW: number } | null = null
+
+const workspaceContentRef = ref<HTMLElement | null>(null)
+
+function onCenterSplitterDown(e: MouseEvent) {
+  e.preventDefault()
+  centerSplitterDrag = { startX: e.clientX, startW: centerPdfWidth.value }
+  document.body.classList.add('workspace-resizing')
+  window.addEventListener('mousemove', onCenterSplitterMove)
+  window.addEventListener('mouseup', onCenterSplitterUp)
+}
+
+function onCenterSplitterMove(e: MouseEvent) {
+  if (!centerSplitterDrag) return
+  const dx = e.clientX - centerSplitterDrag.startX
+  const total = workspaceContentRef.value?.getBoundingClientRect().width ?? 800
+  const maxPdf = Math.max(200, total - 240)
+  centerPdfWidth.value = clampWorkspaceWidth(centerSplitterDrag.startW + dx, 160, maxPdf)
+}
+
+function onCenterSplitterUp() {
+  centerSplitterDrag = null
+  document.body.classList.remove('workspace-resizing')
+  window.removeEventListener('mousemove', onCenterSplitterMove)
+  window.removeEventListener('mouseup', onCenterSplitterUp)
+  try {
+    localStorage.setItem(WORKSPACE_LS_CENTER_PDF, String(centerPdfWidth.value))
+  } catch {
+    /* noop */
+  }
+}
+
+function uint8ToBase64(u8: Uint8Array): string {
+  let b = ''
+  for (let i = 0; i < u8.length; i++) b += String.fromCharCode(u8[i])
+  return btoa(b)
+}
+
+function base64ToUint8(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+  return out
+}
+
+function collabAwarenessUserColor(clientId: number): string {
+  const h = (clientId * 37) % 360
+  return `hsl(${h} 58% 52%)`
+}
+
+const collabNotesDoc = shallowRef<Y.Doc | null>(null)
+const collabNotesAwareness = shallowRef<Awareness | null>(null)
+
+async function collabLoadTelemost() {
+  telemostHint.value = ''
+  if (!collabToken.value || !collabProjectId.value) {
+    telemostJoinUrl.value = ''
+    telemostNeedsOAuth.value = false
+    return
+  }
+  telemostLoading.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/telemost`)
+    let data: Record<string, unknown> = {}
+    try {
+      data = (await res.json()) as Record<string, unknown>
+    } catch {
+      data = {}
+    }
+    if (!res.ok) {
+      telemostJoinUrl.value = ''
+      telemostNeedsOAuth.value = false
+      const d = data.detail
+      telemostHint.value =
+        typeof d === 'string' ? d : `Ошибка ${res.status}`
+      return
+    }
+    if (data.needsOAuth === true || data.ok === false) {
+      telemostNeedsOAuth.value = true
+      telemostJoinUrl.value = ''
+      telemostHint.value = typeof data.message === 'string' ? data.message : ''
+      return
+    }
+    telemostNeedsOAuth.value = false
+    telemostJoinUrl.value = typeof data.joinUrl === 'string' ? data.joinUrl : ''
+  } catch (e) {
+    telemostJoinUrl.value = ''
+    telemostNeedsOAuth.value = false
+    telemostHint.value = e instanceof Error ? e.message : 'Ошибка'
+  } finally {
+    telemostLoading.value = false
+  }
+}
+
+watch(rightWorkAreaTab, (t) => {
+  if (t === 'telemost') void collabLoadTelemost()
+})
+
+watch(
+  () => [collabUser.value?.displayName, collabUser.value?.email] as const,
+  () => {
+    const a = collabNotesAwareness.value
+    if (!a) return
+    const name = collabUser.value?.displayName?.trim() || collabUser.value?.email || 'Участник'
+    a.setLocalStateField('user', {
+      name,
+      color: collabAwarenessUserColor(a.clientID),
+    })
+  }
+)
+
+/** Процент загрузки файла на 📎 (null — не идёт загрузка) */
+const collabAttachPct = ref<number | null>(null)
+const collabSendingText = ref(false)
+/** Сдвигается раз в минуту — подписи «Сегодня» / «Вчера» и разделители дат обновляются после полуночи */
+const collabDateTick = ref(0)
+let collabDayTimer: ReturnType<typeof setInterval> | null = null
+let collabWs: WebSocket | null = null
+
+const MONTHS_RU_SHORT = [
+  'янв',
+  'фев',
+  'мар',
+  'апр',
+  'мая',
+  'июн',
+  'июл',
+  'авг',
+  'сен',
+  'окт',
+  'ноя',
+  'дек',
+]
+
+function startOfLocalDay(d: Date): Date {
+  const x = new Date(d)
+  x.setHours(0, 0, 0, 0)
+  return x
+}
+
+function parseMessageIso(iso: string | undefined): Date | null {
+  if (!iso) return null
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+function dayKeyLocal(d: Date): string {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function formatDaySeparatorLabel(d: Date): string {
+  collabDateTick.value
+  const today = startOfLocalDay(new Date())
+  const yesterday = new Date(today)
+  yesterday.setDate(yesterday.getDate() - 1)
+  const t = startOfLocalDay(d)
+  if (t.getTime() === today.getTime()) return 'Сегодня'
+  if (t.getTime() === yesterday.getTime()) return 'Вчера'
+  return `${d.getDate()} ${MONTHS_RU_SHORT[d.getMonth()]} ${d.getFullYear()}`
+}
+
+function formatMessageTime(iso: string | undefined): string {
+  const d = parseMessageIso(iso)
+  if (!d) return ''
+  return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+}
+
+function collabMessageAuthorLabel(m: Record<string, unknown>): string {
+  const self = collabUser.value
+  const aid = String(m.author_id ?? '')
+  if (self?.id && aid && self.id === aid) {
+    const n = self.displayName?.trim()
+    if (n) return n
+    const e = self.email?.trim()
+    if (e) return e
+  }
+  const a = m.author as Record<string, unknown> | undefined
+  const pick = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '')
+  const name =
+    pick(a?.displayName) ||
+    pick(a?.display_name) ||
+    pick(m.authorDisplayName) ||
+    pick(m.author_display_name) ||
+    pick(a?.email) ||
+    pick(m.authorEmail) ||
+    pick(m.author_email)
+  if (name) return name
+  return 'Участник'
+}
+
+function collabAuthorIdForMessage(m: Record<string, unknown>): string {
+  return String(m.author_id ?? (m.author as { id?: string } | undefined)?.id ?? '')
+}
+
+const collabCurrentProjectRole = computed((): CollabMemberRole | null => {
+  const p = collabProjects.value.find((x: { id: string }) => x.id === collabProjectId.value)
+  const r = p?.role
+  return typeof r === 'string' && r in COLLAB_ROLE_LABELS ? (r as CollabMemberRole) : null
+})
+
+/** Совпадает с server/main._role_can_manage_members */
+const collabCanManageMembers = computed(() => {
+  const r = collabCurrentProjectRole.value
+  return r === 'gip' || r === 'chief_designer' || r === 'designer'
+})
+
+function collabRoleFromMessage(m: Record<string, unknown>): CollabMemberRole | null {
+  const pick =
+    (typeof m.authorProjectRole === 'string' && m.authorProjectRole) ||
+    (typeof (m.author as Record<string, unknown> | undefined)?.projectRole === 'string' &&
+      String((m.author as Record<string, unknown>).projectRole)) ||
+    (typeof (m.author as Record<string, unknown> | undefined)?.project_role === 'string' &&
+      String((m.author as Record<string, unknown>).project_role)) ||
+    ''
+  if (pick && pick in COLLAB_ROLE_LABELS) return pick as CollabMemberRole
+  const self = collabUser.value
+  const aid = String(m.author_id ?? '')
+  if (self?.id && aid && self.id === aid && collabCurrentProjectRole.value) {
+    return collabCurrentProjectRole.value
+  }
+  return null
+}
+
+function collabMessageRow(m: Record<string, unknown>): {
+  author: string
+  role: CollabMemberRole | null
+  roleShort: string
+  avatar: { initials: string; bg: string; ring: string }
+} {
+  const author = collabMessageAuthorLabel(m)
+  const id = collabAuthorIdForMessage(m) || author || 'x'
+  const role = collabRoleFromMessage(m)
+  let initials = '?'
+  const trimmed = author.replace(/\s+/g, ' ').trim()
+  if (trimmed && trimmed !== 'Участник') {
+    const parts = trimmed.split(/\s+/).filter(Boolean)
+    if (parts.length >= 2) {
+      const a = parts[0][0]
+      const b = parts[parts.length - 1][0]
+      if (a && b) initials = (a + b).toUpperCase()
+    } else {
+      initials = trimmed.slice(0, 2).toUpperCase()
+    }
+  } else {
+    const hexish = id.replace(/-/g, '').slice(0, 2)
+    initials = hexish.length >= 2 ? hexish.toUpperCase() : '?'
+  }
+  if (role && COLLAB_ROLE_AVATAR[role]) {
+    const a = COLLAB_ROLE_AVATAR[role]
+    return {
+      author,
+      role,
+      roleShort: COLLAB_ROLE_SHORT[role],
+      avatar: { initials, bg: a.bg, ring: a.ring },
+    }
+  }
+  let h = 0
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0
+  const hue = Math.abs(h) % 360
+  const fall = `hsl(${hue} 46% 36%)`
+  return {
+    author,
+    role: null,
+    roleShort: '',
+    avatar: { initials, bg: fall, ring: `hsl(${hue} 55% 55%)` },
+  }
+}
+
+type CollabTimelineItem =
+  | { type: 'sep'; key: string; label: string }
+  | {
+      type: 'msg'
+      key: string
+      message: Record<string, unknown>
+      row: {
+        author: string
+        role: CollabMemberRole | null
+        roleShort: string
+        avatar: { initials: string; bg: string; ring: string }
+      }
+    }
+
+function buildCollabTimeline(messages: typeof collabMessages.value): CollabTimelineItem[] {
+  collabDateTick.value
+  void collabUser.value?.id
+  void collabCurrentProjectRole.value
+  const items: CollabTimelineItem[] = []
+  let lastDay: string | null = null
+  for (const m of messages) {
+    const d = parseMessageIso(m.created_at as string | undefined)
+    if (d) {
+      const dk = dayKeyLocal(d)
+      if (dk !== lastDay) {
+        lastDay = dk
+        items.push({ type: 'sep', key: `sep-${dk}`, label: formatDaySeparatorLabel(d) })
+      }
+    }
+    const msg = m as Record<string, unknown>
+    items.push({ type: 'msg', key: String(m.id), message: msg, row: collabMessageRow(msg) })
+  }
+  return items
+}
+
+const collabChatTimeline = computed(() => buildCollabTimeline(collabMessages.value))
 
 const MODEL_EXTENSIONS = ['stl', 'step', 'stp', 'igs', 'iges', 'glb', 'gltf']
 
@@ -197,9 +710,14 @@ function onOpenPdf() {
   pdfInput.click()
 }
 
-function onViewModeChange(mode: ViewMode) {
+async function onViewModeChange(mode: ViewMode) {
   viewMode.value = mode
   logger.info('App', `Режим вида: ${mode}`)
+  await nextTick()
+  requestAnimationFrame(() => {
+    viewerRef.value?.resizeViewport?.()
+    requestAnimationFrame(() => viewerRef.value?.resizeViewport?.())
+  })
 }
 
 function onOpenFile() {
@@ -582,108 +1100,32 @@ async function onScreenshot3D() {
   }
 }
 
-async function onScreenshotTab() {
-  logger.info('App', `Скриншот вкладки: getDisplayMedia=${!!navigator.mediaDevices?.getDisplayMedia}`)
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    logger.warn('App', 'Скриншот вкладки: API недоступен (нужен HTTPS и современный браузер)')
-    alert('Захват вкладки недоступен. Используйте современный браузер и HTTPS.')
+/** Прямой рендер страницы PDF в изображение (как 3D takeScreenshot), без захвата экрана ОС */
+async function onScreenshot2d() {
+  const pv = pdfViewerRef.value
+  if (!pdfFile.value || !pv?.getCurrentPageImageUrlAsync) {
+    alert('Откройте PDF и дождитесь загрузки страницы.')
     return
   }
-  try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { displaySurface: 'browser' },
-      audio: false,
-    })
-    logger.info('App', 'Скриншот вкладки: поток получен')
-    const video = document.createElement('video')
-    video.muted = true
-    video.playsInline = true
-    video.srcObject = stream
-    const CAPTURE_WAIT_MS = 5000
-    const pollStepMs = 100
-    const waitForFrame = async (): Promise<{ w: number; h: number }> => {
-      await video.play()
-      const deadline = Date.now() + CAPTURE_WAIT_MS
-      while (video.videoWidth === 0 || video.videoHeight === 0) {
-        if (Date.now() >= deadline) throw new Error('timeout')
-        await new Promise((r) => setTimeout(r, pollStepMs))
-      }
-      await new Promise((r) => requestAnimationFrame(r))
-      return { w: video.videoWidth, h: video.videoHeight }
-    }
-    let w: number
-    let h: number
-    try {
-      const size = await Promise.race([
-        waitForFrame(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), CAPTURE_WAIT_MS + 500)
-        ),
-      ])
-      w = size.w
-      h = size.h
-    } catch (err) {
-      stream.getTracks().forEach((t) => t.stop())
-      logger.warn('App', 'Скриншот вкладки: не удалось получить кадр за 5 с')
-      alert('Не удалось получить кадр. Попробуйте снова или выберите вкладку явно.')
-      return
-    }
-    logger.info('App', `Скриншот вкладки: видео размер ${w}×${h}`)
-    const dpr = window.devicePixelRatio || 1
-    const iframeEl = document.querySelector('.pdf-iframe') as HTMLElement | null
-    let drawW = w
-    let drawH = h
-    let sx = 0
-    let sy = 0
-    let sw = w
-    let sh = h
-    if (iframeEl) {
-      const rect = iframeEl.getBoundingClientRect()
-      sx = Math.round(rect.left * dpr)
-      sy = Math.round(rect.top * dpr)
-      sw = Math.round(rect.width * dpr)
-      sh = Math.round(rect.height * dpr)
-      sx = Math.max(0, Math.min(sx, w - 1))
-      sy = Math.max(0, Math.min(sy, h - 1))
-      sw = Math.min(sw, w - sx)
-      sh = Math.min(sh, h - sy)
-      if (sw > 0 && sh > 0) {
-        drawW = sw
-        drawH = sh
-        logger.info('App', `Скриншот вкладки: обрезка по iframe ${drawW}×${drawH}`)
-      } else {
-        sx = 0
-        sy = 0
-        sw = w
-        sh = h
-      }
-    }
-    const canvas = document.createElement('canvas')
-    canvas.width = drawW
-    canvas.height = drawH
-    const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      logger.warn('App', 'Скриншот вкладки: не удалось получить 2D контекст canvas')
-      stream.getTracks().forEach((t) => t.stop())
-      return
-    }
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, drawW, drawH)
-    const url = canvas.toDataURL('image/png')
-    stream.getTracks().forEach((t) => t.stop())
-    screenshotSourceType.value = '2d'
-    savedPdfPageForNextScreenshot.value = pdfViewerRef.value?.getScreenshotPage?.() ?? 1
-    screenshotImageUrl.value = url
-    screenshotSuggestedFileName.value = `вкладка-${new Date().toISOString().slice(0, 10)}`
-    showScreenshotModal.value = true
-    logger.info('App', `Скриншот вида вкладки получен, dataURL длина=${url.length}`)
-  } catch (e) {
-    if (e instanceof Error && e.name === 'NotAllowedError') {
-      logger.info('App', 'Скриншот вкладки: пользователь отменил выбор источника')
-    } else {
-      logger.error('App', 'Скриншот вкладки: ошибка захвата', e)
-      alert('Не удалось захватить вид. Убедитесь, что используется HTTPS.')
-    }
+  const pageNum = pv.getScreenshotPage?.() ?? 1
+  const url = await pv.getCurrentPageImageUrlAsync(pageNum)
+  if (!url) {
+    alert('Не удалось подготовить скриншот страницы. Проверьте номер страницы и попробуйте снова.')
+    return
   }
+  screenshotSourceType.value = '2d'
+  savedPdfPageForNextScreenshot.value = pageNum
+  screenshotImageUrl.value = url
+  screenshotSuggestedFileName.value = build2dScreenshotFileName({
+    id: '',
+    type: '2d',
+    dataUrl: '',
+    pageNumber: pageNum,
+    albumCode: resolveAlbumCodeSnapshot(),
+    moduleNumber: reportModuleNumber.value.trim(),
+  })
+  showScreenshotModal.value = true
+  logger.info('App', `Скриншот 2D: стр. ${pageNum}, dataURL длина=${url.length}`)
 }
 
 function onScreenshotEditorClose(dataUrl: string | null) {
@@ -707,6 +1149,8 @@ function onScreenshotEditorClose(dataUrl: string | null) {
           pdfViewerRef.value?.getScreenshotPage?.() ??
           savedPdfPageForNextScreenshot.value ??
           1
+        item.albumCode = resolveAlbumCodeSnapshot()
+        item.moduleNumber = reportModuleNumber.value.trim()
       }
       reportScreenshots.value.push(item)
       logger.info('App', `Редактор скриншота: добавлен ${type === '2d' ? '2D' : '3D'} скриншот в отчёт (всего ${reportScreenshots.value.length})`)
@@ -733,7 +1177,8 @@ function openEditorForScreenshot(item: ReportScreenshotItem) {
   editingScreenshotId.value = item.id
   screenshotSourceType.value = item.type
   screenshotImageUrl.value = item.dataUrl
-  screenshotSuggestedFileName.value = item.type === '2d' ? '2d-скриншот' : '3d-скриншот'
+  screenshotSuggestedFileName.value =
+    item.type === '2d' ? build2dScreenshotFileName(item) : '3d-скриншот'
   showScreenshotModal.value = true
 }
 
@@ -790,6 +1235,878 @@ function sanitizeFileName(s: string): string {
   return s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'проект'
 }
 
+function resolveAlbumCodeSnapshot(): string {
+  return reportProjectName.value.trim() || firstSheetData.value.projectCode?.trim() || ''
+}
+
+/** Имя файла 2D: шифр альбома + номер модуля + номер страницы PDF */
+function build2dScreenshotFileName(item: ReportScreenshotItem): string {
+  const rawCode = item.albumCode?.trim() || resolveAlbumCodeSnapshot()
+  const rawMod = (item.moduleNumber ?? reportModuleNumber.value).trim()
+  const page = item.pageNumber ?? 1
+  const code = sanitizeFileName(rawCode) || 'альбом'
+  const mod = sanitizeFileName(rawMod) || 'м0'
+  const base = `${code}_M${mod}_стр${page}`
+  const limited = base.length > 160 ? base.slice(0, 160) : base
+  return `${limited}.png`
+}
+
+function collabAuthHeaders() {
+  return collabToken.value ? { Authorization: `Bearer ${collabToken.value}` } : {}
+}
+
+function collabAuthFetch(path: string, init?: RequestInit) {
+  const headers = new Headers(init?.headers || {})
+  if (collabToken.value) headers.set('Authorization', `Bearer ${collabToken.value}`)
+  if (!headers.has('Content-Type') && init?.body && !(init.body instanceof FormData)) {
+    headers.set('Content-Type', 'application/json')
+  }
+  return fetch(`${collabApiBase.value}${path}`, { ...(init || {}), headers })
+}
+
+async function collabErrorText(res: Response): Promise<string> {
+  const msg = await res.text()
+  try {
+    const j = JSON.parse(msg) as { detail?: unknown }
+    if (j.detail != null) return typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)
+  } catch {
+    /* оставить сырой текст */
+  }
+  return msg
+}
+
+function filenameFromContentDisposition(cd: string | null, fallback: string): string {
+  if (!cd) return fallback
+  const m = /filename\*=(?:UTF-8'')?([^;\n]+)|filename="([^"]+)"/i.exec(cd)
+  const raw = (m?.[1] || m?.[2] || '').trim().replace(/^UTF-8''/i, '')
+  try {
+    return decodeURIComponent(raw.replace(/^"|"$/g, '')) || fallback
+  } catch {
+    return raw.replace(/^"|"$/g, '') || fallback
+  }
+}
+
+async function collabLoadAssetPairs() {
+  if (!collabToken.value || !collabProjectId.value) {
+    collabAssetPairs.value = []
+    return
+  }
+  collabAssetPairsLoading.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/asset-pairs`)
+    if (!res.ok) return
+    const data = await res.json()
+    collabAssetPairs.value = data.pairs || []
+  } finally {
+    collabAssetPairsLoading.value = false
+  }
+}
+
+async function collabLoadSuggestions() {
+  if (!collabToken.value || !collabProjectId.value) {
+    collabAssetSuggestions.value = []
+    return
+  }
+  collabSuggestLoading.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/asset-pairs/suggestions`)
+    if (!res.ok) return
+    const data = await res.json()
+    collabAssetSuggestions.value = data.suggestions || []
+  } finally {
+    collabSuggestLoading.value = false
+  }
+}
+
+async function collabAddSuggestedPair(s: Record<string, unknown>) {
+  if (!collabProjectId.value) return
+  const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/asset-pairs`, {
+    method: 'POST',
+    body: JSON.stringify({
+      pdfAttachmentId: s.pdfAttachmentId,
+      modelAttachmentId: s.modelAttachmentId,
+      pdfStem: s.pdfStem,
+      modelStem: s.modelStem,
+    }),
+  })
+  if (!res.ok) throw new Error(await collabErrorText(res))
+}
+
+async function collabAddOneSuggestedPair(s: Record<string, unknown>) {
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    await collabAddSuggestedPair(s)
+    await collabLoadAssetPairs()
+    await collabLoadSuggestions()
+    collabStatus.value = 'Связка добавлена'
+  } catch (e) {
+    collabStatus.value = e instanceof Error ? e.message : 'Ошибка'
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabAddAllSuggestedPairs() {
+  const list = [...collabAssetSuggestions.value]
+  if (!collabProjectId.value || list.length === 0) return
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    for (const s of list) {
+      await collabAddSuggestedPair(s)
+    }
+    await collabLoadAssetPairs()
+    await collabLoadSuggestions()
+    collabStatus.value = `Добавлено связок: ${list.length}`
+  } catch (e) {
+    collabStatus.value = e instanceof Error ? e.message : 'Ошибка'
+    await collabLoadAssetPairs()
+    await collabLoadSuggestions()
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabDeleteAssetPair(pairId: string) {
+  if (!collabProjectId.value) return
+  collabBusy.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/asset-pairs/${pairId}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) {
+      collabStatus.value = await collabErrorText(res)
+      return
+    }
+    await collabLoadAssetPairs()
+    await collabLoadSuggestions()
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabOpenAssetPair(p: Record<string, unknown>) {
+  const pid = collabProjectId.value
+  if (!pid) return
+  const pdfAid = String(p.pdfAttachmentId ?? p.pdf_attachment_id ?? '').trim()
+  const modelAid = String(p.modelAttachmentId ?? p.model_attachment_id ?? '').trim()
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    viewMode.value = 'split'
+    if (pdfAid) {
+      const res = await collabAuthFetch(`/api/projects/${pid}/attachments/${pdfAid}`)
+      if (!res.ok) throw new Error(await collabErrorText(res))
+      const blob = await res.blob()
+      const fn = filenameFromContentDisposition(
+        res.headers.get('Content-Disposition'),
+        `${String(p.pdfStem ?? 'drawing')}.pdf`
+      )
+      const file = new File([blob], fn, { type: blob.type || 'application/pdf' })
+      if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
+      pdfFile.value = { url: URL.createObjectURL(file), name: file.name }
+    }
+    if (modelAid && viewerRef.value) {
+      const res = await collabAuthFetch(`/api/projects/${pid}/attachments/${modelAid}`)
+      if (!res.ok) throw new Error(await collabErrorText(res))
+      const blob = await res.blob()
+      const fn = filenameFromContentDisposition(
+        res.headers.get('Content-Disposition'),
+        `${String(p.modelStem ?? 'model')}.glb`
+      )
+      const file = new File([blob], fn, { type: blob.type || 'application/octet-stream' })
+      await viewerRef.value.loadModelFile(file)
+    }
+    if (!pdfAid && !modelAid) {
+      collabStatus.value =
+        'У связки нет вложений из чата — загрузите PDF и 3D в канал, затем добавьте связку по подсказке.'
+      return
+    }
+    collabStatus.value = 'Пара загружена (режим «Разделение»)'
+  } catch (e) {
+    collabStatus.value = e instanceof Error ? e.message : 'Ошибка открытия пары'
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+function collabIsMemberSelf(m: { id: string }): boolean {
+  const uid = collabUser.value?.id
+  return Boolean(uid && uid === m.id)
+}
+
+function collabCanEditOtherMemberRole(m: { id: string }): boolean {
+  return collabCanManageMembers.value && !collabIsMemberSelf(m)
+}
+
+function collabCanRemoveOtherMember(m: { id: string; role: string }): boolean {
+  if (!collabCanManageMembers.value || collabIsMemberSelf(m)) return false
+  if (m.role === 'gip' && collabCurrentProjectRole.value !== 'gip') return false
+  return true
+}
+
+async function collabSetMemberRole(targetId: string, role: CollabMemberRole) {
+  if (!collabProjectId.value) return
+  const cur = collabMembers.value.find((x) => x.id === targetId)
+  if (cur && cur.role === role) return
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/members/${targetId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    })
+    if (!res.ok) throw new Error(await collabErrorText(res))
+    await collabLoadMembers()
+    collabStatus.value = 'Роль участника обновлена'
+  } catch (e) {
+    collabStatus.value = `Роль: ${e instanceof Error ? e.message : 'ошибка'}`
+    await collabLoadMembers()
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+function onCollabMemberRoleChange(m: { id: string; role: string }, ev: Event) {
+  const v = (ev.target as HTMLSelectElement).value
+  if (!isCollabMemberRole(v)) return
+  void collabSetMemberRole(m.id, v)
+}
+
+async function collabLeaveProject() {
+  const uid = collabUser.value?.id
+  if (!collabProjectId.value || !uid) return
+  if (!confirm('Покинуть этот проект?')) return
+  collabBusy.value = true
+  collabStatus.value = ''
+  const leftId = collabProjectId.value
+  try {
+    const res = await collabAuthFetch(`/api/projects/${leftId}/members/${uid}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error(await collabErrorText(res))
+    await collabLoadProjects()
+    if (!collabProjects.value.some((p: { id: string }) => p.id === leftId)) {
+      collabProjectId.value = collabProjects.value[0]?.id ?? ''
+      collabChannelId.value = ''
+      collabMessages.value = []
+      if (collabProjectId.value) {
+        await collabLoadChannels()
+        await collabLoadMessages()
+        await collabLoadMembers()
+        collabConnectWs()
+      } else {
+        collabChannels.value = []
+        collabMembers.value = []
+        collabDisconnectWs()
+      }
+    } else {
+      await collabLoadMembers()
+    }
+    collabStatus.value = 'Вы вышли из проекта'
+  } catch (e) {
+    collabStatus.value = `Выход: ${e instanceof Error ? e.message : 'ошибка'}`
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabKickMember(targetId: string) {
+  if (!collabProjectId.value || collabIsMemberSelf({ id: targetId })) return
+  if (!confirm('Исключить участника из проекта?')) return
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/members/${targetId}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error(await collabErrorText(res))
+    await collabLoadMembers()
+    collabStatus.value = 'Участник исключён'
+  } catch (e) {
+    collabStatus.value = `Исключение: ${e instanceof Error ? e.message : 'ошибка'}`
+    await collabLoadMembers()
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+function xhrPostFormData(
+  fullUrl: string,
+  formData: FormData,
+  onUploadProgress: (percent: number) => void
+): Promise<{ ok: boolean; status: number; text: () => Promise<string> }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', fullUrl)
+    if (collabToken.value) xhr.setRequestHeader('Authorization', `Bearer ${collabToken.value}`)
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && ev.total > 0) {
+        onUploadProgress(Math.min(100, Math.round((ev.loaded / ev.total) * 100)))
+      }
+    }
+    xhr.onload = () => {
+      const body = xhr.responseText ?? ''
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        text: async () => body,
+      })
+    }
+    xhr.onerror = () => reject(new Error('Сеть: не удалось загрузить файл'))
+    xhr.send(formData)
+  })
+}
+
+async function collabDownloadAttachment(att: { id: string; file_name?: string | null; fileName?: string | null }) {
+  if (!collabProjectId.value || !collabToken.value) {
+    collabStatus.value = 'Войдите в чат, чтобы скачать файл'
+    return
+  }
+  try {
+    const path = `/api/projects/${collabProjectId.value}/attachments/${att.id}`
+    const res = await collabAuthFetch(path)
+    if (!res.ok) throw new Error(await res.text())
+    const blob = await res.blob()
+    const raw = att.file_name || att.fileName || 'attachment'
+    const name = String(raw).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'attachment'
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    collabStatus.value = `Скачивание: ${e instanceof Error ? e.message : 'ошибка'}`
+  }
+}
+
+function collabAttachmentDisplayName(
+  att: { file_name?: string | null; fileName?: string | null },
+  messageBody?: string
+): string {
+  const fromApi = att.file_name || att.fileName
+  if (typeof fromApi === 'string' && fromApi.trim()) return fromApi.trim()
+  const m = messageBody?.match(/^Вложение:\s*(.+)$/i)
+  if (m?.[1]?.trim()) return m[1].trim()
+  return 'Файл'
+}
+
+/** Текст сообщения в ленте: без дубля «Вложение: имя», если имя уже есть во вложениях */
+function collabMessageBodyForDisplay(m: { body?: unknown; attachments?: unknown }) {
+  const body = typeof m.body === 'string' ? m.body.trim() : ''
+  const atts = m.attachments
+  if (!body || !Array.isArray(atts) || atts.length !== 1) return body
+  const name = collabAttachmentDisplayName(atts[0] as { file_name?: string; fileName?: string }, body)
+  const dup = new RegExp(`^Вложение:\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i')
+  if (dup.test(body)) return ''
+  return body
+}
+
+async function collabOpenAttachmentPreview(att: { id: string; file_name?: string | null; fileName?: string | null }) {
+  if (!collabProjectId.value || !collabToken.value) {
+    collabStatus.value = 'Войдите в чат'
+    return
+  }
+  try {
+    const path = `/api/projects/${collabProjectId.value}/attachments/${att.id}`
+    const res = await collabAuthFetch(path)
+    if (!res.ok) throw new Error(await res.text())
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank', 'noopener,noreferrer')
+    setTimeout(() => URL.revokeObjectURL(url), 120_000)
+  } catch (e) {
+    collabStatus.value = `Открытие файла: ${e instanceof Error ? e.message : 'ошибка'}`
+  }
+}
+
+async function collabLoadMe() {
+  if (!collabToken.value) return
+  const res = await collabAuthFetch('/api/me')
+  if (!res.ok) throw new Error('auth failed')
+  const data = await res.json()
+  collabUser.value = data.user
+}
+
+async function collabLoadProjects() {
+  const res = await collabAuthFetch('/api/projects')
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  collabProjects.value = data.projects || []
+  if (!collabProjectId.value && collabProjects.value.length > 0) {
+    collabProjectId.value = collabProjects.value[0].id
+  }
+}
+
+async function collabLoadChannels() {
+  if (!collabProjectId.value) return
+  const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels`)
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  collabChannels.value = data.channels || []
+  if (!collabChannelId.value && collabChannels.value.length > 0) {
+    collabChannelId.value = collabChannels.value[0].id
+  }
+}
+
+async function collabLoadMessages() {
+  if (!collabProjectId.value || !collabChannelId.value) return
+  const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels/${collabChannelId.value}/messages?limit=100`)
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  collabMessages.value = data.messages || []
+}
+
+function collabDisconnectWs() {
+  if (collabNotesAwareness.value && collabWs?.readyState === WebSocket.OPEN) {
+    try {
+      collabNotesAwareness.value.setLocalState(null)
+    } catch {
+      /* noop */
+    }
+  }
+  if (collabWs) {
+    collabWs.close()
+    collabWs = null
+  }
+  if (collabNotesAwareness.value) {
+    collabNotesAwareness.value = null
+  }
+  if (collabNotesDoc.value) {
+    try {
+      collabNotesDoc.value.destroy()
+    } catch {
+      /* noop */
+    }
+    collabNotesDoc.value = null
+  }
+}
+
+function collabConnectWs() {
+  collabDisconnectWs()
+  if (!collabToken.value || !collabProjectId.value) return
+
+  const doc = new Y.Doc()
+  collabNotesDoc.value = doc
+
+  const awareness = new Awareness(doc)
+  collabNotesAwareness.value = awareness
+  {
+    const name = collabUser.value?.displayName?.trim() || collabUser.value?.email || 'Участник'
+    awareness.setLocalStateField('user', {
+      name,
+      color: collabAwarenessUserColor(awareness.clientID),
+    })
+  }
+
+  doc.on('update', (update: Uint8Array, origin: unknown) => {
+    if (origin === 'remote' || origin === 'sync') return
+    if (!collabWs || collabWs.readyState !== WebSocket.OPEN) return
+    collabWs.send(JSON.stringify({ type: 'yjs.update', update: uint8ToBase64(update) }))
+  })
+
+  awareness.on('update', ({ added, updated, removed }, origin: unknown) => {
+    if (origin === 'remote') return
+    if (!collabWs || collabWs.readyState !== WebSocket.OPEN) return
+    const changed = Array.from(new Set([...added, ...updated, ...removed]))
+    if (changed.length === 0) return
+    const u = encodeAwarenessUpdate(awareness, changed)
+    collabWs.send(JSON.stringify({ type: 'yjs.awareness', update: uint8ToBase64(u) }))
+  })
+
+  const wsBase = collabApiBase.value.replace(/^http/, 'ws')
+  collabWs = new WebSocket(`${wsBase}/api/projects/${collabProjectId.value}/ws?token=${encodeURIComponent(collabToken.value)}`)
+  collabWs.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data)
+      if (msg.type === 'yjs.sync' && collabNotesDoc.value && Array.isArray(msg.updates)) {
+        for (const u of msg.updates as string[]) {
+          Y.applyUpdate(collabNotesDoc.value, base64ToUint8(u), 'sync')
+        }
+        return
+      }
+      if (msg.type === 'yjs.update' && collabNotesDoc.value && typeof msg.update === 'string') {
+        Y.applyUpdate(collabNotesDoc.value, base64ToUint8(msg.update), 'remote')
+        return
+      }
+      if (msg.type === 'yjs.awareness' && collabNotesAwareness.value && typeof msg.update === 'string') {
+        applyAwarenessUpdate(collabNotesAwareness.value, base64ToUint8(msg.update), 'remote')
+        return
+      }
+      if (msg.type === 'chat.message.created' && msg.channelId === collabChannelId.value) {
+        let incoming = msg.message as Record<string, unknown>
+        const u = collabUser.value
+        const aid = String(incoming.author_id ?? '')
+        if (u?.id && aid && u.id === aid && !incoming.author) {
+          const proj = collabProjects.value.find((x: { id: string }) => x.id === collabProjectId.value)
+          const myRole = typeof proj?.role === 'string' && proj.role in COLLAB_ROLE_LABELS ? proj.role : undefined
+          incoming = {
+            ...incoming,
+            author: { id: u.id, email: u.email, displayName: u.displayName, display_name: u.displayName },
+            authorDisplayName: u.displayName,
+            authorEmail: u.email,
+            ...(myRole ? { authorProjectRole: myRole } : {}),
+          }
+        }
+        collabMessages.value.push(incoming)
+      }
+    } catch {
+      // noop
+    }
+  }
+}
+
+async function collabBootstrap() {
+  await collabLoadMe()
+  await collabLoadProjects()
+  await collabLoadChannels()
+  await collabLoadMessages()
+  await collabLoadMembers()
+  collabConnectWs()
+  await collabLoadAssetPairs()
+  await collabLoadSuggestions()
+}
+
+async function collabLoadMembers() {
+  if (!collabToken.value || !collabProjectId.value) {
+    collabMembers.value = []
+    return
+  }
+  collabMembersLoading.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/members`)
+    if (!res.ok) {
+      collabMembers.value = []
+      return
+    }
+    const data = await res.json()
+    collabMembers.value = data.members || []
+  } finally {
+    collabMembersLoading.value = false
+  }
+}
+
+async function collabSubmitAuth() {
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const path = collabAuthMode.value === 'login' ? '/api/auth/login' : '/api/auth/register'
+    const payload: Record<string, string> = {
+      email: collabEmail.value.trim(),
+      password: collabPassword.value,
+    }
+    if (collabAuthMode.value === 'register') payload.display_name = collabDisplayName.value.trim() || 'User'
+    const res = await fetch(`${collabApiBase.value}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    collabToken.value = data.token || ''
+    localStorage.setItem('collabToken', collabToken.value)
+    await collabBootstrap()
+    collabStatus.value = 'Подключено'
+  } catch (e) {
+    collabStatus.value = `Ошибка: ${e instanceof Error ? e.message : 'auth'}`
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabSendMessage() {
+  const body = collabMessageText.value.trim()
+  if (!collabProjectId.value || !collabChannelId.value) {
+    collabStatus.value = 'Выберите проект и канал'
+    return
+  }
+  if (!body) return
+  collabBusy.value = true
+  collabSendingText.value = true
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels/${collabChannelId.value}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ body }),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    collabMessageText.value = ''
+  } catch (e) {
+    collabStatus.value = `Ошибка отправки: ${e instanceof Error ? e.message : 'send'}`
+  } finally {
+    collabSendingText.value = false
+    collabBusy.value = false
+  }
+}
+
+function onCollabComposerKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    if (!collabBusy.value && !collabSendingText.value) collabSendMessage()
+  }
+}
+
+async function collabAttachFile() {
+  if (!collabProjectId.value || !collabChannelId.value) {
+    collabStatus.value = 'Сначала выберите проект и канал'
+    return
+  }
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.png,.jpg,.jpeg,.webp,.gif,.bmp,.tif,.tiff,.pdf,.xls,.xlsx,.xlsm,.csv,.dwg,.dxf,.cdw,.spw,.m3d,.a3d,.frw,.rvt,.rfa,.step,.stp,.iges,.igs,.stl,.glb,.gltf'
+  input.onchange = async () => {
+    const file = input.files?.[0]
+    if (!file) return
+    collabBusy.value = true
+    collabAttachPct.value = 0
+    collabStatus.value = ''
+    try {
+      const fd = new FormData()
+      fd.append('file', file, file.name)
+      fd.append('source', 'chat')
+      fd.append('context_json', JSON.stringify({ origin: 'chat-compose' }))
+      const uploadUrl = `${collabApiBase.value}/api/projects/${collabProjectId.value}/attachments/upload`
+      const up = await xhrPostFormData(uploadUrl, fd, (p) => {
+        collabAttachPct.value = p
+      })
+      const upText = await up.text()
+      if (!up.ok) throw new Error(upText)
+      const upData = JSON.parse(upText) as { attachment?: { id: string } }
+      const attachmentId = upData?.attachment?.id
+      if (!attachmentId) throw new Error('attachment id missing')
+      collabAttachPct.value = null
+      collabStatus.value = 'Отправка сообщения…'
+      const body = collabMessageText.value.trim() || `Вложение: ${file.name}`
+      const msg = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels/${collabChannelId.value}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({
+          body,
+          attachmentIds: [attachmentId],
+        }),
+      })
+      if (!msg.ok) throw new Error(await msg.text())
+      collabMessageText.value = ''
+      collabStatus.value = `Файл отправлен: ${file.name}`
+    } catch (e) {
+      collabStatus.value = `Ошибка вложения: ${e instanceof Error ? e.message : 'upload'}`
+    } finally {
+      collabBusy.value = false
+      collabAttachPct.value = null
+    }
+  }
+  input.click()
+}
+
+async function onCollabProjectChange() {
+  collabChannelId.value = ''
+  collabMessages.value = []
+  await collabLoadChannels()
+  await collabLoadMessages()
+  await collabLoadMembers()
+  collabConnectWs()
+  await collabLoadTelemost()
+  await collabLoadAssetPairs()
+  await collabLoadSuggestions()
+}
+
+async function onCollabChannelChange() {
+  await collabLoadMessages()
+}
+
+async function collabCreateProject() {
+  const name = collabNewProjectName.value.trim()
+  if (!name) {
+    collabStatus.value = 'Введите название проекта'
+    return
+  }
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const res = await collabAuthFetch('/api/projects', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    const proj = data.project
+    if (!proj?.id) throw new Error('Ответ без id проекта')
+    await collabLoadProjects()
+    collabProjectId.value = String(proj.id)
+    collabNewProjectName.value = ''
+    collabChannelId.value = ''
+    collabMessages.value = []
+    await collabLoadChannels()
+    if (!collabChannelId.value && collabChannels.value.length > 0) {
+      collabChannelId.value = collabChannels.value[0].id
+    }
+    await collabLoadMessages()
+    await collabLoadMembers()
+    collabConnectWs()
+    await collabLoadTelemost()
+    await collabLoadAssetPairs()
+    await collabLoadSuggestions()
+    collabStatus.value = `Проект создан. Сразу доступен канал «Общий» (если не переименован).`
+  } catch (e) {
+    collabStatus.value = `Ошибка создания проекта: ${e instanceof Error ? e.message : 'create'}`
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabCreateChannel() {
+  if (!collabProjectId.value) {
+    collabStatus.value = 'Сначала выберите или создайте проект'
+    return
+  }
+  const name = collabNewChannelName.value.trim()
+  if (!name) {
+    collabStatus.value = 'Введите название канала'
+    return
+  }
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels`, {
+      method: 'POST',
+      body: JSON.stringify({ name, kind: 'general' }),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const data = await res.json()
+    const ch = data.channel
+    await collabLoadChannels()
+    if (ch?.id) collabChannelId.value = String(ch.id)
+    await collabLoadMessages()
+    collabNewChannelName.value = ''
+    collabStatus.value = `Канал «${name}» создан`
+  } catch (e) {
+    collabStatus.value = `Ошибка канала: ${e instanceof Error ? e.message : 'create'}`
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function collabInviteMember() {
+  if (!collabProjectId.value) {
+    collabStatus.value = 'Выберите проект'
+    return
+  }
+  const email = collabInviteEmail.value.trim().toLowerCase()
+  if (!email || !email.includes('@')) {
+    collabStatus.value = 'Укажите email участника'
+    return
+  }
+  collabBusy.value = true
+  collabStatus.value = ''
+  try {
+    const res = await collabAuthFetch(`/api/projects/${collabProjectId.value}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ email, role: collabInviteRole.value }),
+    })
+    if (!res.ok) throw new Error(await collabErrorText(res))
+    collabInviteEmail.value = ''
+    collabStatus.value = `Добавлено: ${email} (${collabInviteRole.value})`
+    await collabLoadMembers()
+  } catch (e) {
+    collabStatus.value = `Приглашение: ${e instanceof Error ? e.message : 'ошибка'}`
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+function collabLogout() {
+  collabDisconnectWs()
+  collabToken.value = ''
+  collabUser.value = null
+  collabProjects.value = []
+  collabProjectId.value = ''
+  collabChannels.value = []
+  collabChannelId.value = ''
+  collabMessages.value = []
+  collabMembers.value = []
+  collabAssetPairs.value = []
+  collabAssetSuggestions.value = []
+  localStorage.removeItem('collabToken')
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const [meta, base64] = dataUrl.split(',', 2)
+  const mimeMatch = /data:([^;]+)/.exec(meta)
+  const mime = mimeMatch ? mimeMatch[1] : 'image/png'
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+  return new Blob([bytes], { type: mime })
+}
+
+async function sendScreenshotToChat(item: ReportScreenshotItem): Promise<boolean> {
+  if (!collabProjectId.value || !collabChannelId.value) {
+    collabStatus.value = 'Сначала выберите проект и канал'
+    return false
+  }
+  collabBusy.value = true
+  try {
+    const blob = dataUrlToBlob(item.dataUrl)
+    const fd = new FormData()
+    const uploadName =
+      item.type === '2d' ? build2dScreenshotFileName(item) : `${item.type}-${item.id}.png`
+    fd.append('file', blob, uploadName)
+    fd.append('source', item.type === '2d' ? 'pdf' : 'viewer3d')
+    fd.append(
+      'context_json',
+      JSON.stringify({
+        screenshotType: item.type,
+        pdfFileName: item.pdfFileName || null,
+        pageNumber: item.pageNumber || null,
+      })
+    )
+    const up = await collabAuthFetch(`/api/projects/${collabProjectId.value}/attachments/upload`, {
+      method: 'POST',
+      body: fd,
+    })
+    if (!up.ok) throw new Error(await up.text())
+    const upData = await up.json()
+    const attachmentId = upData?.attachment?.id
+    const text = item.type === '2d'
+      ? `Скриншот 2D${item.pageNumber ? `, стр. ${item.pageNumber}` : ''}`
+      : 'Скриншот 3D'
+    const msg = await collabAuthFetch(`/api/projects/${collabProjectId.value}/channels/${collabChannelId.value}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({
+        body: text,
+        attachmentIds: attachmentId ? [attachmentId] : [],
+      }),
+    })
+    if (!msg.ok) throw new Error(await msg.text())
+    collabStatus.value = 'Скриншот отправлен в чат'
+    return true
+  } catch (e) {
+    collabStatus.value = `Ошибка отправки скриншота: ${e instanceof Error ? e.message : 'upload'}`
+    return false
+  } finally {
+    collabBusy.value = false
+  }
+}
+
+async function onScreenshotEditorSendToChat(dataUrl: string) {
+  const type = screenshotSourceType.value
+  const item: ReportScreenshotItem = {
+    id: nextScreenshotId(),
+    type,
+    dataUrl,
+    pdfFileName: type === '2d' ? pdfFile.value?.name ?? '' : undefined,
+    pageNumber:
+      type === '2d'
+        ? pdfViewerRef.value?.getScreenshotPage?.() ?? savedPdfPageForNextScreenshot.value ?? 1
+        : undefined,
+    albumCode: type === '2d' ? resolveAlbumCodeSnapshot() : undefined,
+    moduleNumber: type === '2d' ? reportModuleNumber.value.trim() : undefined,
+  }
+  const ok = await sendScreenshotToChat(item)
+  if (ok) {
+    editingScreenshotId.value = null
+    showScreenshotModal.value = false
+    screenshotImageUrl.value = null
+    screenshotSuggestedFileName.value = null
+  }
+}
+
 function closeScreenshotModal() {
   showScreenshotModal.value = false
   screenshotImageUrl.value = null
@@ -801,15 +2118,40 @@ const show3dPanel = () => viewMode.value === '3d' || viewMode.value === 'split'
 const showLogPanel = () => viewMode.value === 'log'
 
 onMounted(() => {
+  try {
+    const sw = localStorage.getItem(WORKSPACE_LS_SIDEBAR)
+    const rw = localStorage.getItem(WORKSPACE_LS_RIGHT)
+    const cw = localStorage.getItem(WORKSPACE_LS_CENTER_PDF)
+    if (sw) sidebarWidth.value = clampWorkspaceWidth(Number(sw), 160, 480)
+    if (rw) rightPanelWidth.value = clampWorkspaceWidth(Number(rw), 260, 720)
+    if (cw) centerPdfWidth.value = clampWorkspaceWidth(Number(cw), 160, 1200)
+  } catch {
+    /* noop */
+  }
   window.addEventListener('dragover', onDragOver)
   window.addEventListener('drop', onDrop)
   window.addEventListener('dragleave', onDragLeave)
+  collabDayTimer = setInterval(() => {
+    collabDateTick.value++
+  }, 60_000)
+  if (collabToken.value) {
+    collabBootstrap().catch((e) => {
+      collabStatus.value = `Ошибка подключения: ${e instanceof Error ? e.message : 'bootstrap'}`
+      collabToken.value = ''
+      localStorage.removeItem('collabToken')
+    })
+  }
 })
 
 onUnmounted(() => {
   window.removeEventListener('dragover', onDragOver)
   window.removeEventListener('drop', onDrop)
   window.removeEventListener('dragleave', onDragLeave)
+  if (collabDayTimer != null) {
+    clearInterval(collabDayTimer)
+    collabDayTimer = null
+  }
+  collabDisconnectWs()
 })
 </script>
 
@@ -829,9 +2171,11 @@ onUnmounted(() => {
         <span class="report-screenshots-count">({{ reportScreenshots.length }})</span>
       </div>
       <div class="report-params">
-        <label class="report-params-label">Название проекта:</label>
+        <label class="report-params-label">Шифр альбома:</label>
         <input v-model="reportProjectName" type="text" class="report-params-input" placeholder="10-23-КП-Р-НВФ1.1" />
         <button type="button" class="report-params-btn" title="Взять с первого листа PDF" @click="fillProjectNameFromFirstSheet">С 1-го листа</button>
+        <label class="report-params-label">Номер модуля:</label>
+        <input v-model="reportModuleNumber" type="text" class="report-params-input" placeholder="например 3 или М1" />
         <label class="report-params-label">Номер листа:</label>
         <input v-model="reportSheetNumber" type="text" class="report-params-input" placeholder="1" />
         <label class="report-params-label">Автор замечаний:</label>
@@ -856,23 +2200,86 @@ onUnmounted(() => {
             <button type="button" class="report-screenshot-btn" title="Выше в отчёте" :disabled="index === 0" @click="moveScreenshotUp(index)">↑</button>
             <button type="button" class="report-screenshot-btn" title="Ниже в отчёте" :disabled="index === reportScreenshots.length - 1" @click="moveScreenshotDown(index)">↓</button>
             <button type="button" class="report-screenshot-btn" title="Редактировать" @click="openEditorForScreenshot(item)">✎</button>
+            <button type="button" class="report-screenshot-btn report-screenshot-btn-chat" title="Отправить скриншот в чат" @click="sendScreenshotToChat(item)">В чат</button>
             <button type="button" class="report-screenshot-btn report-screenshot-btn-remove" title="Удалить из отчёта" @click="removeScreenshotFromReport(item)">×</button>
           </div>
         </div>
       </div>
     </div>
-    <div class="content" :class="'mode-' + viewMode">
-      <div v-show="showPdfPanel()" class="panel pdf-panel">
+    <div class="workspace">
+      <aside
+        class="ide-sidebar ide-sidebar--disk"
+        aria-label="Файлы проекта на Яндекс.Диске"
+        :style="{ flex: `0 0 ${sidebarWidth}px`, width: `${sidebarWidth}px` }"
+      >
+        <div class="ide-sidebar-header">
+          <span class="ide-sidebar-title">Яндекс.Диск</span>
+          <span class="ide-sidebar-pill">заготовка</span>
+        </div>
+        <div class="ide-tree" role="tree">
+          <div v-for="folder in yandexDiskSampleTree" :key="folder.id" class="ide-tree-folder">
+            <button
+              type="button"
+              class="ide-tree-row ide-tree-row--folder"
+              :aria-expanded="yandexDiskOpen[folder.id] ? 'true' : 'false'"
+              @click="yandexDiskToggleFolder(folder.id)"
+            >
+              <span class="ide-tree-chevron">{{ yandexDiskOpen[folder.id] ? '▼' : '▶' }}</span>
+              <span class="ide-tree-icon" aria-hidden="true">📁</span>
+              <span class="ide-tree-label">{{ folder.name }}</span>
+            </button>
+            <div v-show="yandexDiskOpen[folder.id]" class="ide-tree-children">
+              <div v-for="file in folder.children" :key="file.id" class="ide-tree-row ide-tree-row--file">
+                <span class="ide-tree-chevron ide-tree-chevron--spacer" aria-hidden="true" />
+                <span class="ide-tree-icon" aria-hidden="true">📄</span>
+                <span class="ide-tree-label">{{ file.name }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="ide-sidebar-hint">
+          Структура как в Cursor / VS Code: папки проекта и вложения. Позже здесь будет доступ к API Яндекс.Диска и выбор файла для вьюера.
+        </p>
+      </aside>
+      <div
+        class="workspace-splitter"
+        title="Изменить ширину панели"
+        @mousedown.prevent="onWorkspaceSplitterDown('left', $event)"
+      />
+      <div ref="workspaceContentRef" class="content" :class="'mode-' + viewMode">
+        <div
+          v-show="showPdfPanel()"
+          class="panel pdf-panel"
+          :style="
+            viewMode === 'split'
+              ? {
+                  flex: `0 0 ${centerPdfWidth}px`,
+                  width: `${centerPdfWidth}px`,
+                  maxWidth: '85%',
+                }
+              : undefined
+          "
+        >
         <PdfViewer
           v-if="pdfFile"
           ref="pdfViewerRef"
           :pdf-url="pdfFile.url"
           :pdf-name="pdfFile.name"
-          @screenshot-2d="onScreenshotTab"
+          @screenshot-2d="onScreenshot2d"
         />
         <div v-else class="panel-placeholder">Выберите PDF (чертежи, спецификация)</div>
-      </div>
-      <div v-show="show3dPanel()" class="panel viewer-panel">
+        </div>
+        <div
+          v-if="viewMode === 'split'"
+          class="workspace-splitter workspace-splitter--2d3d"
+          title="Соотношение панелей 2D и 3D"
+          @mousedown.prevent="onCenterSplitterDown"
+        />
+        <div
+          v-show="show3dPanel()"
+          class="panel viewer-panel"
+          :style="viewMode === 'split' ? { flex: '1 1 auto', minWidth: '180px', minHeight: 0 } : undefined"
+        >
         <Viewer3D
           ref="viewerRef"
           :section-mode="sectionMode"
@@ -896,17 +2303,417 @@ onUnmounted(() => {
           @export-stl="onExportStl"
           @screenshot-3d="onScreenshot3D"
         />
-      </div>
-      <div v-show="showLogPanel()" class="panel log-panel-wrap">
+        </div>
+        <div v-show="showLogPanel()" class="panel log-panel-wrap">
         <LogPanel />
+        </div>
       </div>
+      <div
+        class="workspace-splitter"
+        title="Изменить ширину чата"
+        @mousedown.prevent="onWorkspaceSplitterDown('right', $event)"
+      />
+      <aside
+        class="collab-panel"
+        :style="{ flex: `0 0 ${rightPanelWidth}px`, width: `${rightPanelWidth}px` }"
+      >
+        <div class="collab-panel-head">
+          <div class="collab-work-tabs" role="tablist">
+            <button
+              type="button"
+              class="collab-work-tab"
+              role="tab"
+              :aria-selected="rightWorkAreaTab === 'chat'"
+              :class="{ 'is-active': rightWorkAreaTab === 'chat' }"
+              @click="rightWorkAreaTab = 'chat'"
+            >
+              Чат
+            </button>
+            <button
+              type="button"
+              class="collab-work-tab"
+              role="tab"
+              :aria-selected="rightWorkAreaTab === 'notes'"
+              :class="{ 'is-active': rightWorkAreaTab === 'notes' }"
+              @click="rightWorkAreaTab = 'notes'"
+            >
+              Заметки
+            </button>
+            <button
+              type="button"
+              class="collab-work-tab"
+              role="tab"
+              :aria-selected="rightWorkAreaTab === 'telemost'"
+              :class="{ 'is-active': rightWorkAreaTab === 'telemost' }"
+              @click="rightWorkAreaTab = 'telemost'"
+            >
+              Телемост
+            </button>
+          </div>
+          <button v-if="collabToken" type="button" class="collab-btn collab-btn--compact" @click="collabLogout">Выйти</button>
+        </div>
+        <div v-show="rightWorkAreaTab === 'telemost'" class="collab-telemost">
+          <p class="collab-hint collab-hint--tight">
+            Один звонок на проект: сервер создаёт комнату Телемоста при первом открытии вкладки (нужен OAuth API у администратора). Участникам достаточно нажать «Подключиться».
+          </p>
+          <div v-if="telemostLoading" class="collab-telemost-placeholder">Получение ссылки…</div>
+          <div v-else-if="telemostNeedsOAuth" class="collab-telemost-oauth">{{ telemostHint }}</div>
+          <div v-else-if="telemostHint && !telemostJoinUrl" class="collab-telemost-oauth">{{ telemostHint }}</div>
+          <template v-else-if="telemostJoinUrl">
+            <a
+              class="collab-btn collab-btn-primary collab-telemost-open"
+              :href="telemostJoinUrl"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Подключиться к звонку проекта
+            </a>
+            <button type="button" class="collab-btn collab-telemost-secondary" :disabled="telemostLoading" @click="collabLoadTelemost">
+              Обновить
+            </button>
+          </template>
+          <div v-else class="collab-telemost-placeholder">Войдите в чат и выберите проект.</div>
+        </div>
+        <div v-show="rightWorkAreaTab === 'notes'" class="collab-notes-wrap">
+          <p class="collab-hint collab-hint--tight">
+            Совместное редактирование (Yjs CRDT): текст и курсоры синхронизируются по WebSocket внутри проекта. Откройте ту же вкладку на другом ПК — изменения сливаются без конфликтов.
+          </p>
+          <CollaborativeEditor
+            v-if="collabNotesDoc && collabNotesAwareness"
+            :y-doc="collabNotesDoc"
+            :awareness="collabNotesAwareness"
+          />
+          <div v-else class="collab-notes-placeholder">Войдите в чат и выберите проект — подключится общий документ.</div>
+        </div>
+        <div v-show="rightWorkAreaTab === 'chat'" class="collab-chat-area">
+        <div v-if="!collabToken" class="collab-auth">
+          <div class="collab-auth-tabs">
+            <button type="button" class="collab-btn" :class="{ active: collabAuthMode === 'login' }" @click="collabAuthMode = 'login'">Вход</button>
+            <button type="button" class="collab-btn" :class="{ active: collabAuthMode === 'register' }" @click="collabAuthMode = 'register'">Регистрация</button>
+          </div>
+          <input v-model="collabEmail" type="email" class="collab-input" placeholder="email" />
+          <input v-model="collabPassword" type="password" class="collab-input" placeholder="password" />
+          <input v-if="collabAuthMode === 'register'" v-model="collabDisplayName" type="text" class="collab-input" placeholder="display name" />
+          <button type="button" class="collab-btn collab-btn-primary" :disabled="collabBusy" @click="collabSubmitAuth">Подключиться</button>
+        </div>
+        <div v-else class="collab-body">
+          <div class="collab-user-row">
+            <span
+              v-if="collabCurrentProjectRole"
+              class="collab-user-role-badge"
+              :style="{
+                background: COLLAB_ROLE_AVATAR[collabCurrentProjectRole].bg,
+                boxShadow: `0 0 0 2px ${COLLAB_ROLE_AVATAR[collabCurrentProjectRole].ring}`,
+              }"
+              :title="collabRoleLabel(collabCurrentProjectRole)"
+            >
+              <CollabRoleIcon :role="collabCurrentProjectRole" :size="13" class="collab-user-role-icon" />
+            </span>
+            <div class="collab-user">{{ collabUser?.displayName || collabUser?.email }}</div>
+          </div>
+          <label class="collab-field-label">Проект</label>
+          <select v-model="collabProjectId" class="collab-input" @change="onCollabProjectChange">
+            <option value="" disabled>{{ collabProjects.length ? 'Выберите проект' : 'Нет проектов — создайте ниже' }}</option>
+            <option v-for="p in collabProjects" :key="p.id" :value="p.id">
+              {{ p.name }}<template v-if="p.role"> — {{ collabRoleLabel(String(p.role)) }}</template>
+            </option>
+          </select>
+          <div class="collab-create-row">
+            <input
+              v-model="collabNewProjectName"
+              type="text"
+              class="collab-input collab-input-grow"
+              placeholder="Название нового проекта"
+              @keydown.enter.prevent="collabCreateProject"
+            />
+            <button type="button" class="collab-btn collab-btn-primary" :disabled="collabBusy" @click="collabCreateProject">Создать</button>
+          </div>
+          <label class="collab-field-label">Канал</label>
+          <select v-model="collabChannelId" class="collab-input" @change="onCollabChannelChange">
+            <option value="" disabled>{{ collabChannels.length ? 'Выберите канал' : 'Нет каналов — создайте или откройте проект' }}</option>
+            <option v-for="c in collabChannels" :key="c.id" :value="c.id">{{ c.name }}</option>
+          </select>
+          <div class="collab-create-row">
+            <input
+              v-model="collabNewChannelName"
+              type="text"
+              class="collab-input collab-input-grow"
+              placeholder="Новый канал (не для роли «Клиент»)"
+              @keydown.enter.prevent="collabCreateChannel"
+            />
+            <button type="button" class="collab-btn collab-btn-primary" :disabled="collabBusy || !collabProjectId" @click="collabCreateChannel">Создать</button>
+          </div>
+          <p class="collab-hint">При создании проекта на сервере автоматически добавляется канал «Общий».</p>
+          <label class="collab-field-label">Участники проекта</label>
+          <input
+            v-model="collabInviteEmail"
+            type="email"
+            class="collab-input"
+            placeholder="Email (уже зарегистрированного пользователя)"
+            autocomplete="email"
+            @keydown.enter.prevent="collabInviteMember"
+          />
+          <div class="collab-create-row">
+            <select v-model="collabInviteRole" class="collab-input collab-input-grow collab-role-select">
+              <option value="gip">{{ COLLAB_ROLE_LABELS.gip }}</option>
+              <option value="chief_designer">{{ COLLAB_ROLE_LABELS.chief_designer }}</option>
+              <option value="designer">{{ COLLAB_ROLE_LABELS.designer }}</option>
+              <option value="installer">{{ COLLAB_ROLE_LABELS.installer }}</option>
+              <option value="assembler">{{ COLLAB_ROLE_LABELS.assembler }}</option>
+              <option value="client">{{ COLLAB_ROLE_LABELS.client }}</option>
+            </select>
+            <button type="button" class="collab-btn collab-btn-primary" :disabled="collabBusy || !collabProjectId" @click="collabInviteMember">Добавить</button>
+          </div>
+          <p class="collab-hint">
+            Приглашать могут ГИП, главный конструктор и конструктор. Пользователь должен быть зарегистрирован на этом сервере. Роль «ГИП» может назначить только текущий ГИП. У роли «Клиент» нет записи в чат и загрузки файлов.
+          </p>
+          <label class="collab-field-label">Состав проекта</label>
+          <div v-if="collabMembersLoading" class="collab-hint">Загрузка списка…</div>
+          <ul v-else-if="collabMembers.length" class="collab-member-list">
+            <li v-for="m in collabMembers" :key="m.id" class="collab-member-row">
+              <span
+                v-if="isCollabMemberRole(m.role)"
+                class="collab-member-avatar"
+                :style="{
+                  background: COLLAB_ROLE_AVATAR[m.role].bg,
+                  boxShadow: `0 0 0 2px ${COLLAB_ROLE_AVATAR[m.role].ring}`,
+                }"
+              >
+                <CollabRoleIcon :role="m.role" :size="11" class="collab-user-role-icon" />
+              </span>
+              <span v-else class="collab-member-avatar collab-member-avatar-fallback">{{
+                (m.displayName || m.email || '?').slice(0, 2)
+              }}</span>
+              <div class="collab-member-info">
+                <span class="collab-member-name">{{ m.displayName || m.email }}</span>
+                <select
+                  v-if="collabCanEditOtherMemberRole(m)"
+                  class="collab-input collab-member-role-select"
+                  :value="m.role"
+                  :disabled="collabBusy"
+                  @change="onCollabMemberRoleChange(m, $event)"
+                >
+                  <option
+                    v-for="rid in COLLAB_ROLE_ORDER"
+                    :key="rid"
+                    :value="rid"
+                    :disabled="rid === 'gip' && collabCurrentProjectRole !== 'gip'"
+                  >
+                    {{ COLLAB_ROLE_SHORT[rid] }}
+                  </option>
+                </select>
+                <span v-else class="collab-member-role-tag">{{ collabRoleLabel(m.role) }}</span>
+              </div>
+              <div class="collab-member-actions">
+                <button
+                  v-if="collabIsMemberSelf(m)"
+                  type="button"
+                  class="collab-btn collab-member-btn"
+                  :disabled="collabBusy"
+                  @click="collabLeaveProject"
+                >
+                  Покинуть
+                </button>
+                <button
+                  v-else-if="collabCanRemoveOtherMember(m)"
+                  type="button"
+                  class="collab-btn collab-member-btn"
+                  :disabled="collabBusy"
+                  @click="collabKickMember(m.id)"
+                >
+                  Исключить
+                </button>
+              </div>
+            </li>
+          </ul>
+          <div class="collab-role-legend" aria-label="Цвета и значки ролей">
+            <div v-for="rid in COLLAB_ROLE_ORDER" :key="rid" class="collab-role-chip">
+              <span
+                class="collab-role-chip-dot"
+                :style="{
+                  background: COLLAB_ROLE_AVATAR[rid].bg,
+                  boxShadow: `0 0 0 2px ${COLLAB_ROLE_AVATAR[rid].ring}`,
+                }"
+              >
+                <CollabRoleIcon :role="rid" :size="11" class="collab-role-chip-svg" />
+              </span>
+              <span>{{ COLLAB_ROLE_SHORT[rid] }}</span>
+            </div>
+          </div>
+          <label class="collab-field-label">Связки PDF ↔ 3D</label>
+          <p class="collab-hint">
+            Вложения из чата с одинаковым именем файла (без расширения), например узел.pdf и узел.glb, можно связать и открыть разом.
+          </p>
+          <div class="collab-asset-actions">
+            <button
+              type="button"
+              class="collab-btn collab-btn-primary"
+              :disabled="collabBusy || !collabProjectId || collabSuggestLoading"
+              @click="collabLoadSuggestions"
+            >
+              Найти по именам вложений
+            </button>
+            <button
+              type="button"
+              class="collab-btn"
+              :disabled="collabBusy || collabAssetSuggestions.length === 0"
+              @click="collabAddAllSuggestedPairs"
+            >
+              Добавить все
+            </button>
+          </div>
+          <div v-if="collabSuggestLoading" class="collab-hint">Поиск пар…</div>
+          <ul v-else-if="collabAssetSuggestions.length" class="collab-asset-suggest-list">
+            <li v-for="(s, i) in collabAssetSuggestions" :key="`sug-${i}`" class="collab-asset-suggest-row">
+              <span class="collab-asset-suggest-label"
+                >{{ s.pdfFileName || s.pdfStem }} ↔ {{ s.modelFileName || s.modelStem }}</span
+              >
+              <button type="button" class="collab-btn collab-asset-suggest-add" :disabled="collabBusy" @click="collabAddOneSuggestedPair(s)">
+                +
+              </button>
+            </li>
+          </ul>
+          <div v-if="collabAssetPairsLoading" class="collab-hint">Загрузка реестра…</div>
+          <ul v-else-if="collabAssetPairs.length" class="collab-asset-pair-list">
+            <li v-for="ap in collabAssetPairs" :key="String(ap.id)" class="collab-asset-pair-row">
+              <div class="collab-asset-pair-meta">
+                <span class="collab-asset-pair-stem">{{ ap.pdfStem }} ↔ {{ ap.modelStem }}</span>
+              </div>
+              <div class="collab-asset-pair-actions">
+                <button
+                  type="button"
+                  class="collab-btn collab-btn-primary collab-asset-open"
+                  :disabled="collabBusy"
+                  @click="collabOpenAssetPair(ap)"
+                >
+                  Открыть пару
+                </button>
+                <button type="button" class="collab-btn" :disabled="collabBusy" @click="collabDeleteAssetPair(String(ap.id))">
+                  Удалить
+                </button>
+              </div>
+            </li>
+          </ul>
+          <div v-else class="collab-hint">Реестр пуст — добавьте связки по подсказке или после загрузки файлов в канал.</div>
+          <div class="collab-messages">
+            <template v-for="item in collabChatTimeline" :key="item.key">
+              <div v-if="item.type === 'sep'" class="collab-day-sep">
+                <span class="collab-day-sep-line" aria-hidden="true" />
+                <span class="collab-day-sep-label">{{ item.label }}</span>
+                <span class="collab-day-sep-line" aria-hidden="true" />
+              </div>
+              <div v-else class="collab-msg">
+                <div class="collab-msg-head">
+                  <div
+                    class="collab-avatar"
+                    :class="{ 'collab-avatar--role': item.row.role }"
+                    :style="{
+                      background: item.row.avatar.bg,
+                      boxShadow: `0 0 0 2px ${item.row.avatar.ring}, 0 3px 12px rgba(0, 0, 0, 0.38)`,
+                    }"
+                    :title="item.row.role ? collabRoleLabel(item.row.role) : undefined"
+                    aria-hidden="true"
+                  >
+                    <CollabRoleIcon
+                      v-if="item.row.role"
+                      :role="item.row.role"
+                      :size="13"
+                      class="collab-avatar-icon"
+                    />
+                    <template v-else>{{ item.row.avatar.initials }}</template>
+                  </div>
+                  <div class="collab-msg-meta">
+                    <span class="collab-msg-author">{{ item.row.author }}</span>
+                    <span
+                      v-if="item.row.roleShort"
+                      class="collab-msg-role-pill"
+                      :style="{
+                        borderColor: item.row.avatar.ring,
+                        color: item.row.avatar.ring,
+                      }"
+                      >{{ item.row.roleShort }}</span>
+                    <span class="collab-msg-dot" aria-hidden="true">·</span>
+                    <time class="collab-msg-time" :datetime="String(item.message.created_at ?? '')">{{
+                      formatMessageTime(item.message.created_at as string)
+                    }}</time>
+                  </div>
+                </div>
+                <div v-if="collabMessageBodyForDisplay(item.message)" class="collab-msg-body">
+                  {{ collabMessageBodyForDisplay(item.message) }}
+                </div>
+                <div
+                  v-for="a in (item.message.attachments || [])"
+                  :key="String((a as { id?: string }).id)"
+                  class="collab-attach-block"
+                >
+                  <div
+                    class="collab-attach-name"
+                    :title="collabAttachmentDisplayName(a as { id: string; file_name?: string; fileName?: string }, String(item.message.body ?? ''))"
+                  >
+                    {{
+                      collabAttachmentDisplayName(
+                        a as { id: string; file_name?: string; fileName?: string },
+                        String(item.message.body ?? '')
+                      )
+                    }}
+                  </div>
+                  <div class="collab-attach-actions">
+                    <button
+                      type="button"
+                      class="collab-attach-action collab-action-open"
+                      @click="collabOpenAttachmentPreview(a as { id: string; file_name?: string; fileName?: string })"
+                    >
+                      Открыть
+                    </button>
+                    <button
+                      type="button"
+                      class="collab-attach-action collab-action-save"
+                      @click="collabDownloadAttachment(a as { id: string; file_name?: string; fileName?: string })"
+                    >
+                      Скачать
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+          <div class="collab-compose">
+            <textarea
+              v-model="collabMessageText"
+              class="collab-input collab-textarea"
+              placeholder="Сообщение... (Enter — отправить, Shift+Enter — новая строка)"
+              @keydown="onCollabComposerKeydown"
+            />
+            <div class="collab-attach-btn-wrap" title="Прикрепить файл (Excel, PDF, CAD, KOMPAS, Revit, изображения)">
+              <div v-if="collabAttachPct !== null" class="collab-attach-pct-ring" aria-live="polite">{{ collabAttachPct }}%</div>
+              <button
+                type="button"
+                class="collab-btn collab-attach-trigger"
+                :disabled="collabBusy"
+                :class="{ 'is-uploading': collabAttachPct !== null }"
+                @click="collabAttachFile"
+              >
+                📎
+              </button>
+            </div>
+            <button type="button" class="collab-btn collab-btn-primary collab-send-btn" :disabled="collabBusy" @click="collabSendMessage">
+              <span v-if="collabSendingText" class="collab-sending-dot" aria-hidden="true" />
+              <span>{{ collabSendingText ? 'Отпр…' : 'Отпр.' }}</span>
+            </button>
+          </div>
+        </div>
+        </div>
+        <div v-if="collabStatus" class="collab-status">{{ collabStatus }}</div>
+      </aside>
     </div>
     <ScreenshotEditorModal
       v-if="showScreenshotModal && screenshotImageUrl"
       :image-url="screenshotImageUrl!"
       :suggested-file-name="screenshotSuggestedFileName"
+      :chat-send-enabled="!!collabToken && !!collabProjectId && !!collabChannelId"
       @close="onScreenshotEditorClose"
       @final-image="onScreenshotEditorFinalImage"
+      @send-to-chat="onScreenshotEditorSendToChat"
     />
   </div>
 </template>
@@ -1070,6 +2877,11 @@ onUnmounted(() => {
   opacity: 0.4;
   cursor: not-allowed;
 }
+.report-screenshot-btn-chat {
+  width: auto;
+  padding: 0 6px;
+  font-size: 0.7rem;
+}
 .report-screenshot-btn-remove {
   background: rgba(180, 60, 60, 0.9);
 }
@@ -1077,36 +2889,744 @@ onUnmounted(() => {
   background: #b43c3c;
 }
 .content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+.workspace {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  overflow: hidden;
 }
-.content.mode-split .panel {
+.ide-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  align-self: stretch;
+  background: #141920;
+  border-right: 1px solid #2f3d56;
+}
+.ide-sidebar--disk {
+  min-width: 160px;
+  max-width: 480px;
+}
+.ide-sidebar-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  padding: 0.42rem 0.5rem;
+  border-bottom: 1px solid #2a3548;
+}
+.ide-sidebar-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #9eb4d8;
+}
+.ide-sidebar-pill {
+  font-size: 0.58rem;
+  padding: 0.12rem 0.38rem;
+  border-radius: 3px;
+  background: #252f42;
+  color: #7a8faa;
+}
+.ide-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0.28rem 0;
+}
+.ide-tree-folder {
+  margin-bottom: 0.06rem;
+}
+.ide-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 0.22rem;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 0.72rem;
+  color: #c8d6ee;
+  padding: 0.14rem 0.4rem;
+  border-radius: 3px;
+}
+.ide-tree-row--folder {
+  cursor: pointer;
+}
+.ide-tree-row--folder:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.ide-tree-row--file {
+  cursor: default;
+  color: #a8b8d4;
+}
+.ide-tree-chevron {
+  width: 0.78rem;
+  flex-shrink: 0;
+  font-size: 0.58rem;
+  color: #6a7f9e;
+}
+.ide-tree-chevron--spacer {
+  visibility: hidden;
+}
+.ide-tree-icon {
+  flex-shrink: 0;
+}
+.ide-tree-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ide-tree-children {
+  margin-left: 0.2rem;
+  padding: 0.05rem 0 0.1rem 0.35rem;
+  border-left: 1px solid #2a3a52;
+}
+.ide-sidebar-hint {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 0.4rem 0.5rem 0.45rem;
+  font-size: 0.62rem;
+  line-height: 1.35;
+  color: #5f7394;
+  border-top: 1px solid #2a3548;
+  background: rgba(0, 0, 0, 0.12);
+}
+.collab-panel {
+  min-width: 260px;
+  max-width: 720px;
+  min-height: 0;
+  align-self: stretch;
+  border-left: 1px solid #3a4a6a;
+  background: #1a1f2b;
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem;
+  gap: 0.4rem;
+  overflow: hidden;
+}
+.workspace-splitter {
+  flex: 0 0 5px;
+  margin: 0 -1px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 4;
+  align-self: stretch;
+}
+.workspace-splitter:hover {
+  background: rgba(100, 140, 220, 0.35);
+}
+.collab-notes-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  overflow: hidden;
+}
+.collab-notes-placeholder {
+  flex: 1;
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.6rem;
+  font-size: 0.76rem;
+  color: #7a8faa;
+  border: 1px dashed #3d4e68;
+  border-radius: 6px;
+}
+.collab-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+.collab-work-tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 0.2rem;
+}
+.collab-work-tab {
+  flex: 1;
+  border: 1px solid #3d4e6a;
+  background: #232b3b;
+  color: #9eb0d0;
+  border-radius: 4px;
+  padding: 0.32rem 0.45rem;
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.collab-work-tab.is-active {
+  background: #2d3f62;
+  color: #eaf0ff;
+  border-color: #5169a0;
+}
+.collab-work-tab:hover:not(.is-active) {
+  background: #283248;
+}
+.collab-btn--compact {
+  height: 28px;
+  padding: 0 8px;
+  flex-shrink: 0;
+}
+.collab-chat-area {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.collab-telemost {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-top: 0.1rem;
+}
+.collab-hint--tight {
+  margin: 0;
+}
+.collab-telemost-open {
+  text-align: center;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+}
+.collab-telemost-placeholder {
+  font-size: 0.72rem;
+  color: #6a7f9e;
+  padding: 0.55rem;
+  border: 1px dashed #3a4a62;
+  border-radius: 6px;
+  text-align: center;
+}
+.collab-telemost-oauth {
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: #b8c8e4;
+  padding: 0.55rem 0.45rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid #4a5f78;
+}
+.collab-telemost-secondary {
+  margin-top: 0.35rem;
+  width: 100%;
+}
+.collab-auth,
+.collab-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.collab-auth-tabs {
+  display: flex;
+  gap: 0.3rem;
+}
+.collab-btn {
+  border: 1px solid #516487;
+  background: #2c3a54;
+  color: #e8efff;
+  border-radius: 4px;
+  height: 28px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+.collab-btn.active,
+.collab-btn-primary {
+  background: #4a6fc7;
+  border-color: #5d82db;
+}
+.collab-input {
+  width: 100%;
+  height: 30px;
+  border: 1px solid #4a5f7a;
+  background: #233049;
+  color: #e7efff;
+  border-radius: 4px;
+  padding: 0 8px;
+}
+.collab-user-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.collab-user-role-badge {
+  flex-shrink: 0;
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.collab-user-role-icon,
+.collab-role-chip-svg,
+.collab-avatar-icon {
+  color: rgba(255, 255, 255, 0.96);
+}
+.collab-user {
+  color: #9fb6dc;
+  font-size: 0.8rem;
+}
+.collab-member-list {
+  list-style: none;
+  margin: 0 0 0.45rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  max-height: 9.5rem;
+  overflow-y: auto;
+}
+.collab-member-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  color: #b0c4e8;
+}
+.collab-member-role-select {
+  margin-top: 0.12rem;
+  max-width: 100%;
+  height: 26px;
+  font-size: 0.64rem;
+  padding: 0 6px;
+}
+.collab-member-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: flex-start;
+  gap: 0.25rem;
+}
+.collab-member-btn {
+  height: 26px;
+  font-size: 0.65rem;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+.collab-member-avatar {
+  flex-shrink: 0;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.55rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.92);
+}
+.collab-member-avatar-fallback {
+  background: #3d4a62;
+  box-shadow: 0 0 0 1px #5a6b88;
+}
+.collab-member-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 0.06rem;
+}
+.collab-member-name {
+  color: #d2dff5;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collab-member-role-tag {
+  font-size: 0.62rem;
+  color: #7a92b8;
+  line-height: 1.2;
+}
+.collab-role-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+  align-items: center;
+  margin: 0.1rem 0 0.45rem;
+  padding: 0.35rem 0.4rem;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid #2f4566;
+}
+.collab-asset-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+.collab-asset-suggest-list,
+.collab-asset-pair-list {
+  list-style: none;
+  margin: 0 0 0.45rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  max-height: 9rem;
+  overflow: auto;
+}
+.collab-asset-suggest-row,
+.collab-asset-pair-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+  padding: 0.28rem 0.4rem;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid #2a4060;
+  font-size: 0.72rem;
+}
+.collab-asset-suggest-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #b8c8e0;
+}
+.collab-asset-suggest-add {
+  flex-shrink: 0;
+  min-width: 2rem;
+  padding: 0.12rem 0.35rem;
+  font-weight: 700;
+}
+.collab-asset-pair-meta {
+  min-width: 0;
+  flex: 1;
+}
+.collab-asset-pair-stem {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c5d4ee;
+}
+.collab-asset-pair-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.28rem;
+  align-items: center;
+}
+.collab-asset-open {
+  white-space: nowrap;
+}
+.collab-role-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  font-size: 0.61rem;
+  color: #93a8cc;
+  white-space: nowrap;
+}
+.collab-role-chip-dot {
+  flex-shrink: 0;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.collab-msg-role-pill {
+  font-size: 0.58rem;
+  font-weight: 600;
+  padding: 0.05rem 0.28rem;
+  border-radius: 4px;
+  border: 1px solid;
+  background: rgba(255, 255, 255, 0.04);
+  max-width: 8.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.collab-field-label {
+  font-size: 0.72rem;
+  color: #7a91b8;
+  margin-top: 0.15rem;
+}
+.collab-create-row {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+.collab-input-grow {
   flex: 1;
   min-width: 0;
 }
-.content.mode-split .pdf-panel {
-  flex: 0 0 50%;
+.collab-hint {
+  font-size: 0.68rem;
+  color: #6a7f9e;
+  margin: 0 0 0.2rem;
+  line-height: 1.35;
 }
+.collab-role-select {
+  cursor: pointer;
+}
+.collab-body > :not(.collab-messages) {
+  flex-shrink: 0;
+}
+.collab-messages {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  border: 1px solid #334666;
+  border-radius: 6px;
+  padding: 0.35rem;
+  background: #192336;
+}
+.collab-msg {
+  border: 1px solid #324a72;
+  border-radius: 5px;
+  padding: 0.28rem 0.35rem;
+  background: #233149;
+}
+.collab-msg-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  margin-bottom: 0.25rem;
+}
+.collab-avatar {
+  flex-shrink: 0;
+  width: 1.65rem;
+  height: 1.65rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.95);
+  letter-spacing: -0.02em;
+}
+.collab-avatar--role .collab-avatar-icon {
+  margin-top: 1px;
+}
+.collab-msg-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.35rem;
+  font-size: 0.68rem;
+  color: #9eb4d8;
+  flex: 1;
+  min-width: 0;
+}
+.collab-msg-author {
+  color: #c5d7f5;
+  font-weight: 600;
+}
+.collab-msg-dot {
+  color: #6a7a9a;
+  user-select: none;
+}
+.collab-msg-time {
+  color: #8a9bb5;
+  font-variant-numeric: tabular-nums;
+}
+.collab-day-sep {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.55rem 0 0.4rem;
+}
+.collab-day-sep-line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #4a5f7a 15%, #4a5f7a 85%, transparent);
+  min-width: 0;
+}
+.collab-day-sep-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #8fa3c4;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+.collab-msg-body {
+  color: #edf3ff;
+  font-size: 0.78rem;
+}
+.collab-attach-btn-wrap {
+  position: relative;
+  flex-shrink: 0;
+  align-self: flex-end;
+}
+.collab-attach-pct-ring {
+  position: absolute;
+  z-index: 2;
+  right: -2px;
+  bottom: 22px;
+  min-width: 2.1rem;
+  padding: 2px 5px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  line-height: 1.1;
+  background: rgba(20, 32, 56, 0.95);
+  border: 1px solid #5a7fd7;
+  border-radius: 5px;
+  color: #e8f0ff;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.collab-attach-trigger.is-uploading {
+  opacity: 0.88;
+}
+.collab-send-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.collab-sending-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #b8d4ff;
+  animation: collab-send-pulse 0.9s ease-in-out infinite;
+}
+@keyframes collab-send-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+.collab-attach-block {
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.4rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid #3a5280;
+}
+.collab-attach-name {
+  font-size: 0.78rem;
+  color: #e4ecff;
+  word-break: break-all;
+  margin-bottom: 0.35rem;
+  line-height: 1.3;
+}
+.collab-attach-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+.collab-attach-action {
+  font-size: 0.72rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid #516897;
+  background: #2c3d5c;
+  color: #dbe8ff;
+}
+.collab-attach-action:hover {
+  background: #3a5280;
+  border-color: #5a7fc7;
+}
+.collab-action-open {
+  border-color: #4a7a9e;
+}
+.collab-action-save {
+  border-color: #5a8060;
+  background: #2a4a38;
+}
+.collab-action-save:hover {
+  background: #346648;
+}
+.collab-compose {
+  display: flex;
+  gap: 0.3rem;
+  align-items: flex-end;
+}
+.collab-textarea {
+  min-height: 56px;
+  max-height: 140px;
+  resize: vertical;
+  padding: 6px 8px;
+  line-height: 1.35;
+}
+.collab-status {
+  color: #aac0e6;
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+/* В режиме split ширины 2D/3D задаются инлайн (centerPdfWidth) + сплиттер между панелями */
+.content.mode-split .pdf-panel,
 .content.mode-split .viewer-panel {
-  flex: 0 0 50%;
+  min-height: 0;
+}
+.content.mode-2d {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
 }
 .content.mode-2d .pdf-panel {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.content.mode-3d {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
 }
 .content.mode-3d .viewer-panel {
-  flex: 1 1 100%;
+  flex: 1 1 auto;
   width: 100%;
   min-width: 0;
-  height: 100%;
+  min-height: 0;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
 }
 .panel.pdf-panel {
   background: #1a2228;
 }
+.content.mode-log {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
 .content.mode-log .log-panel-wrap {
   flex: 1;
   min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .content.mode-log .pdf-panel,
 .content.mode-log .viewer-panel {
@@ -1128,5 +3648,9 @@ onUnmounted(() => {
 }
 .viewer-panel {
   position: relative;
+}
+:global(body.workspace-resizing) {
+  cursor: col-resize !important;
+  user-select: none;
 }
 </style>

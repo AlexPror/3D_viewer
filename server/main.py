@@ -10,15 +10,17 @@ from pathlib import Path
 
 import asyncio
 
+import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from spec_builder import build_spec_from_assembly
 from kompas_metadata import read_kompas_metadata, build_assembly_map
 from collab_auth import create_token, decode_token, hash_password, token_expiration_iso, verify_password
 from collab_store import (
+    PROJECT_MEMBER_ROLES,
     add_member,
     bind_attachments_to_message,
     create_channel,
@@ -28,15 +30,38 @@ from collab_store import (
     create_user,
     get_attachment,
     get_membership,
+    get_project_telemost,
     get_user_by_email,
+    create_asset_pair,
+    delete_asset_pair,
+    list_asset_pairs,
+    list_project_attachments,
+    list_project_members,
+    count_project_members,
+    count_role_in_project,
+    delete_project_member,
     get_user_by_id,
     init_collab_db,
     list_channels,
     list_messages,
     list_projects_for_user,
     upsert_message_read,
+    stem_filename,
+    suggest_asset_pair_candidates,
+    upsert_project_telemost,
     write_audit,
 )
+
+_MEMBER_ROLE_PATTERN = "^(" + "|".join(PROJECT_MEMBER_ROLES) + ")$"
+
+
+def _role_can_manage_members(role: str) -> bool:
+    """Invite or change roles (except assigning ГИП — see endpoint)."""
+    return role in ("gip", "chief_designer", "designer")
+
+
+def _role_is_client(role: str) -> bool:
+    return role == "client"
 
 try:
     from step_to_glb import step_to_glb_bytes, is_server_conversion_available
@@ -587,7 +612,11 @@ class CreateProjectRequest(BaseModel):
 
 class AddMemberRequest(BaseModel):
     email: str = Field(min_length=5, max_length=320)
-    role: str = Field(default="viewer", pattern="^(owner|editor|viewer)$")
+    role: str = Field(default="client", pattern=_MEMBER_ROLE_PATTERN)
+
+
+class UpdateMemberRoleRequest(BaseModel):
+    role: str = Field(pattern=_MEMBER_ROLE_PATTERN)
 
 
 class CreateChannelRequest(BaseModel):
@@ -602,6 +631,15 @@ class CreateMessageRequest(BaseModel):
 
 class MarkReadRequest(BaseModel):
     last_read_msg_id: str | None = Field(default=None, alias="lastReadMsgId")
+
+
+class CreateAssetPairRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    pdf_attachment_id: str | None = Field(default=None, alias="pdfAttachmentId")
+    model_attachment_id: str | None = Field(default=None, alias="modelAttachmentId")
+    pdf_stem: str = Field(default="", alias="pdfStem", max_length=400)
+    model_stem: str = Field(default="", alias="modelStem", max_length=400)
 
 
 class RealtimeHub:
@@ -632,8 +670,34 @@ class RealtimeHub:
             except Exception:
                 await self.disconnect(project_id, ws)
 
+    async def broadcast_except(self, project_id: str, event: dict[str, Any], exclude: WebSocket | None) -> None:
+        async with self._lock:
+            targets = [ws for ws in list(self._by_project.get(project_id, set())) if ws is not exclude]
+        for ws in targets:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                await self.disconnect(project_id, ws)
+
 
 _hub = RealtimeHub()
+
+# История CRDT-обновлений Yjs по проекту (ретрансляция без слияния на сервере; новые клиенты получают полную цепочку)
+_project_yjs_updates: dict[str, list[str]] = {}
+_yjs_updates_lock = asyncio.Lock()
+_YJS_SYNC_CHUNK = 120
+
+
+async def _send_yjs_history(ws: WebSocket, project_id: str) -> None:
+    async with _yjs_updates_lock:
+        updates = list(_project_yjs_updates.get(project_id, []))
+    if not updates:
+        await ws.send_json({"type": "yjs.sync", "updates": [], "final": True})
+        return
+    for i in range(0, len(updates), _YJS_SYNC_CHUNK):
+        chunk = updates[i : i + _YJS_SYNC_CHUNK]
+        final = (i + _YJS_SYNC_CHUNK) >= len(updates)
+        await ws.send_json({"type": "yjs.sync", "updates": chunk, "final": final})
 
 
 def _extract_token(authorization: str | None) -> str:
@@ -739,15 +803,229 @@ def projects_create(payload: CreateProjectRequest, user: dict[str, Any] = Depend
 @app.post("/api/projects/{project_id}/members")
 def projects_add_member(project_id: str, payload: AddMemberRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
     membership = _require_project_member(project_id, str(user["id"]))
-    if membership.get("role") not in ("owner", "editor"):
-        raise HTTPException(status_code=403, detail="Only owner/editor can add members")
+    if not _role_can_manage_members(str(membership.get("role", ""))):
+        raise HTTPException(status_code=403, detail="Only GIP / chief designer / designer can add members")
     target = get_user_by_email(str(payload.email))
     if not target:
         raise HTTPException(status_code=404, detail="Target user not found")
-    if payload.role == "owner" and membership.get("role") != "owner":
-        raise HTTPException(status_code=403, detail="Only owner can assign owner role")
+    if payload.role == "gip" and str(membership.get("role")) != "gip":
+        raise HTTPException(status_code=403, detail="Only GIP can assign GIP role")
     add_member(project_id, str(target["id"]), payload.role)
     write_audit(project_id, user.get("id"), "project.member.upsert", "membership", str(target["id"]), {"role": payload.role})
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/members")
+def projects_list_members(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    return {"ok": True, "members": list_project_members(project_id)}
+
+
+@app.get("/api/projects/{project_id}/telemost")
+def projects_telemost(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    """Один звонок Телемоста на проект: создаётся через API при первом запросе, затем хранится в БД."""
+    _require_project_member(project_id, str(user["id"]))
+    cached = get_project_telemost(project_id)
+    if cached:
+        return {"ok": True, "joinUrl": cached["join_url"], "cached": True}
+    token = os.environ.get("YANDEX_TELEMOST_OAUTH", "").strip()
+    if not token:
+        return {
+            "ok": False,
+            "needsOAuth": True,
+            "message": (
+                "Автоматическое создание комнаты Телемоста недоступно: задайте на сервере переменную окружения "
+                "YANDEX_TELEMOST_OAUTH с OAuth-токеном API Яндекс Телемоста (организации Яндекс 360 для бизнеса)."
+            ),
+        }
+    try:
+        r = httpx.post(
+            "https://cloud-api.yandex.net/v1/telemost-api/conferences",
+            headers={
+                "Authorization": f"OAuth {token}",
+                "Content-Type": "application/json",
+            },
+            json={"waiting_room_level": "PUBLIC"},
+            timeout=45.0,
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Telemost API недоступен: {e}") from e
+
+    if r.status_code != 201:
+        detail_body = r.text
+        try:
+            err_j = r.json()
+            detail_body = str(err_j.get("message") or err_j.get("error") or detail_body)
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"Телемост API ({r.status_code}): {detail_body}")
+
+    try:
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Телемост: неверный JSON ответа: {e}") from e
+
+    join_url = str(data.get("join_url") or "").strip()
+    conf_id = str(data.get("id") or "").strip()
+    if not join_url:
+        raise HTTPException(status_code=502, detail="Телемост API не вернул join_url")
+    upsert_project_telemost(project_id, conf_id or "-", join_url)
+    write_audit(project_id, user.get("id"), "telemost.conference.create", "project", project_id, {"conferenceId": conf_id})
+    return {"ok": True, "joinUrl": join_url, "cached": False}
+
+
+@app.get("/api/projects/{project_id}/attachments")
+def projects_list_attachments(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    return {"ok": True, "attachments": list_project_attachments(project_id)}
+
+
+@app.get("/api/projects/{project_id}/asset-pairs")
+def projects_list_asset_pairs(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    return {"ok": True, "pairs": list_asset_pairs(project_id)}
+
+
+@app.get("/api/projects/{project_id}/asset-pairs/suggestions")
+def projects_asset_pair_suggestions(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    return {"ok": True, "suggestions": suggest_asset_pair_candidates(project_id)}
+
+
+@app.post("/api/projects/{project_id}/asset-pairs")
+def projects_create_asset_pair(
+    project_id: str,
+    payload: CreateAssetPairRequest,
+    user: dict[str, Any] = Depends(_current_user),
+) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    pdf_stem = (payload.pdf_stem or "").strip()
+    model_stem = (payload.model_stem or "").strip()
+    pdf_aid = (payload.pdf_attachment_id or "").strip() or None
+    model_aid = (payload.model_attachment_id or "").strip() or None
+
+    if pdf_aid:
+        pa = get_attachment(project_id, pdf_aid)
+        if not pa:
+            raise HTTPException(status_code=404, detail="PDF attachment not found in project")
+        pdf_stem = stem_filename(str(pa.get("file_name") or "")) or pdf_stem
+    if model_aid:
+        ma = get_attachment(project_id, model_aid)
+        if not ma:
+            raise HTTPException(status_code=404, detail="Model attachment not found in project")
+        model_stem = stem_filename(str(ma.get("file_name") or "")) or model_stem
+
+    if not pdf_stem or not model_stem:
+        raise HTTPException(status_code=400, detail="Укажите pdfStem/modelStem или id вложений")
+
+    pair = create_asset_pair(
+        project_id,
+        str(user["id"]),
+        pdf_attachment_id=pdf_aid,
+        model_attachment_id=model_aid,
+        pdf_stem=pdf_stem,
+        model_stem=model_stem,
+    )
+    write_audit(project_id, user.get("id"), "project.asset_pair.create", "asset_pair", str(pair.get("id")), None)
+    return {"ok": True, "pair": pair}
+
+
+@app.delete("/api/projects/{project_id}/asset-pairs/{pair_id}")
+def projects_delete_asset_pair(project_id: str, pair_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    if not delete_asset_pair(project_id, pair_id):
+        raise HTTPException(status_code=404, detail="Pair not found")
+    write_audit(project_id, user.get("id"), "project.asset_pair.delete", "asset_pair", pair_id, None)
+    return {"ok": True}
+
+
+@app.patch("/api/projects/{project_id}/members/{target_user_id}")
+def projects_update_member_role(
+    project_id: str,
+    target_user_id: str,
+    payload: UpdateMemberRoleRequest,
+    user: dict[str, Any] = Depends(_current_user),
+) -> dict[str, Any]:
+    membership = _require_project_member(project_id, str(user["id"]))
+    if not _role_can_manage_members(str(membership.get("role", ""))):
+        raise HTTPException(
+            status_code=403,
+            detail="Only GIP / chief designer / designer can change roles",
+        )
+    target = get_membership(project_id, target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found in project")
+    if payload.role == "gip" and str(membership.get("role")) != "gip":
+        raise HTTPException(status_code=403, detail="Only GIP can assign GIP role")
+    prev_role = str(target.get("role", ""))
+    if prev_role == "gip" and payload.role != "gip" and count_role_in_project(project_id, "gip") <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Assign another GIP before changing the last GIP role",
+        )
+    add_member(project_id, target_user_id, payload.role)
+    write_audit(
+        project_id,
+        user.get("id"),
+        "project.member.role",
+        "membership",
+        target_user_id,
+        {"role": payload.role, "previousRole": prev_role},
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/projects/{project_id}/members/{target_user_id}")
+def projects_remove_member(
+    project_id: str,
+    target_user_id: str,
+    user: dict[str, Any] = Depends(_current_user),
+) -> dict[str, Any]:
+    actor_id = str(user["id"])
+    membership = _require_project_member(project_id, actor_id)
+    target = get_membership(project_id, target_user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found in project")
+
+    target_role = str(target.get("role", ""))
+
+    if target_user_id == actor_id:
+        n = count_project_members(project_id)
+        if n <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot leave project: you are the only member",
+            )
+        if target_role == "gip" and count_role_in_project(project_id, "gip") <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Assign another GIP before leaving the project",
+            )
+        delete_project_member(project_id, actor_id)
+        write_audit(project_id, actor_id, "project.member.leave", "membership", actor_id, None)
+        return {"ok": True}
+
+    if not _role_can_manage_members(str(membership.get("role", ""))):
+        raise HTTPException(
+            status_code=403,
+            detail="Only GIP / chief designer / designer can remove members",
+        )
+    if target_role == "gip" and str(membership.get("role")) != "gip":
+        raise HTTPException(status_code=403, detail="Only GIP can remove a GIP member")
+    if target_role == "gip" and count_role_in_project(project_id, "gip") <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Assign another GIP before removing the current GIP",
+        )
+    delete_project_member(project_id, target_user_id)
+    write_audit(
+        project_id,
+        actor_id,
+        "project.member.remove",
+        "membership",
+        target_user_id,
+        {"role": target_role},
+    )
     return {"ok": True}
 
 
@@ -760,8 +1038,8 @@ def channels_list(project_id: str, user: dict[str, Any] = Depends(_current_user)
 @app.post("/api/projects/{project_id}/channels")
 def channels_create(project_id: str, payload: CreateChannelRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
     membership = _require_project_member(project_id, str(user["id"]))
-    if membership.get("role") == "viewer":
-        raise HTTPException(status_code=403, detail="Viewer cannot create channels")
+    if _role_is_client(str(membership.get("role", ""))):
+        raise HTTPException(status_code=403, detail="Client role cannot create channels")
     channel = create_channel(project_id, payload.kind, payload.name, str(user["id"]))
     write_audit(project_id, user.get("id"), "chat.channel.create", "channel", channel.get("id"), {"kind": payload.kind, "name": payload.name})
     return {"ok": True, "channel": channel}
@@ -777,8 +1055,8 @@ def messages_list(project_id: str, channel_id: str, limit: int = 50, before: str
 @app.post("/api/projects/{project_id}/channels/{channel_id}/messages")
 async def messages_create(project_id: str, channel_id: str, payload: CreateMessageRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
     membership = _require_project_member(project_id, str(user["id"]))
-    if membership.get("role") == "viewer":
-        raise HTTPException(status_code=403, detail="Viewer cannot send messages")
+    if _role_is_client(str(membership.get("role", ""))):
+        raise HTTPException(status_code=403, detail="Client role cannot send messages")
     msg = create_message(project_id, channel_id, str(user["id"]), payload.body)
     if payload.attachment_ids:
         try:
@@ -821,8 +1099,44 @@ async def mark_channel_read(project_id: str, channel_id: str, payload: MarkReadR
 
 
 _ATTACH_ROOT = Path(__file__).resolve().parent / "uploads" / "chat"
-_ATTACH_MAX_BYTES = 20 * 1024 * 1024
-_ATTACH_ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
+_ATTACH_MAX_BYTES = 200 * 1024 * 1024
+_ATTACH_ALLOWED_EXT = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+    ".pdf",
+    ".xls", ".xlsx", ".xlsm", ".csv",
+    ".dwg", ".dxf",
+    ".cdw", ".spw", ".m3d", ".a3d", ".frw",
+    ".rvt", ".rfa",
+    ".step", ".stp", ".iges", ".igs", ".stl", ".glb", ".gltf",
+}
+_ATTACH_ALLOWED_MIME = {
+    "application/octet-stream",
+    "application/pdf",
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "text/csv",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+}
+_ATTACH_FALLBACK_EXT_BY_MIME = {
+    "application/pdf": ".pdf",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel.sheet.macroenabled.12": ".xlsm",
+    "text/csv": ".csv",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+}
 
 
 @app.post("/api/projects/{project_id}/attachments/upload")
@@ -834,10 +1148,13 @@ async def upload_attachment(
     user: dict[str, Any] = Depends(_current_user),
 ) -> dict[str, Any]:
     membership = _require_project_member(project_id, str(user["id"]))
-    if membership.get("role") == "viewer":
-        raise HTTPException(status_code=403, detail="Viewer cannot upload attachments")
-    mime = (file.content_type or "").lower().strip()
-    if mime not in _ATTACH_ALLOWED_MIME:
+    if _role_is_client(str(membership.get("role", ""))):
+        raise HTTPException(status_code=403, detail="Client role cannot upload attachments")
+    mime = (file.content_type or "").lower().strip() or "application/octet-stream"
+    ext = Path(file.filename or "").suffix.lower().strip()
+    if ext and ext not in _ATTACH_ALLOWED_EXT:
+        raise HTTPException(status_code=400, detail=f"Unsupported file extension: {ext}")
+    if mime not in _ATTACH_ALLOWED_MIME and not ext:
         raise HTTPException(status_code=400, detail=f"Unsupported mime type: {mime}")
     data = await file.read()
     if len(data) > _ATTACH_MAX_BYTES:
@@ -846,9 +1163,8 @@ async def upload_attachment(
         context = json.loads(context_json) if context_json else {}
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid context_json") from e
-    ext = Path(file.filename or "").suffix.lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
-        ext = ".png" if mime == "image/png" else ".jpg" if mime == "image/jpeg" else ".webp"
+    if not ext:
+        ext = _ATTACH_FALLBACK_EXT_BY_MIME.get(mime, ".bin")
     attach_id = str(uuid.uuid4())
     project_dir = _ATTACH_ROOT / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -913,11 +1229,30 @@ async def project_ws(project_id: str, ws: WebSocket) -> None:
                 "userId": user_id,
             }
         )
+        await _send_yjs_history(ws, project_id)
         while True:
             data = await ws.receive_json()
             action = str(data.get("type", ""))
             if action == "ping":
                 await ws.send_json({"type": "pong"})
+            elif action == "yjs.update":
+                raw = str(data.get("update", "")).strip()
+                if raw:
+                    async with _yjs_updates_lock:
+                        _project_yjs_updates.setdefault(project_id, []).append(raw)
+                    await _hub.broadcast_except(
+                        project_id,
+                        {"type": "yjs.update", "update": raw},
+                        exclude=ws,
+                    )
+            elif action == "yjs.awareness":
+                raw = str(data.get("update", "")).strip()
+                if raw:
+                    await _hub.broadcast_except(
+                        project_id,
+                        {"type": "yjs.awareness", "update": raw},
+                        exclude=ws,
+                    )
             elif action == "chat.read":
                 channel_id = str(data.get("channelId", "")).strip()
                 if channel_id:

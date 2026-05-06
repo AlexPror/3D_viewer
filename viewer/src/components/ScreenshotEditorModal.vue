@@ -4,11 +4,14 @@ import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
 const props = defineProps<{
   imageUrl: string
   suggestedFileName?: string | null
+  /** Вход в чат, выбраны проект и канал — иначе кнопка «В чат» неактивна */
+  chatSendEnabled?: boolean
 }>()
 
 const emit = defineEmits<{
   close: [dataUrl: string | null]
   'final-image': [dataUrl: string]
+  'send-to-chat': [dataUrl: string]
 }>()
 
 function getCanvasDataUrl(): string | null {
@@ -452,6 +455,13 @@ function onMouseUp(e: MouseEvent) {
   redraw()
 }
 
+function sendToChat() {
+  closeTextOverlay()
+  redraw()
+  const dataUrl = getCanvasDataUrl()
+  if (dataUrl) emit('send-to-chat', dataUrl)
+}
+
 function saveToFile() {
   if (!canvasRef.value) return
   const dataUrl = canvasRef.value.toDataURL('image/png')
@@ -529,6 +539,19 @@ watch(() => props.imageUrl, () => loadImage())
           <input v-model="currentStrokeColor" type="color" class="toolbar-input-color" />
         </template>
         <button type="button" @click="saveToFile">Сохранить на ПК</button>
+        <button
+          type="button"
+          class="btn-chat"
+          :disabled="!chatSendEnabled"
+          :title="
+            chatSendEnabled
+              ? 'Отправить текущее изображение в чат'
+              : 'Войдите и выберите проект и канал в правой панели'
+          "
+          @click="sendToChat"
+        >
+          В чат
+        </button>
       </div>
       <div v-if="tool === 'text'" class="text-hint">Кликните на изображение — откроется блок. Перетащите за полоску «Перетащить» или за край блока. Удалить: кнопка или Delete.</div>
       <div class="canvas-wrap">
@@ -637,6 +660,18 @@ watch(() => props.imageUrl, () => loadImage())
 .toolbar button.active {
   background: #4a6fc7;
   border-color: #5a7fd7;
+}
+.toolbar .btn-chat {
+  margin-left: 0.35rem;
+  background: #2d6a4a;
+  border-color: #3d8a5e;
+}
+.toolbar .btn-chat:hover:not(:disabled) {
+  background: #3a8a5e;
+}
+.toolbar .btn-chat:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .toolbar-label {
   font-size: 0.85rem;

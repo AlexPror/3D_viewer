@@ -104,6 +104,46 @@ class CollabApiTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(msgs), 1)
         self.assertEqual(msgs[-1]["body"], "Сообщение 1")
 
+    def test_list_project_members(self) -> None:
+        token = self.register_and_login("members@example.com", "Members")
+        headers = {"Authorization": f"Bearer {token}"}
+        project_resp = self.client.post("/api/projects", json={"name": "Members Project"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+        r = self.client.get(f"/api/projects/{project_id}/members", headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body.get("ok"))
+        members = body.get("members", [])
+        self.assertGreaterEqual(len(members), 1)
+        self.assertIn("displayName", members[0])
+        self.assertIn("role", members[0])
+        self.assertEqual(members[0].get("role"), "gip")
+
+    def test_asset_pair_suggestions_empty(self) -> None:
+        token = self.register_and_login("ap_empty@example.com", "AP Empty")
+        headers = {"Authorization": f"Bearer {token}"}
+        pid = self.client.post("/api/projects", json={"name": "AP Empty"}, headers=headers).json()["project"]["id"]
+        r = self.client.get(f"/api/projects/{pid}/asset-pairs/suggestions", headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("suggestions"), [])
+
+    def test_asset_pair_create_manual_stems(self) -> None:
+        token = self.register_and_login("ap_stem@example.com", "AP Stem")
+        headers = {"Authorization": f"Bearer {token}"}
+        pid = self.client.post("/api/projects", json={"name": "AP Stem"}, headers=headers).json()["project"]["id"]
+        cr = self.client.post(
+            f"/api/projects/{pid}/asset-pairs",
+            headers=headers,
+            json={"pdfStem": "drawing-module-a", "modelStem": "drawing-module-a"},
+        )
+        self.assertEqual(cr.status_code, 200, cr.text)
+        lr = self.client.get(f"/api/projects/{pid}/asset-pairs", headers=headers)
+        self.assertEqual(lr.status_code, 200, lr.text)
+        pairs = lr.json().get("pairs", [])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].get("pdfStem"), "drawing-module-a")
+
     def test_member_roles_block_viewer_write(self) -> None:
         owner_token = self.register_and_login("owner@example.com", "Owner")
         owner_headers = {"Authorization": f"Bearer {owner_token}"}
@@ -118,7 +158,7 @@ class CollabApiTestCase(unittest.TestCase):
 
         add_member = self.client.post(
             f"/api/projects/{project_id}/members",
-            json={"email": "viewer@example.com", "role": "viewer"},
+            json={"email": "viewer@example.com", "role": "client"},
             headers=owner_headers,
         )
         self.assertEqual(add_member.status_code, 200, add_member.text)
@@ -180,6 +220,34 @@ class CollabApiTestCase(unittest.TestCase):
         self.assertEqual(dl.status_code, 200, dl.text)
         self.assertEqual(dl.headers.get("content-type"), "image/png")
 
+    def test_attachment_upload_pdf_and_bind_to_message(self) -> None:
+        token = self.register_and_login("attach-pdf@example.com", "Attach Pdf")
+        headers = {"Authorization": f"Bearer {token}"}
+        project_resp = self.client.post("/api/projects", json={"name": "Attach PDF Project"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+        channels = self.client.get(f"/api/projects/{project_id}/channels", headers=headers).json()["channels"]
+        channel_id = channels[0]["id"]
+
+        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+        upload = self.client.post(
+            f"/api/projects/{project_id}/attachments/upload",
+            headers=headers,
+            files={"file": ("doc.pdf", BytesIO(pdf_bytes), "application/pdf")},
+            data={"source": "chat", "context_json": '{"kind":"pdf"}'},
+        )
+        self.assertEqual(upload.status_code, 200, upload.text)
+        attachment_id = upload.json()["attachment"]["id"]
+        self.assertTrue(attachment_id)
+
+        msg = self.client.post(
+            f"/api/projects/{project_id}/channels/{channel_id}/messages",
+            headers=headers,
+            json={"body": "pdf attached", "attachmentIds": [attachment_id]},
+        )
+        self.assertEqual(msg.status_code, 200, msg.text)
+        self.assertEqual(len(msg.json()["message"].get("attachments", [])), 1)
+
     def test_mark_read_endpoint(self) -> None:
         token = self.register_and_login("read1@example.com", "Read One")
         headers = {"Authorization": f"Bearer {token}"}
@@ -204,6 +272,18 @@ class CollabApiTestCase(unittest.TestCase):
         self.assertTrue(mark.json().get("ok"))
         self.assertEqual(mark.json()["readState"]["last_read_msg_id"], msg["id"])
 
+    def test_telemost_without_oauth_returns_hint(self) -> None:
+        token = self.register_and_login("tm_oauth@example.com", "Tm OAuth")
+        headers = {"Authorization": f"Bearer {token}"}
+        project_resp = self.client.post("/api/projects", json={"name": "Tm Project"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+        r = self.client.get(f"/api/projects/{project_id}/telemost", headers=headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body.get("ok"))
+        self.assertTrue(body.get("needsOAuth"))
+
     def test_websocket_receives_message_event(self) -> None:
         token = self.register_and_login("ws1@example.com", "Ws One")
         headers = {"Authorization": f"Bearer {token}"}
@@ -216,6 +296,9 @@ class CollabApiTestCase(unittest.TestCase):
         with self.client.websocket_connect(f"/api/projects/{project_id}/ws?token={token}") as ws:
             connected_evt = ws.receive_json()
             self.assertEqual(connected_evt.get("type"), "ws.connected")
+            sync_evt = ws.receive_json()
+            self.assertEqual(sync_evt.get("type"), "yjs.sync")
+            self.assertTrue(sync_evt.get("final"))
             create_msg = self.client.post(
                 f"/api/projects/{project_id}/channels/{channel_id}/messages",
                 headers=headers,
@@ -225,6 +308,102 @@ class CollabApiTestCase(unittest.TestCase):
             evt = ws.receive_json()
             self.assertEqual(evt.get("type"), "chat.message.created")
             self.assertEqual(evt.get("channelId"), channel_id)
+
+    def test_patch_member_role(self) -> None:
+        gip_token = self.register_and_login("gip_role@example.com", "Gip Role")
+        gip_headers = {"Authorization": f"Bearer {gip_token}"}
+        self.register_and_login("role_target@example.com", "Role Target")
+        project_id = self.client.post(
+            "/api/projects", json={"name": "Role change"}, headers=gip_headers
+        ).json()["project"]["id"]
+        add = self.client.post(
+            f"/api/projects/{project_id}/members",
+            json={"email": "role_target@example.com", "role": "designer"},
+            headers=gip_headers,
+        )
+        self.assertEqual(add.status_code, 200, add.text)
+        members = self.client.get(f"/api/projects/{project_id}/members", headers=gip_headers).json()[
+            "members"
+        ]
+        target_id = next(m["id"] for m in members if m["email"] == "role_target@example.com")
+        patch = self.client.patch(
+            f"/api/projects/{project_id}/members/{target_id}",
+            json={"role": "installer"},
+            headers=gip_headers,
+        )
+        self.assertEqual(patch.status_code, 200, patch.text)
+        members2 = self.client.get(f"/api/projects/{project_id}/members", headers=gip_headers).json()[
+            "members"
+        ]
+        t2 = next(m for m in members2 if m["id"] == target_id)
+        self.assertEqual(t2["role"], "installer")
+
+    def test_chief_cannot_assign_gip_via_patch(self) -> None:
+        gip_t = self.register_and_login("gip_chief_patch@example.com", "Gip CP")
+        chief_t = self.register_and_login("chief_chief_patch@example.com", "Chief CP")
+        self.register_and_login("victim_chief_patch@example.com", "Victim CP")
+        gh = {"Authorization": f"Bearer {gip_t}"}
+        pid = self.client.post("/api/projects", json={"name": "PC"}, headers=gh).json()["project"]["id"]
+        self.client.post(
+            f"/api/projects/{pid}/members",
+            json={"email": "chief_chief_patch@example.com", "role": "chief_designer"},
+            headers=gh,
+        )
+        self.client.post(
+            f"/api/projects/{pid}/members",
+            json={"email": "victim_chief_patch@example.com", "role": "designer"},
+            headers=gh,
+        )
+        members = self.client.get(f"/api/projects/{pid}/members", headers=gh).json()["members"]
+        vid = next(m["id"] for m in members if m["email"] == "victim_chief_patch@example.com")
+        ch = {"Authorization": f"Bearer {chief_t}"}
+        bad = self.client.patch(f"/api/projects/{pid}/members/{vid}", json={"role": "gip"}, headers=ch)
+        self.assertEqual(bad.status_code, 403, bad.text)
+
+    def test_leave_project_removes_membership(self) -> None:
+        a_token = self.register_and_login("leave_a@example.com", "User A")
+        b_token = self.register_and_login("leave_b@example.com", "User B")
+        ah = {"Authorization": f"Bearer {a_token}"}
+        project_id = self.client.post("/api/projects", json={"name": "Leave P"}, headers=ah).json()["project"]["id"]
+        add = self.client.post(
+            f"/api/projects/{project_id}/members",
+            json={"email": "leave_b@example.com", "role": "designer"},
+            headers=ah,
+        )
+        self.assertEqual(add.status_code, 200, add.text)
+        members = self.client.get(f"/api/projects/{project_id}/members", headers=ah).json()["members"]
+        bid = next(m["id"] for m in members if m["email"] == "leave_b@example.com")
+        bh = {"Authorization": f"Bearer {b_token}"}
+        leave = self.client.delete(f"/api/projects/{project_id}/members/{bid}", headers=bh)
+        self.assertEqual(leave.status_code, 200, leave.text)
+        plist = self.client.get("/api/projects", headers=bh).json().get("projects", [])
+        self.assertFalse(any(p["id"] == project_id for p in plist))
+
+    def test_leave_sole_member_rejected(self) -> None:
+        token = self.register_and_login("sole_leave@example.com", "Sole")
+        h = {"Authorization": f"Bearer {token}"}
+        project_id = self.client.post("/api/projects", json={"name": "Sole"}, headers=h).json()["project"]["id"]
+        uid = self.client.get("/api/me", headers=h).json()["user"]["id"]
+        r = self.client.delete(f"/api/projects/{project_id}/members/{uid}", headers=h)
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_gip_kicks_member(self) -> None:
+        gip_token = self.register_and_login("kick_g@example.com", "Kick Gip")
+        self.register_and_login("kick_o@example.com", "Kick Other")
+        gh = {"Authorization": f"Bearer {gip_token}"}
+        project_id = self.client.post("/api/projects", json={"name": "Kick"}, headers=gh).json()["project"]["id"]
+        add = self.client.post(
+            f"/api/projects/{project_id}/members",
+            json={"email": "kick_o@example.com", "role": "designer"},
+            headers=gh,
+        )
+        self.assertEqual(add.status_code, 200, add.text)
+        members = self.client.get(f"/api/projects/{project_id}/members", headers=gh).json()["members"]
+        oid = next(m["id"] for m in members if m["email"] == "kick_o@example.com")
+        r = self.client.delete(f"/api/projects/{project_id}/members/{oid}", headers=gh)
+        self.assertEqual(r.status_code, 200, r.text)
+        ms = self.client.get(f"/api/projects/{project_id}/members", headers=gh).json()["members"]
+        self.assertEqual(len(ms), 1)
 
 
 if __name__ == "__main__":
