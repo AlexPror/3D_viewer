@@ -16,6 +16,32 @@ Health check: `http://localhost:8000/api/health`
 
 ## API
 
+### Auth + collaboration (этап 1, каркас)
+
+Локальная SQLite БД создается автоматически: `server/collab.sqlite3`  
+Путь можно переопределить переменной `COLLAB_DB_PATH`.
+
+Доп. переменные:
+- `COLLAB_AUTH_SECRET` — секрет подписи токена (обязательно сменить в проде)
+- `COLLAB_TOKEN_TTL_SECONDS` — TTL токена (по умолчанию 43200)
+
+Endpoints:
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `GET /api/me`
+- `GET /api/projects`
+- `POST /api/projects`
+- `POST /api/projects/{project_id}/members`
+- `GET /api/projects/{project_id}/channels`
+- `POST /api/projects/{project_id}/channels`
+- `GET /api/projects/{project_id}/channels/{channel_id}/messages`
+- `POST /api/projects/{project_id}/channels/{channel_id}/messages`
+- `POST /api/projects/{project_id}/attachments/upload`
+- `GET /api/projects/{project_id}/attachments/{attachment_id}`
+
+Для защищенных endpoint используйте:
+`Authorization: Bearer <token>`
+
 ### POST `/api/step/metadata`
 
 Multipart form-data:

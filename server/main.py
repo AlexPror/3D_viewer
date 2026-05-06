@@ -4,12 +4,36 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile
+import json
+import uuid
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
 from spec_builder import build_spec_from_assembly
 from kompas_metadata import read_kompas_metadata, build_assembly_map
+from collab_auth import create_token, decode_token, hash_password, token_expiration_iso, verify_password
+from collab_store import (
+    add_member,
+    bind_attachments_to_message,
+    create_channel,
+    create_attachment,
+    create_message,
+    create_project,
+    create_user,
+    get_attachment,
+    get_membership,
+    get_user_by_email,
+    get_user_by_id,
+    init_collab_db,
+    list_channels,
+    list_messages,
+    list_projects_for_user,
+    write_audit,
+)
 
 try:
     from step_to_glb import step_to_glb_bytes, is_server_conversion_available
@@ -33,6 +57,8 @@ app.add_middleware(
 
 
 _cache: dict[str, Any] = {}
+
+init_collab_db()
 
 
 _re_x2 = re.compile(r"\\X2\\([0-9A-Fa-f]+)\\X0\\")
@@ -539,4 +565,256 @@ def kompas_assembly_map_auto(root_dir: str) -> dict[str, Any]:
             "selected": selected,
             "error": str(e),
         }
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=8, max_length=256)
+    display_name: str = Field(min_length=2, max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class CreateProjectRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+
+
+class AddMemberRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    role: str = Field(default="viewer", pattern="^(owner|editor|viewer)$")
+
+
+class CreateChannelRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    kind: str = Field(default="general", pattern="^(general|module|thread)$")
+
+
+class CreateMessageRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=8000)
+    attachment_ids: list[str] = Field(default_factory=list, alias="attachmentIds")
+
+
+def _extract_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authorization must be Bearer token")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty token")
+    return token
+
+
+def _current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    token = _extract_token(authorization)
+    payload = decode_token(token)
+    user_id = str(payload.get("sub", ""))
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+    user = get_user_by_id(user_id)
+    if not user or not bool(user.get("is_active", 0)):
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
+
+
+def _require_project_member(project_id: str, user_id: str) -> dict[str, Any]:
+    membership = get_membership(project_id, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Project access denied")
+    return membership
+
+
+@app.post("/api/auth/register")
+def auth_register(payload: RegisterRequest) -> dict[str, Any]:
+    exists = get_user_by_email(payload.email)
+    if exists:
+        raise HTTPException(status_code=409, detail="User already exists")
+    user = create_user(
+        email=str(payload.email),
+        display_name=payload.display_name.strip(),
+        password_hash=hash_password(payload.password),
+    )
+    token = create_token(user)
+    write_audit(None, user.get("id"), "auth.register", "user", user.get("id"), {"email": user.get("email")})
+    return {
+        "ok": True,
+        "token": token,
+        "expiresAt": token_expiration_iso(),
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "displayName": user.get("display_name"),
+        },
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: LoginRequest) -> dict[str, Any]:
+    user = get_user_by_email(str(payload.email))
+    if not user or not verify_password(payload.password, str(user.get("password_hash", ""))):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not bool(user.get("is_active", 0)):
+        raise HTTPException(status_code=403, detail="User is inactive")
+    token = create_token(user)
+    write_audit(None, user.get("id"), "auth.login", "user", user.get("id"), None)
+    return {
+        "ok": True,
+        "token": token,
+        "expiresAt": token_expiration_iso(),
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "displayName": user.get("display_name"),
+        },
+    }
+
+
+@app.get("/api/me")
+def me(user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "user": {
+            "id": user.get("id"),
+            "email": user.get("email"),
+            "displayName": user.get("display_name"),
+        },
+    }
+
+
+@app.get("/api/projects")
+def projects_list(user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    projects = list_projects_for_user(str(user["id"]))
+    return {"ok": True, "projects": projects}
+
+
+@app.post("/api/projects")
+def projects_create(payload: CreateProjectRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    project = create_project(payload.name, str(user["id"]))
+    write_audit(project.get("id"), user.get("id"), "project.create", "project", project.get("id"), {"name": payload.name})
+    return {"ok": True, "project": project}
+
+
+@app.post("/api/projects/{project_id}/members")
+def projects_add_member(project_id: str, payload: AddMemberRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    membership = _require_project_member(project_id, str(user["id"]))
+    if membership.get("role") not in ("owner", "editor"):
+        raise HTTPException(status_code=403, detail="Only owner/editor can add members")
+    target = get_user_by_email(str(payload.email))
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+    if payload.role == "owner" and membership.get("role") != "owner":
+        raise HTTPException(status_code=403, detail="Only owner can assign owner role")
+    add_member(project_id, str(target["id"]), payload.role)
+    write_audit(project_id, user.get("id"), "project.member.upsert", "membership", str(target["id"]), {"role": payload.role})
+    return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/channels")
+def channels_list(project_id: str, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    return {"ok": True, "channels": list_channels(project_id)}
+
+
+@app.post("/api/projects/{project_id}/channels")
+def channels_create(project_id: str, payload: CreateChannelRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    membership = _require_project_member(project_id, str(user["id"]))
+    if membership.get("role") == "viewer":
+        raise HTTPException(status_code=403, detail="Viewer cannot create channels")
+    channel = create_channel(project_id, payload.kind, payload.name, str(user["id"]))
+    write_audit(project_id, user.get("id"), "chat.channel.create", "channel", channel.get("id"), {"kind": payload.kind, "name": payload.name})
+    return {"ok": True, "channel": channel}
+
+
+@app.get("/api/projects/{project_id}/channels/{channel_id}/messages")
+def messages_list(project_id: str, channel_id: str, limit: int = 50, before: str | None = None, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    _require_project_member(project_id, str(user["id"]))
+    safe_limit = min(200, max(1, int(limit)))
+    return {"ok": True, "messages": list_messages(channel_id, safe_limit, before)}
+
+
+@app.post("/api/projects/{project_id}/channels/{channel_id}/messages")
+def messages_create(project_id: str, channel_id: str, payload: CreateMessageRequest, user: dict[str, Any] = Depends(_current_user)) -> dict[str, Any]:
+    membership = _require_project_member(project_id, str(user["id"]))
+    if membership.get("role") == "viewer":
+        raise HTTPException(status_code=403, detail="Viewer cannot send messages")
+    msg = create_message(project_id, channel_id, str(user["id"]), payload.body)
+    if payload.attachment_ids:
+        try:
+            bind_attachments_to_message(project_id, str(msg.get("id", "")), payload.attachment_ids)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        # reload with attachments
+        msgs = list_messages(channel_id, limit=1)
+        if msgs:
+            msg = msgs[-1]
+    write_audit(project_id, user.get("id"), "chat.message.create", "message", msg.get("id"), {"channelId": channel_id})
+    return {"ok": True, "message": msg}
+
+
+_ATTACH_ROOT = Path(__file__).resolve().parent / "uploads" / "chat"
+_ATTACH_MAX_BYTES = 20 * 1024 * 1024
+_ATTACH_ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
+
+
+@app.post("/api/projects/{project_id}/attachments/upload")
+async def upload_attachment(
+    project_id: str,
+    file: UploadFile = File(...),
+    source: str = Form(default="other"),
+    context_json: str = Form(default="{}"),
+    user: dict[str, Any] = Depends(_current_user),
+) -> dict[str, Any]:
+    membership = _require_project_member(project_id, str(user["id"]))
+    if membership.get("role") == "viewer":
+        raise HTTPException(status_code=403, detail="Viewer cannot upload attachments")
+    mime = (file.content_type or "").lower().strip()
+    if mime not in _ATTACH_ALLOWED_MIME:
+        raise HTTPException(status_code=400, detail=f"Unsupported mime type: {mime}")
+    data = await file.read()
+    if len(data) > _ATTACH_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Attachment is too large")
+    try:
+        context = json.loads(context_json) if context_json else {}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid context_json") from e
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        ext = ".png" if mime == "image/png" else ".jpg" if mime == "image/jpeg" else ".webp"
+    attach_id = str(uuid.uuid4())
+    project_dir = _ATTACH_ROOT / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    local_name = f"{attach_id}{ext}"
+    local_path = project_dir / local_name
+    with local_path.open("wb") as f:
+        f.write(data)
+    rec = create_attachment(
+        project_id=project_id,
+        uploader_id=str(user["id"]),
+        source=(source or "other")[:32],
+        mime_type=mime,
+        file_name=file.filename or local_name,
+        size_bytes=len(data),
+        storage_provider="local",
+        storage_key=str(local_path),
+        public_url=f"/api/projects/{project_id}/attachments/{attach_id}",
+        context_json=context if isinstance(context, dict) else {"value": context},
+        attachment_id=attach_id,
+    )
+    write_audit(project_id, user.get("id"), "chat.attachment.upload", "attachment", rec.get("id"), {"source": source})
+    return {"ok": True, "attachment": rec}
+
+
+@app.get("/api/projects/{project_id}/attachments/{attachment_id}")
+def get_attachment_file(project_id: str, attachment_id: str, user: dict[str, Any] = Depends(_current_user)) -> FileResponse:
+    _require_project_member(project_id, str(user["id"]))
+    rec = get_attachment(project_id, attachment_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = str(rec.get("storage_key") or "")
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Attachment file is missing")
+    return FileResponse(path=path, media_type=str(rec.get("mime_type") or "application/octet-stream"), filename=str(rec.get("file_name") or "attachment"))
 
