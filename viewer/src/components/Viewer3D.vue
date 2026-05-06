@@ -12,6 +12,7 @@ import { logger } from '../lib/logger'
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
 const activeTab = ref<'viewer' | 'spec'>('viewer')
+const headerToolsTab = ref<'viewTools' | 'display' | 'export'>('viewTools')
 const stepMeta = ref<any | null>(null)
 
 /** Разделы спецификации по ГОСТ 2.106-96 с начальным номером позиции для каждого раздела. */
@@ -62,6 +63,7 @@ let camera: THREE.PerspectiveCamera
 let renderer: THREE.WebGLRenderer
 let controls: InstanceType<typeof TrackballControls>
 let meshGroup: THREE.Group
+let overlayGroup: THREE.Group
 let measureGroup: THREE.Group
 let highlightGroup: THREE.Group
 let axesHelper: THREE.Group | null = null
@@ -72,6 +74,8 @@ let keyLight: THREE.DirectionalLight | null = null
 let fillLightA: THREE.DirectionalLight | null = null
 let fillLightB: THREE.DirectionalLight | null = null
 let fillLightC: THREE.DirectionalLight | null = null
+let rimLightA: THREE.DirectionalLight | null = null
+let rimLightB: THREE.DirectionalLight | null = null
 let raycaster: THREE.Raycaster
 let mouse: THREE.Vector2
 const HOVER_UPDATE_INTERVAL_MS = 80
@@ -83,6 +87,9 @@ let idlePixelRatio = 1
 const showGroundGrid = ref(true)
 let measurementPoints: THREE.Vector3[] = []
 let measurementPointNormals: (THREE.Vector3 | null)[] = []
+let measurementPointModelIds: (string | null)[] = []
+let measurementPointLocals: (SavedVec3 | null)[] = []
+let measurementPointNormalLocals: (SavedVec3 | null)[] = []
 let measurementLine: THREE.Line | null = null
 let measurementTriangleLines: THREE.Line[] = []
 let measurementPerpLine: THREE.Line | null = null
@@ -92,6 +99,7 @@ let measurementArcPathLine: THREE.Line | null = null
 /** Геометрии двух плоскостей для режима «расстояние» (в мировых координатах), чтобы подсвечивать их на скриншоте */
 let measurementFaceGeometries: THREE.BufferGeometry[] = []
 let measurementPlanesGroup: THREE.Group
+let savedMeasurementsGroup: THREE.Group
 /** Подсветка выбранных плоскостей сборки и связей из таблицы (после initScene) */
 let assemblyHighlightGroup: THREE.Group | undefined
 let measurementLabelEl: HTMLDivElement | null = null
@@ -145,7 +153,7 @@ const SECTION_OFFSET_MAX = 2000
 const SECTION_OFFSET_STEP = 10
 let animationId: number
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
-export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance'
+export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance' | 'cad-linear'
 let measureSnapMode: MeasureSnapMode = 'intersection'
 let measureType: MeasureType = 'distance'
 let fileInput: HTMLInputElement | null = null
@@ -159,7 +167,7 @@ export interface LoadedModelItem {
   inScene: boolean
 }
 
-type SavedMeasureType = 'distance'
+type SavedMeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'cad-linear'
 type SavedVec3 = { x: number; y: number; z: number }
 type AssemblyMateType = 'plane' | 'distance' | 'symmetric'
 type AssemblyAxis = 'x' | 'y' | 'z'
@@ -231,6 +239,56 @@ interface SavedMeasurement {
   p2: SavedVec3
   n1: SavedVec3 | null
   n2: SavedVec3 | null
+  /** Для устойчивого восстановления после перемещения модели. */
+  modelId1?: string | null
+  modelId2?: string | null
+  p1Local?: SavedVec3 | null
+  p2Local?: SavedVec3 | null
+  n1Local?: SavedVec3 | null
+  n2Local?: SavedVec3 | null
+  /** Радиус/диаметр: центр и нормаль в локале модели. */
+  centerLocal?: SavedVec3 | null
+  centerModelId?: string | null
+  centerNormalLocal?: SavedVec3 | null
+  radiusMmValue?: number | null
+  secondCenterLocal?: SavedVec3 | null
+  secondCenterModelId?: string | null
+  arcPath?: SavedVec3[] | null
+  arcModelId?: string | null
+  arcPathLocal?: SavedVec3[] | null
+  displayValue?: string | null
+  outputPlaneModelId?: string | null
+  outputPlaneLocalPoint?: SavedVec3 | null
+  outputPlaneLocalNormal?: SavedVec3 | null
+  lineOffsetMm?: number | null
+}
+
+interface PartColorMetaPart {
+  partId: string
+  displayName?: string
+  name?: string
+  material?: string
+  category?: string
+  defaultColor?: string
+}
+
+interface PartColorMetaInstance {
+  instanceId: string
+  partId: string
+  colorOverride?: string
+}
+
+interface PartColorMetaBinding {
+  meshNode: string
+  instanceId?: string
+  partId?: string
+}
+
+interface PartColorMeta {
+  version?: number
+  parts: PartColorMetaPart[]
+  instances: PartColorMetaInstance[]
+  meshBindings: PartColorMetaBinding[]
 }
 
 const MAX_MODELS_IN_SCENE = 8
@@ -241,6 +299,51 @@ const loadedModels = ref<LoadedModelItem[]>([])
 const measurementHistory = ref<SavedMeasurement[]>([])
 const selectedMeasurementId = ref<string | null>(null)
 const originalMaterials = new WeakMap<THREE.Mesh, THREE.Material | THREE.Material[]>()
+const preservePartColors = ref(true)
+const autoColorizeSegments = ref(true)
+const overlayEnabled = ref(true)
+const overlayOpacity = ref(0.7)
+const OVERLAY_OPACITY_MIN = 0.05
+const OVERLAY_OPACITY_MAX = 1
+const OVERLAY_OPACITY_STEP = 0.01
+const explodeAmount = ref(0)
+const EXPLODE_MIN = 0
+const EXPLODE_MAX = 100
+const EXPLODE_STEP = 1
+const overlayGroupByModelId = new Map<string, THREE.Group>()
+const overlaySourceByModelId = new Map<string, THREE.Group>()
+const partContextMenuOpen = ref(false)
+const partContextMenuX = ref(0)
+const partContextMenuY = ref(0)
+let contextMenuTargetModelId: string | null = null
+let contextMenuTargetPart: THREE.Object3D | null = null
+const contextMenuCanShow = ref(false)
+const contextMenuTargetIsHidden = ref(false)
+let rightMouseDown = false
+let rightMouseDragged = false
+let rightMouseDownX = 0
+let rightMouseDownY = 0
+const RIGHT_DRAG_THRESHOLD_PX = 6
+interface ComponentTreeNode {
+  id: string
+  label: string
+  visible: boolean
+  targetIds: string[]
+  children: ComponentTreeNode[]
+}
+interface ComponentTreeRow {
+  id: string
+  label: string
+  visible: boolean
+  targetIds: string[]
+  depth: number
+}
+const componentTreeByModel = ref<Record<string, ComponentTreeNode[]>>({})
+const assemblyMapByModel = ref<Record<string, any>>({})
+const selectedComponentRowId = ref<string | null>(null)
+const highlightedComponentMeshes = new Set<THREE.Mesh>()
+let hiddenOutlineGroup: THREE.Group
+const hiddenOutlineByComponentId = new Map<string, THREE.Box3Helper>()
 const assemblyPanelOpen = ref(false)
 const assemblyMateType = ref<AssemblyMateType>('plane')
 const assemblySourceModelId = ref('')
@@ -263,6 +366,18 @@ const assemblyMates = ref<StoredAssemblyMate[]>([])
 const selectedAssemblyMateId = ref<string | null>(null)
 const measurementsPanelPos = ref({ x: 14, y: 14 })
 let measurementsPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
+const assemblyPanelPos = ref({ x: 330, y: 14 })
+let assemblyPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
+const FLOAT_PANEL_MARGIN = 14
+const FLOAT_PANEL_HEADER_GAP = 0
+const ASSEMBLY_PANEL_DEFAULT_WIDTH = 300
+const FLOAT_PANEL_STACK_GAP = 10
+const FLOAT_PANEL_SCENE_GAP = 10
+let floatingPanelsResizeObserver: ResizeObserver | null = null
+
+function minFloatingPanelY() {
+  return 0
+}
 const modelGroupsById = new Map<string, THREE.Group>()
 const visibleAssemblyModels = computed(() => loadedModels.value.filter((m) => m.inScene))
 const assemblySourcePlaneText = computed(() =>
@@ -280,6 +395,10 @@ function assemblyPlaneShortLabel(p: AssemblyPlaneSelection | null): string {
   const name = loadedModels.value.find((m) => m.id === p.modelId)?.name ?? p.modelId
   return `${name}`
 }
+const cadLinearPlane1Text = computed(() => assemblyPlaneShortLabel(cadLinearPlane1.value))
+const cadLinearPlane2Text = computed(() => assemblyPlaneShortLabel(cadLinearPlane2.value))
+const cadLinearDisplayPlaneText = computed(() => assemblyPlaneShortLabel(cadLinearDisplayPlane.value))
+const linearMeasurementRows = computed(() => measurementHistory.value.filter((m) => m.type === 'cad-linear'))
 const assemblySymBase1Text = computed(() => assemblyPlaneShortLabel(assemblySymBase1.value))
 const assemblySymBase2Text = computed(() => assemblyPlaneShortLabel(assemblySymBase2.value))
 const assemblySymPart1Text = computed(() => assemblyPlaneShortLabel(assemblySymPart1.value))
@@ -298,6 +417,7 @@ const TINT_BRIGHTNESS_MAX = 2.03
 const TINT_BRIGHTNESS_STEP = 0.05
 const tintBrightness = ref(1)
 const shadingMode = ref<'lit' | 'unlit'>('lit')
+const lightPreset = ref<'engineering' | 'soft'>('engineering')
 const sceneSurfaceAreaMm2 = ref<number | null>(null)
 const sceneVolumeMm3 = ref<number | null>(null)
 const sceneTriangles = ref<number>(0)
@@ -317,6 +437,53 @@ const mouseZoomGestureMs = ref(450)
 const leftButtonMoveModel = ref(true)
 const autoNavLimitsEnabled = ref(true)
 
+const CAD_MOUSE_LIMITS = {
+  minDistanceMin: 1,
+  minDistanceMax: 600,
+  maxDistanceMin: 300,
+  maxDistanceMax: 500000,
+  zoomSpeedMin: 0.01,
+  zoomSpeedMax: 0.09,
+  rotateSpeedMin: 2.2,
+  rotateSpeedMax: 8.8,
+  panSpeedMin: 0.7,
+  panSpeedMax: 3.5,
+  dampingMin: 0.12,
+  dampingMax: 0.4,
+  zoomGestureMsMin: 180,
+  zoomGestureMsMax: 900,
+  minZoomGap: 50,
+} as const
+
+function clampNumber(v: number, min: number, max: number, fallback: number) {
+  if (!Number.isFinite(v)) return fallback
+  return Math.min(max, Math.max(min, v))
+}
+
+function normalizeMouseSettings() {
+  const minD = clampNumber(
+    mouseMinDistance.value,
+    CAD_MOUSE_LIMITS.minDistanceMin,
+    CAD_MOUSE_LIMITS.minDistanceMax,
+    10
+  )
+  const maxD = clampNumber(
+    mouseMaxDistance.value,
+    CAD_MOUSE_LIMITS.maxDistanceMin,
+    CAD_MOUSE_LIMITS.maxDistanceMax,
+    50000
+  )
+  mouseMinDistance.value = minD
+  mouseMaxDistance.value = Math.max(maxD, minD + CAD_MOUSE_LIMITS.minZoomGap)
+  mouseZoomSpeed.value = clampNumber(mouseZoomSpeed.value, CAD_MOUSE_LIMITS.zoomSpeedMin, CAD_MOUSE_LIMITS.zoomSpeedMax, 0.032)
+  mouseRotateSpeed.value = clampNumber(mouseRotateSpeed.value, CAD_MOUSE_LIMITS.rotateSpeedMin, CAD_MOUSE_LIMITS.rotateSpeedMax, 6.4)
+  mousePanSpeed.value = clampNumber(mousePanSpeed.value, CAD_MOUSE_LIMITS.panSpeedMin, CAD_MOUSE_LIMITS.panSpeedMax, 2)
+  mouseDamping.value = clampNumber(mouseDamping.value, CAD_MOUSE_LIMITS.dampingMin, CAD_MOUSE_LIMITS.dampingMax, 0.22)
+  mouseZoomGestureMs.value = Math.round(
+    clampNumber(mouseZoomGestureMs.value, CAD_MOUSE_LIMITS.zoomGestureMsMin, CAD_MOUSE_LIMITS.zoomGestureMsMax, 450)
+  )
+}
+
 function applyAutoNavigationLimits(box: THREE.Box3) {
   if (!autoNavLimitsEnabled.value) return
   const size = box.getSize(new THREE.Vector3())
@@ -329,6 +496,7 @@ function applyAutoNavigationLimits(box: THREE.Box3) {
 }
 
 function applyMouseSettings() {
+  normalizeMouseSettings()
   if (!controls) return
   controls.minDistance = mouseMinDistance.value
   controls.maxDistance = mouseMaxDistance.value
@@ -348,11 +516,334 @@ function applyModelTint() {
   const colorHex = new THREE.Color().setHSL(hsl.h, hsl.s, lightness).getHex()
   meshGroup.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    if (preservePartColors.value && (obj.userData?.lockPartColor || obj.userData?.hasImportedColor)) return
     const arr = Array.isArray(obj.material) ? obj.material : [obj.material]
     arr.forEach((m: THREE.Material) => {
       if ('color' in m) (m as THREE.Material & { color: THREE.Color }).color.setHex(colorHex)
     })
   })
+}
+
+function markImportedMeshColors(root: THREE.Object3D) {
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    const hasAnyColor = mats.some((m: THREE.Material) => 'color' in m)
+    if (hasAnyColor) {
+      obj.userData = { ...obj.userData, hasImportedColor: true }
+    }
+  })
+}
+
+function normalizeHexColor(input: string | undefined): string | null {
+  if (!input) return null
+  const v = input.trim()
+  if (/^#[0-9a-fA-F]{6}$/.test(v)) return v.toLowerCase()
+  if (/^#[0-9a-fA-F]{3}$/.test(v)) {
+    const r = v[1]
+    const g = v[2]
+    const b = v[3]
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase()
+  }
+  return null
+}
+
+function parsePartColorMeta(raw: unknown): PartColorMeta | null {
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as Record<string, unknown>
+  const payload =
+    obj.metadata && typeof obj.metadata === 'object'
+      ? (obj.metadata as Record<string, unknown>)
+      : obj
+
+  const partsRaw = Array.isArray(payload.parts) ? payload.parts : []
+  const instancesRaw = Array.isArray(payload.instances) ? payload.instances : []
+  const meshRaw = Array.isArray(payload.meshBindings) ? payload.meshBindings : []
+
+  const parts: PartColorMetaPart[] = partsRaw
+    .map((p) => {
+      if (!p || typeof p !== 'object') return null
+      const pp = p as Record<string, unknown>
+      const partId = String(pp.partId ?? pp.id ?? '').trim()
+      if (!partId) return null
+      const displayName = String(pp.displayName ?? pp.name ?? '').trim() || undefined
+      const color = normalizeHexColor(
+        String(pp.defaultColor ?? pp.color ?? pp.colorHex ?? '').trim() || undefined
+      )
+      return {
+        partId,
+        displayName,
+        name: String(pp.name ?? '').trim() || undefined,
+        material: String(pp.material ?? '').trim() || undefined,
+        category: String(pp.category ?? pp.kind ?? '').trim() || undefined,
+        defaultColor: color ?? undefined,
+      }
+    })
+    .filter((x): x is PartColorMetaPart => !!x)
+
+  const instances: PartColorMetaInstance[] = instancesRaw
+    .map((i) => {
+      if (!i || typeof i !== 'object') return null
+      const ii = i as Record<string, unknown>
+      const instanceId = String(ii.instanceId ?? ii.id ?? '').trim()
+      const partId = String(ii.partId ?? '').trim()
+      if (!instanceId || !partId) return null
+      const colorOverride = normalizeHexColor(String(ii.colorOverride ?? '').trim() || undefined) ?? undefined
+      return { instanceId, partId, colorOverride }
+    })
+    .filter((x): x is PartColorMetaInstance => !!x)
+
+  const meshBindings: PartColorMetaBinding[] = meshRaw
+    .map((b) => {
+      if (!b || typeof b !== 'object') return null
+      const bb = b as Record<string, unknown>
+      const meshNode = String(bb.meshNode ?? bb.meshNameHint ?? bb.meshName ?? '').trim()
+      if (!meshNode) return null
+      return {
+        meshNode,
+        instanceId: String(bb.instanceId ?? '').trim() || undefined,
+        partId: String(bb.partId ?? '').trim() || undefined,
+      }
+    })
+    .filter((x): x is PartColorMetaBinding => !!x)
+
+  if (!parts.length && !instances.length && !meshBindings.length) return null
+  return { version: typeof payload.version === 'number' ? payload.version : undefined, parts, instances, meshBindings }
+}
+
+function bindPartMetaToMeshes(root: THREE.Object3D, meta: PartColorMeta): { mapped: number; totalMeshes: number } {
+  const partById = new Map(meta.parts.map((p) => [p.partId, p]))
+  const instanceById = new Map(meta.instances.map((i) => [i.instanceId, i]))
+  const bindingByNode = new Map(meta.meshBindings.map((b) => [String(b.meshNode).toLowerCase(), b]))
+
+  let mapped = 0
+  let totalMeshes = 0
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    totalMeshes += 1
+    const nodeKey = String(obj.name || obj.parent?.name || '').trim().toLowerCase()
+    if (!nodeKey) return
+    const binding = bindingByNode.get(nodeKey)
+    if (!binding) return
+    const instance = binding.instanceId ? instanceById.get(binding.instanceId) : undefined
+    const partId = binding.partId ?? instance?.partId
+    if (!partId) return
+    const part = partById.get(partId)
+    const partLabel = String(part?.displayName || part?.name || partId).trim()
+    obj.userData = {
+      ...obj.userData,
+      partId,
+      partName: partLabel,
+      instanceId: instance?.instanceId ?? null,
+      lockPartColor: true,
+      partColorHex: normalizeHexColor(instance?.colorOverride) ?? normalizeHexColor(part?.defaultColor) ?? null,
+    }
+    mapped += 1
+  })
+  return { mapped, totalMeshes }
+}
+
+async function tryLoadKompasMetaAuto(fileName: string): Promise<PartColorMeta | null> {
+  const rootDir = String((import.meta as any).env?.VITE_KOMPAS_ROOT_DIR ?? '').trim()
+  if (!rootDir) return null
+  try {
+    const url = `/api/kompas/metadata/auto?root_dir=${encodeURIComponent(rootDir)}`
+    const res = await fetchWithTimeout(url, { method: 'GET' }, STEP_METADATA_TIMEOUT_MS)
+    if (!res.ok) return null
+    const payload = await res.json()
+    if (payload?.mode === 'select' && Array.isArray(payload?.assemblies) && payload.assemblies.length > 0) {
+      const options = payload.assemblies
+        .slice(0, 12)
+        .map((a: any, i: number) => `${i + 1}. ${String(a?.name ?? a?.path ?? '')}`)
+        .join('\n')
+      const answer = window.prompt(`Найдено несколько сборок КОМПАС.\nВыберите номер:\n${options}`, '1')
+      const idx = Math.max(1, Number.parseInt(String(answer ?? '1'), 10) || 1) - 1
+      const selected = payload.assemblies[Math.min(idx, payload.assemblies.length - 1)]
+      const selectedPath = String(selected?.path ?? '').trim()
+      if (selectedPath) {
+        const one = await fetchWithTimeout(
+          `/api/kompas/metadata?assembly_path=${encodeURIComponent(selectedPath)}`,
+          { method: 'GET' },
+          STEP_METADATA_TIMEOUT_MS
+        )
+        if (one.ok) {
+          const onePayload = await one.json()
+          const parsedOne = parsePartColorMeta(onePayload)
+          if (parsedOne) return parsedOne
+        }
+      }
+    }
+    const parsed = parsePartColorMeta(payload)
+    if (!parsed) return null
+    logger.info('Viewer3D', `KOMPAS metadata подтянут для ${fileName}`)
+    return parsed
+  } catch (e) {
+    console.warn(`${LOG_PREFIX} kompas metadata auto недоступен:`, e)
+    return null
+  }
+}
+
+async function tryLoadKompasAssemblyMapAuto(fileName: string): Promise<any | null> {
+  const rootDir = String((import.meta as any).env?.VITE_KOMPAS_ROOT_DIR ?? '').trim()
+  if (!rootDir) return null
+  try {
+    const url = `/api/kompas/assembly-map/auto?root_dir=${encodeURIComponent(rootDir)}`
+    const res = await fetchWithTimeout(url, { method: 'GET' }, STEP_METADATA_TIMEOUT_MS)
+    if (!res.ok) return null
+    const payload = await res.json()
+    if (payload?.mode === 'select' && Array.isArray(payload?.assemblies) && payload.assemblies.length > 0) {
+      const options = payload.assemblies
+        .slice(0, 12)
+        .map((a: any, i: number) => `${i + 1}. ${String(a?.name ?? a?.path ?? '')}`)
+        .join('\n')
+      const answer = window.prompt(`Найдено несколько сборок КОМПАС (assembly-map).\nВыберите номер:\n${options}`, '1')
+      const idx = Math.max(1, Number.parseInt(String(answer ?? '1'), 10) || 1) - 1
+      const selected = payload.assemblies[Math.min(idx, payload.assemblies.length - 1)]
+      const selectedPath = String(selected?.path ?? '').trim()
+      if (selectedPath) {
+        const one = await fetchWithTimeout(
+          `/api/kompas/assembly-map?assembly_path=${encodeURIComponent(selectedPath)}`,
+          { method: 'GET' },
+          STEP_METADATA_TIMEOUT_MS
+        )
+        if (one.ok) {
+          const onePayload = await one.json()
+          return onePayload?.assemblyMap ?? null
+        }
+      }
+    }
+    return payload?.assemblyMap ?? null
+  } catch (e) {
+    console.warn(`${LOG_PREFIX} kompas assembly-map auto недоступен:`, e)
+    return null
+  }
+}
+
+async function tryLoadPartMetaByBaseName(baseName: string): Promise<PartColorMeta | null> {
+  if (!baseName) return null
+  const encoded = encodeURIComponent(baseName)
+  const candidates = [
+    `/${encoded}.meta.json`,
+    `/${encoded}.json`,
+    `/meta/${encoded}.meta.json`,
+    `/meta/${encoded}.json`,
+  ]
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { method: 'GET' })
+      if (!res.ok) continue
+      const parsed = parsePartColorMeta(await res.json())
+      if (parsed) {
+        logger.info('Viewer3D', `Найден meta.json: ${url}`)
+        return parsed
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null
+}
+
+function applyPartColorsFromMeta(root: THREE.Object3D, meta: PartColorMeta): { painted: number; skipped: number } {
+  const partById = new Map(meta.parts.map((p) => [p.partId, p]))
+  const instanceById = new Map(meta.instances.map((i) => [i.instanceId, i]))
+  const bindingByNode = new Map(meta.meshBindings.map((b) => [b.meshNode, b]))
+  let painted = 0
+  let skipped = 0
+
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const nodeName = String(obj.name || obj.parent?.name || '')
+    if (!nodeName) {
+      skipped += 1
+      return
+    }
+    const binding = bindingByNode.get(nodeName)
+    if (!binding) {
+      skipped += 1
+      return
+    }
+    const instance = binding.instanceId ? instanceById.get(binding.instanceId) : undefined
+    const partId = binding.partId ?? instance?.partId
+    const part = partId ? partById.get(partId) : undefined
+    const hex = normalizeHexColor(instance?.colorOverride) ?? normalizeHexColor(part?.defaultColor)
+    if (!hex) {
+      skipped += 1
+      return
+    }
+    const col = new THREE.Color(hex)
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m: THREE.Material) => {
+      if ('color' in m) {
+        const mm = m as THREE.Material & { color: THREE.Color; needsUpdate?: boolean }
+        mm.color.copy(col)
+        mm.needsUpdate = true
+      }
+    })
+    obj.userData = { ...obj.userData, lockPartColor: true, partColorHex: hex, partId: partId ?? null, instanceId: instance?.instanceId ?? null }
+    painted += 1
+  })
+  return { painted, skipped }
+}
+
+const SEGMENT_FALLBACK_PALETTE = [
+  '#6a8bc7', '#c7796a', '#6ac79a', '#c7b36a',
+  '#8d6ac7', '#6ab9c7', '#c76a9d', '#83c76a',
+  '#c78f6a', '#6a72c7', '#c76a6a', '#6ac7c0',
+]
+
+function hashStringToIndex(text: string, modulo: number): number {
+  let h = 0
+  for (let i = 0; i < text.length; i += 1) h = ((h << 5) - h + text.charCodeAt(i)) | 0
+  return Math.abs(h) % Math.max(1, modulo)
+}
+
+function collectMeshHexColors(root: THREE.Object3D): string[] {
+  const colors: string[] = []
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m: THREE.Material) => {
+      if ('color' in m) {
+        const c = (m as THREE.Material & { color: THREE.Color }).color
+        colors.push(`#${c.getHexString()}`)
+      }
+    })
+  })
+  return colors
+}
+
+function maybeAutoColorizeSegments(root: THREE.Object3D): { painted: number; skipped: number; enabled: boolean } {
+  if (!autoColorizeSegments.value || !preservePartColors.value) return { painted: 0, skipped: 0, enabled: false }
+  const existing = collectMeshHexColors(root)
+  const unique = new Set(existing.map((c) => c.toLowerCase()))
+  if (unique.size > 3) return { painted: 0, skipped: 0, enabled: false }
+  let painted = 0
+  let skipped = 0
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const key = String(obj.parent?.name || obj.name || `mesh_${painted + skipped}`)
+    const idx = hashStringToIndex(key, SEGMENT_FALLBACK_PALETTE.length)
+    const colorHex = SEGMENT_FALLBACK_PALETTE[idx]
+    const col = new THREE.Color(colorHex)
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    let hasColor = false
+    mats.forEach((m: THREE.Material) => {
+      if ('color' in m) {
+        hasColor = true
+        const mm = m as THREE.Material & { color: THREE.Color; needsUpdate?: boolean }
+        mm.color.copy(col)
+        mm.needsUpdate = true
+      }
+    })
+    if (!hasColor) {
+      skipped += 1
+      return
+    }
+    obj.userData = { ...obj.userData, lockPartColor: true, partColorHex: colorHex, autoSegmentColor: true }
+    painted += 1
+  })
+  return { painted, skipped, enabled: painted > 0 }
 }
 
 function cloneAsUnlitMaterial(mat: THREE.Material): THREE.Material {
@@ -367,12 +858,23 @@ function cloneAsUnlitMaterial(mat: THREE.Material): THREE.Material {
 
 function applySceneLightingForShadingMode() {
   const lit = shadingMode.value === 'lit'
-  if (ambientLight) ambientLight.intensity = lit ? 0.22 : 0.38
-  if (hemiLight) hemiLight.intensity = lit ? 0.32 : 0.45
-  if (keyLight) keyLight.intensity = lit ? 0.58 : 0.42
-  if (fillLightA) fillLightA.intensity = lit ? 0.12 : 0.3
-  if (fillLightB) fillLightB.intensity = lit ? 0.09 : 0.24
-  if (fillLightC) fillLightC.intensity = lit ? 0.07 : 0.2
+  const preset = lightPreset.value
+  const base =
+    preset === 'engineering'
+      ? { ambient: 0.2, hemi: 0.32, key: 1.28, fillA: 0.16, fillB: 0.12, fillC: 0.09, rimA: 0.42, rimB: 0.34, exposure: 1.24 }
+      : { ambient: 0.25, hemi: 0.38, key: 0.82, fillA: 0.24, fillB: 0.18, fillC: 0.13, rimA: 0.16, rimB: 0.12, exposure: 1.12 }
+  const tone = 0.78 + (tintBrightness.value - TINT_BRIGHTNESS_MIN) / (TINT_BRIGHTNESS_MAX - TINT_BRIGHTNESS_MIN) * 0.62
+  const toneSafe = Math.min(1.55, Math.max(0.7, tone))
+  const unl = lit ? 1 : 1.22
+  if (ambientLight) ambientLight.intensity = base.ambient * unl * toneSafe
+  if (hemiLight) hemiLight.intensity = base.hemi * unl * toneSafe
+  if (keyLight) keyLight.intensity = base.key * (lit ? 1 : 0.9) * toneSafe
+  if (fillLightA) fillLightA.intensity = base.fillA * unl * toneSafe
+  if (fillLightB) fillLightB.intensity = base.fillB * unl * toneSafe
+  if (fillLightC) fillLightC.intensity = base.fillC * unl * toneSafe
+  if (rimLightA) rimLightA.intensity = base.rimA * (lit ? 1 : 0.9) * toneSafe
+  if (rimLightB) rimLightB.intensity = base.rimB * (lit ? 1 : 0.9) * toneSafe
+  if (renderer) renderer.toneMappingExposure = base.exposure * (0.88 + toneSafe * 0.3)
   if (renderer) renderer.shadowMap.enabled = lit
 }
 
@@ -412,6 +914,251 @@ function onShadingModeChange(ev: Event) {
   const value = (ev.target as HTMLSelectElement).value
   shadingMode.value = value === 'unlit' ? 'unlit' : 'lit'
   applyShadingMode()
+}
+
+function onLightPresetChange(ev: Event) {
+  const value = (ev.target as HTMLSelectElement).value
+  lightPreset.value = value === 'soft' ? 'soft' : 'engineering'
+  applyShadingMode()
+}
+
+function onPreservePartColorsChange() {
+  applyShadingMode()
+}
+
+function onOverlayEnabledChange() {
+  updateOverlayVisuals()
+}
+
+function onOverlayOpacityInput(ev: Event) {
+  const val = Number((ev.target as HTMLInputElement).value)
+  if (!Number.isFinite(val)) return
+  overlayOpacity.value = clampOverlayOpacity(val)
+  updateOverlayVisuals()
+}
+
+function clampExplode(v: number): number {
+  return Math.max(EXPLODE_MIN, Math.min(EXPLODE_MAX, v))
+}
+
+function ensureExplodeCacheForModel(wrapper: THREE.Group) {
+  const worldBox = new THREE.Box3().setFromObject(wrapper)
+  const worldCenter = worldBox.getCenter(new THREE.Vector3())
+  const localCenter = wrapper.worldToLocal(worldCenter.clone())
+  wrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    if (!obj.userData.explodeBasePos) obj.userData.explodeBasePos = obj.position.clone()
+    if (!obj.userData.explodeDir) {
+      const meshWorldCenter = new THREE.Box3().setFromObject(obj).getCenter(new THREE.Vector3())
+      const meshLocalCenter = wrapper.worldToLocal(meshWorldCenter.clone())
+      const dir = meshLocalCenter.sub(localCenter)
+      if (dir.lengthSq() < 1e-8) dir.set(1, 0, 0)
+      dir.normalize()
+      obj.userData.explodeDir = dir
+    }
+  })
+}
+
+function applyExplodeForModel(wrapper: THREE.Group, amount: number) {
+  ensureExplodeCacheForModel(wrapper)
+  const box = new THREE.Box3().setFromObject(wrapper)
+  const diag = Math.max(1, box.getSize(new THREE.Vector3()).length())
+  const shift = (diag * 0.01) * (amount / 10)
+  wrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const base = obj.userData.explodeBasePos as THREE.Vector3 | undefined
+    const dir = obj.userData.explodeDir as THREE.Vector3 | undefined
+    if (!base || !dir) return
+    obj.position.copy(base).addScaledVector(dir, shift)
+    obj.updateMatrix()
+  })
+  wrapper.updateMatrixWorld(true)
+}
+
+function applyExplodeToAllModels() {
+  modelGroupsById.forEach((wrapper) => {
+    applyExplodeForModel(wrapper, explodeAmount.value)
+  })
+  scheduleSceneMetricsRecalc()
+}
+
+function onExplodeInput(ev: Event) {
+  const v = Number((ev.target as HTMLInputElement).value)
+  if (!Number.isFinite(v)) return
+  explodeAmount.value = clampExplode(v)
+  applyExplodeToAllModels()
+}
+
+function clampOverlayOpacity(v: number): number {
+  return Math.max(OVERLAY_OPACITY_MIN, Math.min(OVERLAY_OPACITY_MAX, v))
+}
+
+function extractMeshColorHex(mesh: THREE.Mesh): string {
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  const first = mats.find((m) => 'color' in m) as (THREE.Material & { color?: THREE.Color }) | undefined
+  return first?.color ? `#${first.color.getHexString()}` : '#6a8bc7'
+}
+
+function createOverlayMaterial(colorHex: string): THREE.MeshBasicMaterial {
+  return new THREE.MeshBasicMaterial({
+    color: new THREE.Color(colorHex),
+    transparent: true,
+    opacity: overlayOpacity.value,
+    depthTest: true,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -3,
+    polygonOffsetUnits: -3,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  })
+}
+
+const OVERLAY_MONO_PALETTE = [
+  '#7fa3cc', '#789ec7', '#7398c1', '#6d93bc',
+  '#678eb6', '#6189b1', '#5c84ab', '#567fa6',
+]
+
+function overlayMonochromeColorForMesh(obj: THREE.Mesh): string {
+  const key = String(obj.parent?.name || obj.name || obj.uuid)
+  const idx = hashStringToIndex(key, OVERLAY_MONO_PALETTE.length)
+  return OVERLAY_MONO_PALETTE[idx]
+}
+
+function updateOverlayVisuals() {
+  overlayGroup.visible = overlayEnabled.value
+  overlayGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m: THREE.Material) => {
+      const mm = m as THREE.Material & { opacity?: number; transparent?: boolean; depthWrite?: boolean; needsUpdate?: boolean }
+      if ('opacity' in mm) mm.opacity = overlayOpacity.value
+      if ('transparent' in mm) mm.transparent = true
+      if ('depthWrite' in mm) mm.depthWrite = false
+      mm.needsUpdate = true
+    })
+  })
+}
+
+function buildOverlayForModel(modelId: string, sourceWrapper: THREE.Group): THREE.Group {
+  const overlayWrapper = new THREE.Group()
+  overlayWrapper.userData = { modelId, overlayWrapper: true }
+  sourceWrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.geometry || !obj.material) return
+    const mesh = new THREE.Mesh(obj.geometry, createOverlayMaterial(overlayMonochromeColorForMesh(obj)))
+    mesh.matrixAutoUpdate = false
+    mesh.userData = { overlayMesh: true, sourceUuid: obj.uuid }
+    // Не участвует в хиттестах/измерениях.
+    mesh.raycast = () => {}
+    const local = sourceWrapper.worldToLocal(obj.getWorldPosition(new THREE.Vector3()))
+    const worldQuat = obj.getWorldQuaternion(new THREE.Quaternion())
+    const localQuat = sourceWrapper.getWorldQuaternion(new THREE.Quaternion()).invert().multiply(worldQuat)
+    const worldScale = obj.getWorldScale(new THREE.Vector3())
+    const sourceScale = sourceWrapper.getWorldScale(new THREE.Vector3())
+    mesh.position.copy(local)
+    mesh.quaternion.copy(localQuat)
+    mesh.scale.set(
+      sourceScale.x !== 0 ? worldScale.x / sourceScale.x : worldScale.x,
+      sourceScale.y !== 0 ? worldScale.y / sourceScale.y : worldScale.y,
+      sourceScale.z !== 0 ? worldScale.z / sourceScale.z : worldScale.z,
+    )
+    mesh.updateMatrix()
+    overlayWrapper.add(mesh)
+  })
+  overlayWrapper.position.copy(sourceWrapper.position)
+  overlayWrapper.quaternion.copy(sourceWrapper.quaternion)
+  overlayWrapper.scale.copy(sourceWrapper.scale)
+  overlayWrapper.updateMatrixWorld(true)
+  return overlayWrapper
+}
+
+function syncOverlayTransforms() {
+  overlaySourceByModelId.forEach((source, modelId) => {
+    const overlay = overlayGroupByModelId.get(modelId)
+    if (!overlay) return
+    overlay.position.copy(source.position)
+    overlay.quaternion.copy(source.quaternion)
+    overlay.scale.copy(source.scale)
+  })
+}
+
+function syncOverlayVisibilityForModel(modelId: string) {
+  const source = overlaySourceByModelId.get(modelId)
+  const overlay = overlayGroupByModelId.get(modelId)
+  if (!source || !overlay) return
+  const visByUuid = new Map<string, boolean>()
+  source.traverse((obj: THREE.Object3D) => {
+    visByUuid.set(obj.uuid, obj.visible)
+  })
+  overlay.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const sourceUuid = String(obj.userData?.sourceUuid ?? '')
+    if (!sourceUuid) return
+    const v = visByUuid.get(sourceUuid)
+    if (typeof v === 'boolean') obj.visible = v
+  })
+}
+
+function componentKey(modelId: string, objectId: string): string {
+  return `${modelId}:${objectId}`
+}
+
+function setHiddenOutlineForObject(modelId: string, obj: THREE.Object3D, hidden: boolean) {
+  const key = componentKey(modelId, obj.uuid)
+  const existing = hiddenOutlineByComponentId.get(key)
+  if (!hidden) {
+    if (existing) {
+      hiddenOutlineGroup.remove(existing)
+      existing.geometry.dispose()
+      ;(existing.material as THREE.Material).dispose()
+      hiddenOutlineByComponentId.delete(key)
+    }
+    return
+  }
+  if (existing) return
+  const box = new THREE.Box3().setFromObject(obj)
+  if (box.isEmpty()) return
+  const helper = new THREE.Box3Helper(box, 0x35d35a)
+  helper.userData = { hiddenComponentKey: key, modelId, objectId: obj.uuid }
+  hiddenOutlineByComponentId.set(key, helper)
+  hiddenOutlineGroup.add(helper)
+}
+
+function syncHiddenOutlinesForModel(modelId: string) {
+  const group = modelGroupsById.get(modelId)
+  if (!group) return
+  group.traverse((obj: THREE.Object3D) => {
+    if (obj === group || !(obj instanceof THREE.Mesh)) return
+    setHiddenOutlineForObject(modelId, obj, !obj.visible)
+  })
+}
+
+function ensureOverlayForModel(modelId: string, sourceWrapper: THREE.Group) {
+  const existing = overlayGroupByModelId.get(modelId)
+  if (existing) {
+    if (!overlayGroup.children.includes(existing)) overlayGroup.add(existing)
+    return
+  }
+  const overlayWrapper = buildOverlayForModel(modelId, sourceWrapper)
+  overlayGroupByModelId.set(modelId, overlayWrapper)
+  overlaySourceByModelId.set(modelId, sourceWrapper)
+  overlayGroup.add(overlayWrapper)
+}
+
+function removeOverlayForModel(modelId: string, dispose = false) {
+  const overlay = overlayGroupByModelId.get(modelId)
+  if (!overlay) return
+  overlayGroup.remove(overlay)
+  if (dispose) {
+    overlay.traverse((obj: THREE.Object3D) => {
+      if (obj instanceof THREE.Mesh && obj.material) {
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+        mats.forEach((m: THREE.Material) => m.dispose())
+      }
+    })
+    overlayGroupByModelId.delete(modelId)
+    overlaySourceByModelId.delete(modelId)
+  }
 }
 
 function onAutoNavLimitsChange() {
@@ -513,6 +1260,8 @@ function mateSymmetricDeltaVector(
 function refreshAfterAssemblyMove() {
   if (!meshGroup?.children.length) return
   meshGroup.updateMatrixWorld(true)
+  refreshSelectedMeasurementAfterTransform()
+  rebuildSavedMeasurementsVisuals()
   const box = new THREE.Box3().setFromObject(meshGroup)
   updateGroundGrid(box)
   updateSceneLighting(box)
@@ -567,6 +1316,13 @@ function removeAssemblyMate(id: string) {
   else refreshAllAssemblyVisuals()
 }
 
+function clearAllAssemblyMates() {
+  assemblyMates.value = []
+  assemblyStatus.value = ''
+  clearAssemblyPickStateAfterMateApply()
+  stripStaleAssemblyFaceTriangles()
+}
+
 function startAssemblyPlanePick(target: Exclude<AssemblyPickTarget, null>) {
   selectedAssemblyMateId.value = null
   assemblyPickTarget.value = target
@@ -580,6 +1336,129 @@ function startAssemblyPlanePick(target: Exclude<AssemblyPickTarget, null>) {
   }
   assemblyStatus.value = hints[target]
   refreshAllAssemblyVisuals()
+}
+
+function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
+  clearMeasurements()
+  cadLinearPickTarget.value = target
+  const hints: Record<Exclude<CadLinearPickTarget, null>, string> = {
+    plane1: 'Линейный размер: выберите 1-ю измеряемую плоскость.',
+    plane2: 'Линейный размер: выберите 2-ю измеряемую плоскость.',
+    display: 'Линейный размер: выберите плоскость отображения размера.',
+  }
+  cadLinearStatus.value = hints[target]
+}
+
+function clearCadLinearPicks() {
+  disposePlanePreviewGeometry(cadLinearPlane1.value ?? undefined)
+  disposePlanePreviewGeometry(cadLinearPlane2.value ?? undefined)
+  disposePlanePreviewGeometry(cadLinearDisplayPlane.value ?? undefined)
+  cadLinearPlane1.value = null
+  cadLinearPlane2.value = null
+  cadLinearDisplayPlane.value = null
+  cadLinearPickTarget.value = null
+}
+
+function startNewCadLinearMeasurement() {
+  clearCadLinearPicks()
+  cadLinearStatus.value = 'Новый линейный размер: выберите 1-ю измеряемую плоскость.'
+  startCadLinearPlanePick('plane1')
+}
+
+function toggleLinearMeasurementRow(id: string) {
+  expandedLinearMeasurementIds.value = expandedLinearMeasurementIds.value.includes(id)
+    ? expandedLinearMeasurementIds.value.filter((x) => x !== id)
+    : [...expandedLinearMeasurementIds.value, id]
+}
+
+function saveCadLinearFromPickedPlanes() {
+  const p1 = cadLinearPlane1.value
+  const p2 = cadLinearPlane2.value
+  const pd = cadLinearDisplayPlane.value
+  if (!p1 || !p2 || !pd) return
+  const n1 = p1.normal.clone().normalize()
+  const n2 = p2.normal.clone().normalize()
+  if (Math.abs(n1.dot(n2)) < 0.92) {
+    cadLinearStatus.value = 'Измеряемые плоскости должны быть параллельны.'
+    return
+  }
+  saveCadLinearMeasurement(
+    p1.point.clone(),
+    p2.point.clone(),
+    p1.modelId,
+    p2.modelId,
+    vecToSaved(p1.localPoint),
+    vecToSaved(p2.localPoint),
+    n1,
+    n2,
+    pd.modelId,
+    vecToSaved(pd.localPoint),
+    vecToSaved(pd.normal),
+  )
+  cadLinearStatus.value = 'Линейный размер сохранён. Плоскости сохранены, можно ставить следующий размер.'
+}
+
+function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
+  const wrapper = findWrapperGroup(hit.object)
+  const modelId = String(wrapper?.userData?.modelId ?? '')
+  if (!modelId || !hit.face) {
+    cadLinearStatus.value = 'Не удалось определить грань для линейного размера.'
+    return
+  }
+  const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
+  const localPoint = wrapper.worldToLocal(hit.point.clone())
+  const tri = buildWorldFaceTriangleFromHit(hit)
+  const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
+  if (tri) pick.previewGeometry = tri
+  const t = cadLinearPickTarget.value
+  const target =
+    t
+    ?? (!cadLinearPlane1.value ? 'plane1' : !cadLinearPlane2.value ? 'plane2' : 'display')
+  if (target === 'plane1') {
+    disposePlanePreviewGeometry(cadLinearPlane1.value ?? undefined)
+    cadLinearPlane1.value = pick
+    cadLinearStatus.value = 'Выбрана 1-я измеряемая плоскость.'
+  } else if (target === 'plane2') {
+    disposePlanePreviewGeometry(cadLinearPlane2.value ?? undefined)
+    cadLinearPlane2.value = pick
+    cadLinearStatus.value = 'Выбрана 2-я измеряемая плоскость.'
+  } else {
+    disposePlanePreviewGeometry(cadLinearDisplayPlane.value ?? undefined)
+    cadLinearDisplayPlane.value = pick
+    cadLinearStatus.value = 'Выбрана плоскость отображения размера.'
+  }
+  cadLinearPickTarget.value = null
+  if (cadLinearPlane1.value && cadLinearPlane2.value && cadLinearDisplayPlane.value) {
+    saveCadLinearFromPickedPlanes()
+  }
+}
+
+function inferAutoAssemblyPickTarget(modelId: string): Exclude<AssemblyPickTarget, null> | null {
+  const srcId = assemblySourceModelId.value
+  const tgtId = assemblyTargetModelId.value
+  if (!srcId || !tgtId) return null
+  if (assemblyMateType.value === 'symmetric') {
+    if (modelId === tgtId) {
+      if (!assemblySymBase1.value) return 'symBase1'
+      if (!assemblySymBase2.value) return 'symBase2'
+      return 'symBase1'
+    }
+    if (modelId === srcId) {
+      if (!assemblySymPart1.value) return 'symPart1'
+      if (!assemblySymPart2.value) return 'symPart2'
+      return 'symPart1'
+    }
+    return null
+  }
+  if (modelId === srcId) {
+    if (!assemblySourcePlane.value) return 'source'
+    return 'source'
+  }
+  if (modelId === tgtId) {
+    if (!assemblyTargetPlane.value) return 'target'
+    return 'target'
+  }
+  return null
 }
 
 function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
@@ -602,6 +1481,10 @@ function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
   const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
   if (tri) pick.previewGeometry = tri
   const t = assemblyPickTarget.value
+  if (!t) {
+    assemblyStatus.value = 'Выберите поле плоскости в панели сборки или кликните по грани (автовыбор).'
+    return
+  }
   const srcId = assemblySourceModelId.value
   const tgtId = assemblyTargetModelId.value
   if (t === 'source' || t === 'symPart1' || t === 'symPart2') {
@@ -775,12 +1658,14 @@ function onTintBrightnessInput(ev: Event) {
   if (!Number.isFinite(val)) return
   tintBrightness.value = clampTintBrightness(val)
   applyModelTint()
+  applySceneLightingForShadingMode()
 }
 
 function onTintBrightnessWheel(ev: WheelEvent) {
   const delta = ev.deltaY > 0 ? -TINT_BRIGHTNESS_STEP : TINT_BRIGHTNESS_STEP
   tintBrightness.value = clampTintBrightness(tintBrightness.value + delta)
   applyModelTint()
+  applySceneLightingForShadingMode()
 }
 
 function calculateSceneMetrics(): { areaMm2: number; volumeMm3: number; triangles: number } {
@@ -859,6 +1744,20 @@ const sceneMetricsText = computed(() => {
   const volumeL = sceneVolumeMm3.value / 1_000_000
   return `S: ${areaM2.toFixed(3)} м² | V: ${volumeL.toFixed(3)} л | △ ${sceneTriangles.value.toLocaleString('ru-RU')}`
 })
+const dimArrowSizeMm = ref(8)
+const dimLineOffsetMm = ref(18)
+const dimFontSizeMm = ref(12)
+const expandedLinearMeasurementIds = ref<string[]>([])
+let draggedMeasurementOffset:
+  | {
+      id: string
+      startX: number
+      startY: number
+      startOffset: number
+      axisX: number
+      axisY: number
+    }
+  | null = null
 
 function vecToSaved(v: THREE.Vector3): SavedVec3 {
   return { x: v.x, y: v.y, z: v.z }
@@ -866,6 +1765,39 @@ function vecToSaved(v: THREE.Vector3): SavedVec3 {
 
 function savedToVec(v: SavedVec3): THREE.Vector3 {
   return new THREE.Vector3(v.x, v.y, v.z)
+}
+
+function worldNormalToLocal(group: THREE.Group, n: THREE.Vector3): THREE.Vector3 {
+  const inv = group.matrixWorld.clone().invert()
+  return n.clone().transformDirection(inv).normalize()
+}
+
+function localNormalToWorld(group: THREE.Group | undefined, n: SavedVec3 | null | undefined): THREE.Vector3 | null {
+  if (!group || !n) return null
+  return savedToVec(n).transformDirection(group.matrixWorld).normalize()
+}
+
+function resolveSavedPointWorld(modelId: string | null | undefined, local: SavedVec3 | null | undefined, worldFallback: SavedVec3): THREE.Vector3 {
+  if (modelId && local) {
+    const g = modelGroupsById.get(modelId)
+    if (g) return g.localToWorld(savedToVec(local))
+  }
+  return savedToVec(worldFallback)
+}
+
+function projectPerpendicularByNormals(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  nA: THREE.Vector3 | null,
+  nB: THREE.Vector3 | null,
+): { basePoint: THREE.Vector3; otherPoint: THREE.Vector3; projected: THREE.Vector3; distanceMm: number } | null {
+  if (!nA && !nB) return null
+  const baseNormal = (nB ?? nA)!.clone().normalize()
+  const basePoint = (nB ? b : a).clone()
+  const otherPoint = (nB ? a : b).clone()
+  const distSigned = otherPoint.clone().sub(basePoint).dot(baseNormal)
+  const projected = otherPoint.clone().sub(baseNormal.clone().multiplyScalar(distSigned))
+  return { basePoint, otherPoint, projected, distanceMm: Math.abs(distSigned) }
 }
 
 function saveDistanceMeasurement() {
@@ -878,6 +1810,7 @@ function saveDistanceMeasurement() {
   const trianglePerpMm = bPrime.distanceTo(b)
   const nA = measurementPointNormals[0] ?? null
   const nB = measurementPointNormals[1] ?? null
+  const perpByPlane = projectPerpendicularByNormals(a, b, nA, nB)
   let surfacePerpMm: number | null = null
   if (nA || nB) {
     const baseNormal = (nB || nA)!.clone().normalize()
@@ -890,7 +1823,7 @@ function saveDistanceMeasurement() {
     id,
     type: 'distance',
     createdAt: new Date().toLocaleTimeString('ru-RU'),
-    lengthMm: a.distanceTo(b),
+    lengthMm: perpByPlane ? perpByPlane.distanceMm : a.distanceTo(b),
     parallelMm,
     trianglePerpMm,
     surfacePerpMm,
@@ -898,28 +1831,510 @@ function saveDistanceMeasurement() {
     p2: vecToSaved(b),
     n1: measurementPointNormals[0] ? vecToSaved(measurementPointNormals[0]!) : null,
     n2: measurementPointNormals[1] ? vecToSaved(measurementPointNormals[1]!) : null,
+    modelId1: measurementPointModelIds[0] ?? null,
+    modelId2: measurementPointModelIds[1] ?? null,
+    p1Local: measurementPointLocals[0] ?? null,
+    p2Local: measurementPointLocals[1] ?? null,
+    n1Local: measurementPointNormalLocals[0] ?? null,
+    n2Local: measurementPointNormalLocals[1] ?? null,
   }
   measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
   selectedMeasurementId.value = row.id
+  rebuildSavedMeasurementsVisuals()
 }
 
-function restoreMeasurement(row: SavedMeasurement) {
-  if (row.type !== 'distance') return
-  measureType = 'distance'
+function saveRadiusMeasurement(center: THREE.Vector3, radius: number, normal: THREE.Vector3, modelId: string | null, localCenter: SavedVec3 | null, localNormal: SavedVec3 | null) {
+  const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const row: SavedMeasurement = {
+    id,
+    type: 'radius',
+    createdAt: new Date().toLocaleTimeString('ru-RU'),
+    lengthMm: radius,
+    parallelMm: 0,
+    trianglePerpMm: 0,
+    surfacePerpMm: null,
+    p1: vecToSaved(center),
+    p2: vecToSaved(center),
+    n1: vecToSaved(normal),
+    n2: null,
+    centerModelId: modelId,
+    centerLocal: localCenter,
+    centerNormalLocal: localNormal,
+    radiusMmValue: radius,
+  }
+  measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+  selectedMeasurementId.value = row.id
+  rebuildSavedMeasurementsVisuals()
+}
+
+function saveDiameterMeasurement(
+  firstCenter: THREE.Vector3,
+  firstRadius: number,
+  firstNormal: THREE.Vector3,
+  firstModelId: string | null,
+  firstCenterLocal: SavedVec3 | null,
+  firstNormalLocal: SavedVec3 | null,
+  secondCenter?: THREE.Vector3,
+  secondModelId?: string | null,
+  secondCenterLocal?: SavedVec3 | null,
+) {
+  const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const p2 = secondCenter ?? firstCenter
+  const row: SavedMeasurement = {
+    id,
+    type: 'diameter',
+    createdAt: new Date().toLocaleTimeString('ru-RU'),
+    lengthMm: firstRadius * 2,
+    parallelMm: secondCenter ? firstCenter.distanceTo(secondCenter) : 0,
+    trianglePerpMm: 0,
+    surfacePerpMm: null,
+    p1: vecToSaved(firstCenter),
+    p2: vecToSaved(p2),
+    n1: vecToSaved(firstNormal),
+    n2: null,
+    centerModelId: firstModelId,
+    centerLocal: firstCenterLocal,
+    centerNormalLocal: firstNormalLocal,
+    radiusMmValue: firstRadius,
+    secondCenterModelId: secondModelId ?? null,
+    secondCenterLocal: secondCenterLocal ?? null,
+  }
+  measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+  selectedMeasurementId.value = row.id
+  rebuildSavedMeasurementsVisuals()
+}
+
+function saveArcMeasurement(path: THREE.Vector3[], length: number, modelId: string | null, pathLocal: SavedVec3[] | null) {
+  const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const row: SavedMeasurement = {
+    id,
+    type: 'arc',
+    createdAt: new Date().toLocaleTimeString('ru-RU'),
+    lengthMm: length,
+    parallelMm: 0,
+    trianglePerpMm: 0,
+    surfacePerpMm: null,
+    p1: path.length ? vecToSaved(path[0]) : { x: 0, y: 0, z: 0 },
+    p2: path.length ? vecToSaved(path[path.length - 1]) : { x: 0, y: 0, z: 0 },
+    n1: null,
+    n2: null,
+    arcPath: path.map((p) => vecToSaved(p)),
+    arcModelId: modelId,
+    arcPathLocal: pathLocal,
+    displayValue: length.toFixed(2),
+  }
+  measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+  selectedMeasurementId.value = row.id
+  rebuildSavedMeasurementsVisuals()
+}
+
+function saveCadLinearMeasurement(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  modelId1: string | null,
+  modelId2: string | null,
+  p1Local: SavedVec3 | null,
+  p2Local: SavedVec3 | null,
+  n1: THREE.Vector3 | null,
+  n2: THREE.Vector3 | null,
+  outputPlaneModelId: string | null,
+  outputPlaneLocalPoint: SavedVec3 | null,
+  outputPlaneLocalNormal: SavedVec3 | null,
+) {
+  let planePoint = outputPlaneLocalPoint ? savedToVec(outputPlaneLocalPoint) : (cadLinearPlanePoint ?? a.clone())
+  let planeNormal = outputPlaneLocalNormal ? savedToVec(outputPlaneLocalNormal).normalize() : (cadLinearPlaneNormal ?? new THREE.Vector3(0, 1, 0))
+  if (outputPlaneModelId) {
+    const g = modelGroupsById.get(outputPlaneModelId)
+    if (g) {
+      planePoint = g.localToWorld(planePoint)
+      planeNormal = localNormalToWorld(g, outputPlaneLocalNormal) ?? planeNormal
+    }
+  }
+  const n = planeNormal.clone().normalize()
+  const proj = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
+  const aProj = proj(a)
+  const bProj = proj(b)
+  const perpByPlane = projectPerpendicularByNormals(
+    a,
+    b,
+    n1,
+    n2,
+  )
+  const len = perpByPlane ? perpByPlane.distanceMm : aProj.distanceTo(bProj)
+  const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const row: SavedMeasurement = {
+    id,
+    type: 'cad-linear',
+    createdAt: new Date().toLocaleTimeString('ru-RU'),
+    lengthMm: len,
+    parallelMm: aProj.distanceTo(bProj),
+    trianglePerpMm: Math.abs(a.clone().sub(aProj).dot(n) - b.clone().sub(bProj).dot(n)),
+    surfacePerpMm: null,
+    p1: vecToSaved(a),
+    p2: vecToSaved(b),
+    n1: n1 ? vecToSaved(n1) : null,
+    n2: n2 ? vecToSaved(n2) : null,
+    modelId1,
+    modelId2,
+    p1Local,
+    p2Local,
+    displayValue: len.toFixed(2),
+    outputPlaneModelId,
+    outputPlaneLocalPoint,
+    outputPlaneLocalNormal,
+  }
+  measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+  selectedMeasurementId.value = row.id
+  rebuildSavedMeasurementsVisuals()
+}
+
+function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
   measureModeRef.value = true
   clearMeasurements()
-  measurementPoints = [savedToVec(row.p1), savedToVec(row.p2)]
-  measurementPointNormals = [row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null]
+  if (row.type === 'radius') {
+    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
+    const normal = row.centerModelId
+      ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+      : (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+    radiusOrDiameterResult = {
+      center,
+      radius: row.radiusMmValue ?? row.lengthMm,
+      normal,
+      isDiameter: false,
+    }
+    measureType = 'radius'
+    updateMeasurementGraphics()
+    selectedMeasurementId.value = row.id
+    if (focusCamera) {
+      controls.target.copy(center)
+      controls.update()
+    }
+    rebuildSavedMeasurementsVisuals()
+    return
+  }
+  if (row.type === 'diameter') {
+    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
+    const normal = row.centerModelId
+      ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+      : (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+    firstClickHole = {
+      center: center.clone(),
+      radius: (row.radiusMmValue ?? row.lengthMm * 0.5),
+      normal: normal.clone(),
+    }
+    radiusOrDiameterResult = {
+      center: center.clone(),
+      radius: row.radiusMmValue ?? row.lengthMm * 0.5,
+      normal: normal.clone(),
+      isDiameter: true,
+    }
+    if (row.secondCenterLocal || row.secondCenterModelId || row.p2) {
+      const second = resolveSavedPointWorld(row.secondCenterModelId, row.secondCenterLocal, row.p2)
+      secondHoleResult = { center: second.clone(), radius: row.radiusMmValue ?? row.lengthMm * 0.5, normal: normal.clone() }
+      measurementPoints = [center.clone(), second.clone()]
+      measurementPointNormals = [null, null]
+    }
+    measureType = 'diameter'
+    updateMeasurementGraphics()
+    selectedMeasurementId.value = row.id
+    if (focusCamera) {
+      controls.target.copy(center)
+      controls.update()
+    }
+    rebuildSavedMeasurementsVisuals()
+    return
+  }
+  if (row.type === 'arc') {
+    let path: THREE.Vector3[] = []
+    if (row.arcModelId && row.arcPathLocal?.length) {
+      const g = modelGroupsById.get(row.arcModelId)
+      if (g) path = row.arcPathLocal.map((p) => g.localToWorld(savedToVec(p)))
+    }
+    if (path.length === 0 && row.arcPath?.length) path = row.arcPath.map((p) => savedToVec(p))
+    if (path.length >= 2) {
+      arcResult = { path, length: row.lengthMm }
+      measureType = 'arc'
+      updateMeasurementGraphics()
+      selectedMeasurementId.value = row.id
+      if (focusCamera) {
+        controls.target.copy(path[Math.floor(path.length * 0.5)])
+        controls.update()
+      }
+      rebuildSavedMeasurementsVisuals()
+    }
+    return
+  }
+  if (row.type === 'cad-linear') {
+    const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
+    const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+    measurementPoints = [a, b]
+    measurementPointNormals = [null, null]
+    if (row.outputPlaneModelId && row.outputPlaneLocalPoint && row.outputPlaneLocalNormal) {
+      const g = modelGroupsById.get(row.outputPlaneModelId)
+      if (g) {
+        cadLinearPlanePoint = g.localToWorld(savedToVec(row.outputPlaneLocalPoint))
+        cadLinearPlaneNormal = localNormalToWorld(g, row.outputPlaneLocalNormal)
+      }
+    }
+    measureType = 'cad-linear'
+    selectedMeasurementId.value = row.id
+    if (focusCamera) {
+      controls.target.copy(a.clone().add(b).multiplyScalar(0.5))
+      controls.update()
+    }
+    rebuildSavedMeasurementsVisuals()
+    return
+  }
+  if (row.type !== 'distance') return
+  measureType = 'distance'
+  measurementPoints = [
+    resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1),
+    resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2),
+  ]
+  measurementPointNormals = [
+    row.modelId1 && row.n1Local
+      ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local)
+      : (row.n1 ? savedToVec(row.n1) : null),
+    row.modelId2 && row.n2Local
+      ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local)
+      : (row.n2 ? savedToVec(row.n2) : null),
+  ]
   updateMeasurementGraphics()
   selectedMeasurementId.value = row.id
-  const mid = measurementPoints[0].clone().add(measurementPoints[1]).multiplyScalar(0.5)
-  controls.target.copy(mid)
-  controls.update()
+  if (focusCamera) {
+    const mid = measurementPoints[0].clone().add(measurementPoints[1]).multiplyScalar(0.5)
+    controls.target.copy(mid)
+    controls.update()
+  }
+  rebuildSavedMeasurementsVisuals()
 }
 
 function clearMeasurementHistory() {
   measurementHistory.value = []
   selectedMeasurementId.value = null
+  rebuildSavedMeasurementsVisuals()
+}
+
+function refreshSelectedMeasurementAfterTransform() {
+  if (!selectedMeasurementId.value) return
+  const row = measurementHistory.value.find((m) => m.id === selectedMeasurementId.value)
+  if (!row) return
+  restoreMeasurement(row, false)
+  rebuildSavedMeasurementsVisuals()
+}
+
+function clearSavedMeasurementVisuals() {
+  if (!savedMeasurementsGroup) return
+  while (savedMeasurementsGroup.children.length > 0) {
+    const c = savedMeasurementsGroup.children[0]
+    savedMeasurementsGroup.remove(c)
+    if ('geometry' in c && c.geometry) c.geometry.dispose()
+    if ('material' in c && c.material) {
+      const m = c.material as THREE.Material | THREE.Material[]
+      if (Array.isArray(m)) m.forEach((x) => x.dispose())
+      else m.dispose()
+    }
+    const sprite = c as THREE.Sprite
+    if (sprite.material && 'map' in sprite.material) {
+      const map = (sprite.material as THREE.SpriteMaterial).map
+      map?.dispose()
+    }
+  }
+}
+
+function createMeasurementTextSprite(text: string, color = '#eaf2ff'): THREE.Sprite {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')!
+  const fontSize = 32
+  ctx.font = `600 ${fontSize}px Arial`
+  const w = Math.max(64, Math.ceil(ctx.measureText(text).width + 24))
+  const h = 52
+  canvas.width = w
+  canvas.height = h
+  ctx.font = `600 ${fontSize}px Arial`
+  ctx.fillStyle = 'rgba(20,28,44,0.84)'
+  ctx.fillRect(0, 0, w, h)
+  ctx.strokeStyle = 'rgba(130,160,220,0.85)'
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
+  ctx.fillStyle = color
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(text, w / 2, h / 2 + 1)
+  const tex = new THREE.CanvasTexture(canvas)
+  tex.minFilter = THREE.LinearFilter
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: true })
+  const sprite = new THREE.Sprite(mat)
+  const scale = Math.max(8, dimFontSizeMm.value)
+  sprite.scale.set(scale * 1.85, scale, 1)
+  return sprite
+}
+
+function adaptiveMeasurementScale(worldPoint: THREE.Vector3): number {
+  if (!camera) return 1
+  const d = camera.position.distanceTo(worldPoint)
+  return Math.max(0.7, Math.min(3.2, d / 900))
+}
+
+function orientOffsetDirForScreen(dir: THREE.Vector3, anchor: THREE.Vector3): THREE.Vector3 {
+  if (!camera) return dir
+  const p = anchor.clone().project(camera)
+  const q = anchor.clone().add(dir).project(camera)
+  // Положительный вынос всегда в "экранный верх", чтобы drag не инвертировался.
+  return q.y >= p.y ? dir : dir.clone().negate()
+}
+
+function normalizeSignedOffset(offset: number): number {
+  const sign = Math.sign(offset) || 1
+  return sign * Math.max(2, Math.abs(offset))
+}
+
+function addLine(group: THREE.Group, a: THREE.Vector3, b: THREE.Vector3, color = 0x7fc2ff, measurementId?: string): void {
+  const g = new THREE.BufferGeometry().setFromPoints([a, b])
+  const m = new THREE.LineBasicMaterial({ color })
+  const line = new THREE.Line(g, m)
+  if (measurementId) line.userData.measurementId = measurementId
+  group.add(line)
+}
+
+function addArrowHead(group: THREE.Group, tip: THREE.Vector3, dirToInside: THREE.Vector3, color = 0x7fc2ff, size = 4, measurementId?: string): void {
+  const u = dirToInside.clone().normalize()
+  const aux = Math.abs(u.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+  const v = new THREE.Vector3().crossVectors(u, aux).normalize()
+  const b = tip.clone().add(u.clone().multiplyScalar(size))
+  addLine(group, tip, b.clone().add(v.clone().multiplyScalar(size * 0.45)), color, measurementId)
+  addLine(group, tip, b.clone().add(v.clone().multiplyScalar(-size * 0.45)), color, measurementId)
+}
+
+function rebuildSavedMeasurementsVisuals() {
+  if (!savedMeasurementsGroup) return
+  clearSavedMeasurementVisuals()
+  for (const row of measurementHistory.value) {
+    if (row.type === 'distance') {
+      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
+      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+      const baseNormal =
+        (row.modelId2 && row.n2Local ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local) : null)
+        ?? (row.modelId1 && row.n1Local ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local) : null)
+        ?? (row.n2 ? savedToVec(row.n2) : (row.n1 ? savedToVec(row.n1) : null))
+      const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
+      const srcA = strict ? strict.projected : a
+      const srcB = strict ? strict.otherPoint : b
+      const dir = srcB.clone().sub(srcA).normalize()
+      const n = (baseNormal ?? new THREE.Vector3(0, 1, 0)).clone().normalize()
+      let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+      if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+      offsetDir = orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+      const offset = normalizeSignedOffset(row.lineOffsetMm ?? dimLineOffsetMm.value)
+      const pA = srcA.clone().add(offsetDir.clone().multiplyScalar(offset))
+      const pB = srcB.clone().add(offsetDir.clone().multiplyScalar(offset))
+      const scale = adaptiveMeasurementScale(pA.clone().add(pB).multiplyScalar(0.5))
+      const arrow = Math.max(3, dimArrowSizeMm.value * scale)
+      addLine(savedMeasurementsGroup, srcA, pA, 0x66ccff, row.id)
+      addLine(savedMeasurementsGroup, srcB, pB, 0x66ccff, row.id)
+      addLine(savedMeasurementsGroup, pA, pB, 0x66ccff, row.id)
+      addArrowHead(savedMeasurementsGroup, pA, pB.clone().sub(pA), 0x66ccff, arrow, row.id)
+      addArrowHead(savedMeasurementsGroup, pB, pA.clone().sub(pB), 0x66ccff, arrow, row.id)
+      const mid = pA.clone().add(pB).multiplyScalar(0.5)
+      const s = createMeasurementTextSprite(measurementValueText(row))
+      s.scale.multiplyScalar(scale)
+      s.userData.measurementId = row.id
+      s.position.copy(mid)
+      savedMeasurementsGroup.add(s)
+      continue
+    }
+    if (row.type === 'radius' || row.type === 'diameter') {
+      const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
+      const radius = row.radiusMmValue ?? (row.type === 'diameter' ? row.lengthMm * 0.5 : row.lengthMm)
+      const normal =
+        (row.centerModelId ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) : null)
+        ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+      const u = new THREE.Vector3().crossVectors(normal, new THREE.Vector3(1, 0, 0)).normalize()
+      if (u.lengthSq() < 0.01) u.crossVectors(normal, new THREE.Vector3(0, 1, 0)).normalize()
+      const rim = center.clone().add(u.clone().multiplyScalar(radius))
+      const color = row.type === 'diameter' ? 0xffb35f : 0x73e6a6
+      const scale = adaptiveMeasurementScale(center)
+      const arrow = Math.max(3, dimArrowSizeMm.value * scale)
+      addLine(savedMeasurementsGroup, center, rim, color, row.id)
+      addArrowHead(savedMeasurementsGroup, rim, center.clone().sub(rim), color, arrow, row.id)
+      if (row.type === 'diameter') {
+        const rim2 = center.clone().add(u.clone().multiplyScalar(-radius))
+        addLine(savedMeasurementsGroup, rim, rim2, color, row.id)
+        addArrowHead(savedMeasurementsGroup, rim, rim2.clone().sub(rim), color, arrow, row.id)
+        addArrowHead(savedMeasurementsGroup, rim2, rim.clone().sub(rim2), color, arrow, row.id)
+      }
+      const t = createMeasurementTextSprite(row.type === 'diameter' ? `⌀${measurementValueText(row)}` : `R${measurementValueText(row)}`)
+      t.scale.multiplyScalar(scale)
+      t.userData.measurementId = row.id
+      t.position.copy(center.clone().add(u.clone().multiplyScalar(radius * 0.55)))
+      savedMeasurementsGroup.add(t)
+      continue
+    }
+    if (row.type === 'arc') {
+      let path: THREE.Vector3[] = []
+      if (row.arcModelId && row.arcPathLocal?.length) {
+        const g = modelGroupsById.get(row.arcModelId)
+        if (g) path = row.arcPathLocal.map((p) => g.localToWorld(savedToVec(p)))
+      }
+      if (path.length === 0 && row.arcPath?.length) path = row.arcPath.map((p) => savedToVec(p))
+      if (path.length >= 2) {
+        const geom = new THREE.BufferGeometry().setFromPoints(path)
+        const arcLine = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xffaa55 }))
+        arcLine.userData.measurementId = row.id
+        savedMeasurementsGroup.add(arcLine)
+        const p0 = path[0]
+        const p1 = path[path.length - 1]
+        const scale = adaptiveMeasurementScale(path[Math.floor(path.length * 0.5)])
+        const arrow = Math.max(3, dimArrowSizeMm.value * scale)
+        addArrowHead(savedMeasurementsGroup, p0, path[1].clone().sub(p0), 0xffaa55, arrow, row.id)
+        addArrowHead(savedMeasurementsGroup, p1, path[path.length - 2].clone().sub(p1), 0xffaa55, arrow, row.id)
+        const mid = path[Math.floor(path.length * 0.5)].clone()
+        const t = createMeasurementTextSprite(`⌒${measurementValueText(row)}`)
+        t.scale.multiplyScalar(scale)
+        t.userData.measurementId = row.id
+        t.position.copy(mid)
+        savedMeasurementsGroup.add(t)
+      }
+      continue
+    }
+    if (row.type === 'cad-linear') {
+      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
+      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+      let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
+      let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
+      if (row.outputPlaneModelId) {
+        const g = modelGroupsById.get(row.outputPlaneModelId)
+        if (g) {
+          planePoint = g.localToWorld(planePoint)
+          planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
+        }
+      }
+      const n = planeNormal.clone().normalize()
+      const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
+      const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
+      const srcA = strict ? strict.projected : project(a)
+      const srcB = strict ? strict.otherPoint : project(b)
+      const dir = srcB.clone().sub(srcA).normalize()
+      let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+      if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+      offsetDir = orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+      const off = normalizeSignedOffset(row.lineOffsetMm ?? dimLineOffsetMm.value)
+      const aProj = srcA.clone().add(offsetDir.clone().multiplyScalar(off))
+      const bProj = srcB.clone().add(offsetDir.clone().multiplyScalar(off))
+      const scale = adaptiveMeasurementScale(aProj.clone().add(bProj).multiplyScalar(0.5))
+      const arrow = Math.max(3, dimArrowSizeMm.value * scale)
+      addLine(savedMeasurementsGroup, srcA, aProj, 0x8fd2ff, row.id)
+      addLine(savedMeasurementsGroup, srcB, bProj, 0x8fd2ff, row.id)
+      addLine(savedMeasurementsGroup, aProj, bProj, 0x8fd2ff, row.id)
+      addArrowHead(savedMeasurementsGroup, aProj, bProj.clone().sub(aProj), 0x8fd2ff, arrow, row.id)
+      addArrowHead(savedMeasurementsGroup, bProj, aProj.clone().sub(bProj), 0x8fd2ff, arrow, row.id)
+      const mid = aProj.clone().add(bProj).multiplyScalar(0.5)
+      const t = createMeasurementTextSprite(measurementValueText(row))
+      t.scale.multiplyScalar(scale * 2)
+      t.userData.measurementId = row.id
+      t.position.copy(mid)
+      savedMeasurementsGroup.add(t)
+    }
+  }
 }
 
 function removeMeasurement(id: string) {
@@ -927,6 +2342,16 @@ function removeMeasurement(id: string) {
   if (selectedMeasurementId.value === id) {
     selectedMeasurementId.value = null
   }
+  rebuildSavedMeasurementsVisuals()
+}
+
+function measurementTypeLabel(m: SavedMeasurement): string {
+  if (m.type === 'cad-linear') return 'Лин.'
+  return 'Изм.'
+}
+
+function measurementValueText(m: SavedMeasurement): string {
+  return m.displayValue ?? m.lengthMm.toFixed(2)
 }
 
 function onMeasurementsPanelMouseDown(ev: MouseEvent) {
@@ -948,12 +2373,127 @@ function onMeasurementsPanelMouseMove(ev: MouseEvent) {
     x: Math.max(0, measurementsPanelDragStart.startX + dx),
     y: Math.max(0, measurementsPanelDragStart.startY + dy),
   }
+  clampFloatingPanelsToViewport()
 }
 
 function onMeasurementsPanelMouseUp() {
   measurementsPanelDragStart = null
   window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
   window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
+}
+
+function onAssemblyPanelMouseDown(ev: MouseEvent) {
+  assemblyPanelDragStart = {
+    x: ev.clientX,
+    y: ev.clientY,
+    startX: assemblyPanelPos.value.x,
+    startY: assemblyPanelPos.value.y,
+  }
+  window.addEventListener('mousemove', onAssemblyPanelMouseMove)
+  window.addEventListener('mouseup', onAssemblyPanelMouseUp)
+}
+
+function onAssemblyPanelMouseMove(ev: MouseEvent) {
+  if (!assemblyPanelDragStart) return
+  const dx = ev.clientX - assemblyPanelDragStart.x
+  const dy = ev.clientY - assemblyPanelDragStart.y
+  assemblyPanelPos.value = {
+    x: Math.max(0, assemblyPanelDragStart.startX + dx),
+    y: Math.max(0, assemblyPanelDragStart.startY + dy),
+  }
+  clampFloatingPanelsToViewport()
+}
+
+function syncAssemblyPanelBelowMeasurements() {
+  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
+  const mH = measureEl?.offsetHeight ?? 260
+  assemblyPanelPos.value = {
+    x: measurementsPanelPos.value.x,
+    y: measurementsPanelPos.value.y + mH + FLOAT_PANEL_STACK_GAP,
+  }
+}
+
+function avoidOverlapWithScenePanel(stackW: number, stackH: number) {
+  const sceneEl = document.querySelector('.viewer-scene-panel') as HTMLElement | null
+  if (!sceneEl) return
+  const sceneLeft = sceneEl.offsetLeft
+  const sceneTop = sceneEl.offsetTop
+  const sceneRight = sceneLeft + sceneEl.offsetWidth
+  const sceneBottom = sceneTop + sceneEl.offsetHeight
+  const stackLeft = measurementsPanelPos.value.x
+  const stackTop = measurementsPanelPos.value.y
+  const stackRight = stackLeft + stackW
+  const stackBottom = stackTop + stackH
+  const overlapX = stackLeft < sceneRight && stackRight > sceneLeft
+  const overlapY = stackTop < sceneBottom && stackBottom > sceneTop
+  if (!overlapX || !overlapY) return
+
+  const vw = window.innerWidth
+  const moveBelowY = sceneBottom + FLOAT_PANEL_SCENE_GAP
+  const canMoveBelow = moveBelowY + stackH + FLOAT_PANEL_MARGIN <= window.innerHeight
+  if (canMoveBelow) {
+    measurementsPanelPos.value.y = moveBelowY
+    return
+  }
+  const rightX = sceneRight + FLOAT_PANEL_SCENE_GAP
+  if (rightX + stackW + FLOAT_PANEL_MARGIN <= vw) {
+    measurementsPanelPos.value.x = rightX
+    return
+  }
+  measurementsPanelPos.value.x = FLOAT_PANEL_MARGIN
+}
+
+function onAssemblyPanelMouseUp() {
+  assemblyPanelDragStart = null
+  window.removeEventListener('mousemove', onAssemblyPanelMouseMove)
+  window.removeEventListener('mouseup', onAssemblyPanelMouseUp)
+}
+
+function applyDefaultFloatingPanelPositions() {
+  const minY = minFloatingPanelY()
+  measurementsPanelPos.value = { x: FLOAT_PANEL_MARGIN, y: minY }
+  syncAssemblyPanelBelowMeasurements()
+}
+
+function clampFloatingPanelsToViewport() {
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const minY = minFloatingPanelY()
+  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
+  const assemblyEl = document.querySelector('.viewer-assembly-panel') as HTMLElement | null
+  const mW = measureEl?.offsetWidth ?? 320
+  const mH = measureEl?.offsetHeight ?? 260
+  const aW = assemblyEl?.offsetWidth ?? ASSEMBLY_PANEL_DEFAULT_WIDTH
+  const aH = assemblyEl?.offsetHeight ?? 220
+  const clampX = (x: number, w: number) => Math.max(FLOAT_PANEL_MARGIN, Math.min(x, vw - w - FLOAT_PANEL_MARGIN))
+  const clampY = (y: number, h: number) => Math.max(minY, Math.min(y, vh - h - FLOAT_PANEL_MARGIN))
+  measurementsPanelPos.value = {
+    x: clampX(measurementsPanelPos.value.x, mW),
+    y: clampY(measurementsPanelPos.value.y, mH),
+  }
+  avoidOverlapWithScenePanel(mW, mH)
+  measurementsPanelPos.value = {
+    x: clampX(measurementsPanelPos.value.x, mW),
+    y: clampY(measurementsPanelPos.value.y, mH),
+  }
+  assemblyPanelPos.value = {
+    x: clampX(assemblyPanelPos.value.x, aW),
+    y: clampY(assemblyPanelPos.value.y, aH),
+  }
+}
+
+function setupFloatingPanelsAutoLayout() {
+  if (typeof ResizeObserver === 'undefined') return
+  floatingPanelsResizeObserver?.disconnect()
+  floatingPanelsResizeObserver = new ResizeObserver(() => {
+    clampFloatingPanelsToViewport()
+  })
+  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
+  const assemblyEl = document.querySelector('.viewer-assembly-panel') as HTMLElement | null
+  const sceneEl = document.querySelector('.viewer-scene-panel') as HTMLElement | null
+  if (measureEl) floatingPanelsResizeObserver.observe(measureEl)
+  if (assemblyEl) floatingPanelsResizeObserver.observe(assemblyEl)
+  if (sceneEl) floatingPanelsResizeObserver.observe(sceneEl)
 }
 
 const SNAP_SCREEN_THRESHOLD = 0.08
@@ -1016,6 +2556,8 @@ function updateSceneLighting(box?: THREE.Box3) {
   if (fillLightA) fillLightA.position.set(center.x - scale * 0.8, center.y + scale * 0.75, center.z + scale * 0.6)
   if (fillLightB) fillLightB.position.set(center.x + scale * 0.65, center.y + scale * 0.6, center.z - scale * 0.95)
   if (fillLightC) fillLightC.position.set(center.x - scale * 0.7, center.y + scale * 0.5, center.z - scale * 0.8)
+  if (rimLightA) rimLightA.position.set(center.x - scale * 1.1, center.y + scale * 0.9, center.z - scale * 1.2)
+  if (rimLightB) rimLightB.position.set(center.x + scale * 1.15, center.y + scale * 0.4, center.z - scale * 1.05)
   updateKeyLightShadowCamera(box)
 }
 
@@ -1053,7 +2595,7 @@ function initScene() {
   renderer.toneMappingExposure = 1
   renderer.localClippingEnabled = true
   renderer.shadowMap.enabled = true
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap
+  renderer.shadowMap.type = THREE.PCFShadowMap
   containerRef.value.appendChild(renderer.domElement)
 
   controls = new TrackballControls(camera, renderer.domElement)
@@ -1086,15 +2628,24 @@ function initScene() {
   fillLightA = new THREE.DirectionalLight(0xffffff, 0.3)
   fillLightB = new THREE.DirectionalLight(0xffffff, 0.24)
   fillLightC = new THREE.DirectionalLight(0xffffff, 0.2)
+  rimLightA = new THREE.DirectionalLight(0xffffff, 0.14)
+  rimLightB = new THREE.DirectionalLight(0xffffff, 0.1)
   fillLightA.castShadow = false
   fillLightB.castShadow = false
   fillLightC.castShadow = false
-  scene.add(keyLight, fillLightA, fillLightB, fillLightC)
+  rimLightA.castShadow = false
+  rimLightB.castShadow = false
+  scene.add(keyLight, fillLightA, fillLightB, fillLightC, rimLightA, rimLightB)
   scene.add(keyLight.target)
   applySceneLightingForShadingMode()
 
   meshGroup = new THREE.Group()
   scene.add(meshGroup)
+  hiddenOutlineGroup = new THREE.Group()
+  scene.add(hiddenOutlineGroup)
+  overlayGroup = new THREE.Group()
+  overlayGroup.visible = overlayEnabled.value
+  scene.add(overlayGroup)
 
   measureGroup = new THREE.Group()
   scene.add(measureGroup)
@@ -1102,6 +2653,8 @@ function initScene() {
   scene.add(highlightGroup)
   measurementPlanesGroup = new THREE.Group()
   scene.add(measurementPlanesGroup)
+  savedMeasurementsGroup = new THREE.Group()
+  scene.add(savedMeasurementsGroup)
   assemblyHighlightGroup = new THREE.Group()
   scene.add(assemblyHighlightGroup)
 
@@ -1156,6 +2709,7 @@ function initScene() {
   containerRef.value.appendChild(hoverTooltipEl)
   renderer.domElement.addEventListener('click', onCanvasClick)
   renderer.domElement.addEventListener('mousedown', onCanvasMouseDown, true)
+  renderer.domElement.addEventListener('contextmenu', onCanvasContextMenu)
   renderer.domElement.addEventListener('mousemove', onCanvasMouseMove, false)
   renderer.domElement.addEventListener('mousemove', onCanvasMouseMovePan, true)
   renderer.domElement.addEventListener('mouseup', onCanvasMouseUp, true)
@@ -1167,6 +2721,7 @@ function initScene() {
 
   function animate() {
     animationId = requestAnimationFrame(animate)
+    syncOverlayTransforms()
     controls.update()
     let hits: THREE.Intersection[] = []
     if (measureModeRef.value && meshGroup.children.length && containerRef.value) {
@@ -1439,7 +2994,7 @@ function initScene() {
       measurementLabelEl.textContent = L.toFixed(2)
       measurementLabelEl.style.display = 'block'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
-    } else if (measurementPoints.length === 2 && (measureType !== 'hole-center-distance' || (measureType === 'diameter' && firstClickHole && !secondHoleResult)) && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
+    } else if (measurementPoints.length === 2 && measureType === 'distance' && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
       const rect = containerRef.value.getBoundingClientRect()
       const A = measurementPoints[0]
       const B = measurementPoints[1]
@@ -1554,6 +3109,7 @@ function onResize() {
   renderer.setPixelRatio(isCameraInteracting ? Math.min(INTERACTION_PIXEL_RATIO, idlePixelRatio) : idlePixelRatio)
   renderer.setSize(w, h)
   controls?.handleResize()
+  clampFloatingPanelsToViewport()
 }
 
 function centerModel(box: THREE.Box3) {
@@ -1615,8 +3171,31 @@ const orientationDropdownOpen = ref(false)
 const orientationDropdownRef = ref<HTMLDivElement | null>(null)
 const mouseSettingsDropdownOpen = ref(false)
 const mouseSettingsDropdownRef = ref<HTMLDivElement | null>(null)
-const scenePanelOrientationOpen = ref(false)
-const scenePanelOrientationRef = ref<HTMLDivElement | null>(null)
+const mousePreset = ref<'cad' | 'smooth' | 'fast'>('cad')
+
+function applyMousePreset(preset: 'cad' | 'smooth' | 'fast') {
+  mousePreset.value = preset
+  if (preset === 'cad') {
+    mouseZoomSpeed.value = 0.028
+    mouseRotateSpeed.value = 5.8
+    mousePanSpeed.value = 1.8
+    mouseDamping.value = 0.2
+    mouseZoomGestureMs.value = 420
+  } else if (preset === 'smooth') {
+    mouseZoomSpeed.value = 0.022
+    mouseRotateSpeed.value = 4.8
+    mousePanSpeed.value = 1.5
+    mouseDamping.value = 0.3
+    mouseZoomGestureMs.value = 520
+  } else {
+    mouseZoomSpeed.value = 0.04
+    mouseRotateSpeed.value = 7.2
+    mousePanSpeed.value = 2.4
+    mouseDamping.value = 0.16
+    mouseZoomGestureMs.value = 320
+  }
+  applyMouseSettings()
+}
 
 function onOrientationClickOutside(ev: MouseEvent) {
   if (!orientationDropdownOpen.value) return
@@ -1628,12 +3207,6 @@ function onMouseSettingsClickOutside(ev: MouseEvent) {
   if (!mouseSettingsDropdownOpen.value) return
   const el = mouseSettingsDropdownRef.value
   if (el && !el.contains(ev.target as Node)) mouseSettingsDropdownOpen.value = false
-}
-
-function onScenePanelOrientationClickOutside(ev: MouseEvent) {
-  if (!scenePanelOrientationOpen.value) return
-  const el = scenePanelOrientationRef.value
-  if (el && !el.contains(ev.target as Node)) scenePanelOrientationOpen.value = false
 }
 
 const ORIENTATION_OPTIONS: { id: ViewPreset; label: string; tooltip: string; hasIcon: boolean }[] = [
@@ -1650,7 +3223,6 @@ const ORIENTATION_OPTIONS: { id: ViewPreset; label: string; tooltip: string; has
 function setViewOrientation(preset: ViewPreset) {
   if (!camera || !controls || !meshGroup || meshGroup.children.length === 0) return
   orientationDropdownOpen.value = false
-  scenePanelOrientationOpen.value = false
   const box = new THREE.Box3().setFromObject(meshGroup)
   const center = box.getCenter(new THREE.Vector3())
   const size = box.getSize(new THREE.Vector3())
@@ -1745,7 +3317,7 @@ function toggleWireframe() {
 
 function applySectionToMeshGroup(plane: THREE.Plane | null) {
   const planes = plane ? [plane] : []
-  meshGroup.traverse((obj: THREE.Object3D) => {
+  const applyToGroup = (group: THREE.Group) => group.traverse((obj: THREE.Object3D) => {
     if (obj instanceof THREE.Mesh && obj.material) {
       const mat = obj.material
       const arr = Array.isArray(mat) ? mat : [mat]
@@ -1756,6 +3328,8 @@ function applySectionToMeshGroup(plane: THREE.Plane | null) {
       })
     }
   })
+  applyToGroup(meshGroup)
+  if (overlayGroup) applyToGroup(overlayGroup)
 }
 
 function applySectionPlane() {
@@ -1903,6 +3477,7 @@ function onControlsStart() {
 function onControlsEnd() {
   isCameraInteracting = false
   hoverDirty = true
+  rebuildSavedMeasurementsVisuals()
   if (renderer) {
     renderer.setPixelRatio(idlePixelRatio)
   }
@@ -1926,6 +3501,620 @@ function findWrapperGroup(obj: THREE.Object3D): THREE.Group | null {
   let o: THREE.Object3D | null = obj
   while (o && o.parent !== meshGroup) o = o.parent
   return o && o.parent === meshGroup ? (o as THREE.Group) : null
+}
+
+function findPartNodeInWrapper(obj: THREE.Object3D, wrapper: THREE.Group): THREE.Object3D | null {
+  let o: THREE.Object3D | null = obj
+  while (o && o !== wrapper) {
+    if (o instanceof THREE.Mesh) return o
+    o = o.parent
+  }
+  return obj instanceof THREE.Mesh ? obj : null
+}
+
+function normalizeComponentLabel(raw: string): string {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  const noQty = s.replace(/\s*\(\d+\)\s*$/g, '')
+  const noTailNum = noQty.replace(/([._-])\d{1,4}$/g, '')
+  return noTailNum.replace(/\s{2,}/g, ' ').trim()
+}
+
+function inferComponentLabel(obj: THREE.Object3D): string {
+  const direct = normalizeComponentLabel(String(obj.userData?.partName || obj.userData?.partId || obj.name || ''))
+  if (direct && !/^(mesh|node|object|group)$/i.test(direct)) return direct
+  let p: THREE.Object3D | null = obj.parent
+  while (p) {
+    const candidate = normalizeComponentLabel(String(p.name || ''))
+    if (candidate && !/^(mesh|node|object|group|scene)$/i.test(candidate)) return candidate
+    p = p.parent
+  }
+  return ''
+}
+
+function extractLabelsFromStepSpecMeta(meta: any): string[] {
+  const sections = meta?.spec?.sections
+  if (!sections || typeof sections !== 'object') return []
+  const labels: string[] = []
+  Object.values(sections).forEach((rows: any) => {
+    if (!Array.isArray(rows)) return
+    rows.forEach((r: any) => {
+      const name = String(r?.name ?? '').trim()
+      const des = String(r?.designation ?? '').trim()
+      if (!name && !des) return
+      labels.push(des ? `${name} [${des}]` : name)
+    })
+  })
+  return [...new Set(labels)]
+}
+
+function splitMeshByConnectivity(
+  mesh: THREE.Mesh,
+  desiredLabels: string[] = []
+): THREE.Mesh[] {
+  const geom = mesh.geometry
+  const pos = geom.getAttribute('position')
+  if (!pos || pos.itemSize < 3 || pos.count < 3) return [mesh]
+  const indexArray: number[] = []
+  if (geom.index) {
+    const src = geom.index.array as ArrayLike<number>
+    for (let i = 0; i < src.length; i += 1) indexArray.push(Number(src[i]))
+  } else {
+    for (let i = 0; i < pos.count; i += 1) indexArray.push(i)
+  }
+  const triCount = Math.floor(indexArray.length / 3)
+  if (triCount < 2) return [mesh]
+
+  const vertToTris = new Map<number, number[]>()
+  for (let t = 0; t < triCount; t += 1) {
+    const a = indexArray[t * 3]
+    const b = indexArray[t * 3 + 1]
+    const c = indexArray[t * 3 + 2]
+    ;[a, b, c].forEach((v) => {
+      const arr = vertToTris.get(v)
+      if (arr) arr.push(t)
+      else vertToTris.set(v, [t])
+    })
+  }
+
+  const visited = new Uint8Array(triCount)
+  const triGroups: number[][] = []
+  for (let start = 0; start < triCount; start += 1) {
+    if (visited[start]) continue
+    const queue = [start]
+    visited[start] = 1
+    const group: number[] = []
+    while (queue.length > 0) {
+      const t = queue.pop() as number
+      group.push(t)
+      const a = indexArray[t * 3]
+      const b = indexArray[t * 3 + 1]
+      const c = indexArray[t * 3 + 2]
+      for (const v of [a, b, c]) {
+        const neigh = vertToTris.get(v) || []
+        for (const nt of neigh) {
+          if (!visited[nt]) {
+            visited[nt] = 1
+            queue.push(nt)
+          }
+        }
+      }
+    }
+    triGroups.push(group)
+    if (triGroups.length > 1500) return [mesh]
+  }
+  if (triGroups.length <= 1) return [mesh]
+
+  const srcPos = pos
+  const created: THREE.Mesh[] = []
+  triGroups
+    .sort((a, b) => b.length - a.length)
+    .forEach((tris, idx) => {
+      const localIndex: number[] = []
+      const vMap = new Map<number, number>()
+      const localPos: number[] = []
+      const mapVertex = (globalV: number) => {
+        const prev = vMap.get(globalV)
+        if (prev != null) return prev
+        const next = vMap.size
+        vMap.set(globalV, next)
+        localPos.push(srcPos.getX(globalV), srcPos.getY(globalV), srcPos.getZ(globalV))
+        return next
+      }
+      for (const t of tris) {
+        const a = mapVertex(indexArray[t * 3])
+        const b = mapVertex(indexArray[t * 3 + 1])
+        const c = mapVertex(indexArray[t * 3 + 2])
+        localIndex.push(a, b, c)
+      }
+      const g = new THREE.BufferGeometry()
+      g.setAttribute('position', new THREE.Float32BufferAttribute(localPos, 3))
+      g.setIndex(localIndex)
+      g.computeVertexNormals()
+      const m = new THREE.Mesh(g, Array.isArray(mesh.material) ? mesh.material.map((mm) => mm.clone()) : mesh.material.clone())
+      m.position.copy(mesh.position)
+      m.quaternion.copy(mesh.quaternion)
+      m.scale.copy(mesh.scale)
+      m.matrixAutoUpdate = mesh.matrixAutoUpdate
+      m.visible = mesh.visible
+      const label = desiredLabels[idx] || desiredLabels[desiredLabels.length - 1] || `Деталь ${idx + 1}`
+      m.name = label
+      m.userData = { ...mesh.userData, partName: label, splitFromMerged: true, splitIndex: idx }
+      created.push(m)
+    })
+  return created.length > 1 ? created : [mesh]
+}
+
+function mergeMeshesIntoSingle(parent: THREE.Object3D, meshes: THREE.Mesh[], label: string): THREE.Mesh {
+  const positions: number[] = []
+  const indices: number[] = []
+  let vOffset = 0
+  const world = new THREE.Vector3()
+  const local = new THREE.Vector3()
+  meshes.forEach((mesh) => {
+    const geom = mesh.geometry
+    const pos = geom.getAttribute('position')
+    if (!pos || pos.itemSize < 3) return
+    const idxSrc = geom.index?.array as ArrayLike<number> | undefined
+    for (let i = 0; i < pos.count; i += 1) {
+      world.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(mesh.matrixWorld)
+      local.copy(world)
+      parent.worldToLocal(local)
+      positions.push(local.x, local.y, local.z)
+    }
+    if (idxSrc) {
+      for (let i = 0; i < idxSrc.length; i += 1) indices.push(Number(idxSrc[i]) + vOffset)
+    } else {
+      for (let i = 0; i < pos.count; i += 1) indices.push(i + vOffset)
+    }
+    vOffset += pos.count
+  })
+  const g = new THREE.BufferGeometry()
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  g.setIndex(indices)
+  g.computeVertexNormals()
+  const source = meshes[0]
+  const mat = Array.isArray(source.material) ? source.material[0].clone() : source.material.clone()
+  const out = new THREE.Mesh(g, mat)
+  out.name = label
+  out.userData = { ...source.userData, partName: label, mergedFromFragments: meshes.length }
+  out.visible = meshes.some((m) => m.visible)
+  return out
+}
+
+function reduceFragmentedPartsToSpecCount(parent: THREE.Object3D, parts: THREE.Mesh[], labels: string[]): THREE.Mesh[] {
+  const meshSizeScore = (m: THREE.Mesh): number => {
+    const sz = new THREE.Box3().setFromObject(m).getSize(new THREE.Vector3())
+    return Math.max(1e-9, sz.x * sz.y * sz.z)
+  }
+  const mergePair = (a: THREE.Mesh, b: THREE.Mesh): THREE.Mesh => {
+    const merged = mergeMeshesIntoSingle(parent, [a, b], a.name || b.name || 'Деталь')
+    parent.remove(a)
+    parent.remove(b)
+    if (a.geometry) a.geometry.dispose()
+    if (b.geometry) b.geometry.dispose()
+    ;(Array.isArray(a.material) ? a.material : [a.material]).forEach((m) => m.dispose())
+    ;(Array.isArray(b.material) ? b.material : [b.material]).forEach((m) => m.dispose())
+    parent.add(merged)
+    return merged
+  }
+  const closestIndex = (from: THREE.Mesh, arr: THREE.Mesh[]): number => {
+    const c0 = new THREE.Box3().setFromObject(from).getCenter(new THREE.Vector3())
+    let best = -1
+    let bestD = Number.POSITIVE_INFINITY
+    for (let i = 0; i < arr.length; i += 1) {
+      if (arr[i] === from) continue
+      const d = c0.distanceTo(new THREE.Box3().setFromObject(arr[i]).getCenter(new THREE.Vector3()))
+      if (d < bestD) {
+        bestD = d
+        best = i
+      }
+    }
+    return best
+  }
+  const expandedBox = (m: THREE.Mesh, pad: number) => new THREE.Box3().setFromObject(m).expandByScalar(pad)
+  const nearOrIntersect = (a: THREE.Mesh, b: THREE.Mesh): boolean => {
+    const ba = new THREE.Box3().setFromObject(a)
+    const bb = new THREE.Box3().setFromObject(b)
+    if (ba.intersectsBox(bb)) return true
+    const sa = ba.getSize(new THREE.Vector3()).length()
+    const sb = bb.getSize(new THREE.Vector3()).length()
+    const pad = Math.max(0.2, Math.min(sa, sb) * 0.03)
+    return expandedBox(a, pad).intersectsBox(expandedBox(b, pad))
+  }
+
+  const target = Math.min(labels.length, parts.length)
+  if (target < 1 || parts.length <= target) return parts
+  const work = [...parts]
+
+  // Этап 0: склеиваем оболочки одной детали (тонкие полые профили),
+  // если их bbox пересекаются или почти касаются.
+  let mergedByTouch = true
+  while (mergedByTouch && work.length > target) {
+    mergedByTouch = false
+    outer: for (let i = 0; i < work.length; i += 1) {
+      for (let j = i + 1; j < work.length; j += 1) {
+        if (!nearOrIntersect(work[i], work[j])) continue
+        const merged = mergePair(work[i], work[j])
+        const next = work.filter((_, idx) => idx !== i && idx !== j)
+        next.push(merged)
+        work.splice(0, work.length, ...next)
+        mergedByTouch = true
+        break outer
+      }
+    }
+  }
+
+  // Этап A: склеиваем микрофрагменты к ближайшим крупным, чтобы убрать "крошку".
+  while (work.length > 2) {
+    work.sort((a, b) => meshSizeScore(a) - meshSizeScore(b))
+    const minScore = meshSizeScore(work[0])
+    const maxScore = meshSizeScore(work[work.length - 1])
+    const ratio = minScore / Math.max(1e-9, maxScore)
+    if (ratio > 0.015) break
+    const tiny = work[0]
+    const j = closestIndex(tiny, work)
+    if (j < 0) break
+    const merged = mergePair(tiny, work[j])
+    const filtered = work.filter((m, idx) => idx !== 0 && idx !== j)
+    filtered.push(merged)
+    work.splice(0, work.length, ...filtered)
+  }
+
+  const centerOf = (m: THREE.Mesh) => new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3())
+  while (work.length > target) {
+    let bestI = 0
+    let bestJ = 1
+    let bestD = Number.POSITIVE_INFINITY
+    for (let i = 0; i < work.length; i += 1) {
+      const ci = centerOf(work[i])
+      for (let j = i + 1; j < work.length; j += 1) {
+        const d = ci.distanceTo(centerOf(work[j]))
+        if (d < bestD) {
+          bestD = d
+          bestI = i
+          bestJ = j
+        }
+      }
+    }
+    const a = work[bestI]
+    const b = work[bestJ]
+    const merged = mergePair(a, b)
+    const next: THREE.Mesh[] = []
+    work.forEach((m, idx) => {
+      if (idx !== bestI && idx !== bestJ) next.push(m)
+    })
+    next.push(merged)
+    work.splice(0, work.length, ...next)
+  }
+  work.sort((x, y) => new THREE.Box3().setFromObject(y).getSize(new THREE.Vector3()).length()
+    - new THREE.Box3().setFromObject(x).getSize(new THREE.Vector3()).length())
+  work.forEach((m, idx) => {
+    const label = labels[idx] || labels[labels.length - 1] || m.name || `Деталь ${idx + 1}`
+    m.name = label
+    m.userData = { ...m.userData, partName: label }
+  })
+  return work
+}
+
+function collectMeshes(root: THREE.Object3D): THREE.Mesh[] {
+  const arr: THREE.Mesh[] = []
+  root.traverse((o: THREE.Object3D) => { if (o instanceof THREE.Mesh) arr.push(o) })
+  return arr
+}
+
+function meshVolumeScore(mesh: THREE.Mesh): number {
+  const sz = new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3())
+  return Math.max(1e-9, sz.x * sz.y * sz.z)
+}
+
+function mergeTwoMeshesAtRoot(root: THREE.Object3D, a: THREE.Mesh, b: THREE.Mesh, label: string): THREE.Mesh {
+  const positions: number[] = []
+  const indices: number[] = []
+  let vOffset = 0
+  const world = new THREE.Vector3()
+  const local = new THREE.Vector3()
+  const appendMesh = (mesh: THREE.Mesh) => {
+    const geom = mesh.geometry
+    const pos = geom.getAttribute('position')
+    if (!pos || pos.itemSize < 3) return
+    const idxSrc = geom.index?.array as ArrayLike<number> | undefined
+    for (let i = 0; i < pos.count; i += 1) {
+      world.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(mesh.matrixWorld)
+      local.copy(world)
+      root.worldToLocal(local)
+      positions.push(local.x, local.y, local.z)
+    }
+    if (idxSrc) {
+      for (let i = 0; i < idxSrc.length; i += 1) indices.push(Number(idxSrc[i]) + vOffset)
+    } else {
+      for (let i = 0; i < pos.count; i += 1) indices.push(i + vOffset)
+    }
+    vOffset += pos.count
+  }
+  appendMesh(a)
+  appendMesh(b)
+  const g = new THREE.BufferGeometry()
+  g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  g.setIndex(indices)
+  g.computeVertexNormals()
+  const mat = (Array.isArray(a.material) ? a.material[0] : a.material).clone()
+  const out = new THREE.Mesh(g, mat)
+  out.name = label
+  out.userData = { ...a.userData, partName: label, mergedByAssemblyMap: true }
+  ;[a, b].forEach((m) => {
+    if (m.parent) m.parent.remove(m)
+    if (m.geometry) m.geometry.dispose()
+    ;(Array.isArray(m.material) ? m.material : [m.material]).forEach((mm) => mm.dispose())
+  })
+  root.add(out)
+  return out
+}
+
+function applyAssemblyMapMatching(root: THREE.Object3D, assemblyMap: any): { matched: number; total: number } {
+  const bom = Array.isArray(assemblyMap?.bom) ? assemblyMap.bom : []
+  const labels = bom
+    .map((b: any) => {
+      const n = String(b?.name ?? '').trim()
+      const d = String(b?.designation ?? '').trim()
+      return n ? (d ? `${n} [${d}]` : n) : ''
+    })
+    .filter((x: string) => !!x)
+  const meshes = collectMeshes(root)
+  if (!labels.length || !meshes.length) return { matched: 0, total: meshes.length }
+
+  let work = [...meshes]
+  const target = Math.max(1, labels.length)
+  while (work.length > target) {
+    work.sort((x, y) => meshVolumeScore(x) - meshVolumeScore(y))
+    const tiny = work[0]
+    const c0 = new THREE.Box3().setFromObject(tiny).getCenter(new THREE.Vector3())
+    let best = 1
+    let bestD = Number.POSITIVE_INFINITY
+    for (let i = 1; i < work.length; i += 1) {
+      const d = c0.distanceTo(new THREE.Box3().setFromObject(work[i]).getCenter(new THREE.Vector3()))
+      if (d < bestD) { bestD = d; best = i }
+    }
+    const merged = mergeTwoMeshesAtRoot(root, tiny, work[best], tiny.name || work[best].name || 'Деталь')
+    const next = work.filter((_, idx) => idx !== 0 && idx !== best)
+    next.push(merged)
+    work = next
+  }
+
+  work.sort((a, b) => meshVolumeScore(b) - meshVolumeScore(a))
+  work.forEach((m, i) => {
+    const label = labels[i] || labels[labels.length - 1] || m.name || `Деталь ${i + 1}`
+    const bomRow = bom[i]
+    m.name = label
+    m.userData = {
+      ...m.userData,
+      partName: label,
+      partId: String(bomRow?.partId ?? `bom_${i + 1}`),
+      instanceId: null,
+      assemblyMapMatched: true,
+    }
+  })
+  return { matched: Math.min(labels.length, work.length), total: work.length }
+}
+
+function splitMergedMeshesUsingSpec(root: THREE.Object3D, stepMetaPayload?: any): number {
+  const labels = extractLabelsFromStepSpecMeta(stepMetaPayload)
+  if (!labels.length) return 0
+  let changed = 0
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const parent = obj.parent
+    if (!parent) return
+    const split = splitMeshByConnectivity(obj, labels)
+    if (split.length <= 1) return
+    const reduced = reduceFragmentedPartsToSpecCount(parent, split, labels)
+    const oldVisible = obj.visible
+    parent.remove(obj)
+    if (obj.geometry) obj.geometry.dispose()
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m) => m.dispose())
+    reduced.forEach((m) => {
+      m.visible = oldVisible
+      parent.add(m)
+    })
+    changed += reduced.length
+  })
+  return changed
+}
+
+function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group, stepMetaPayload?: any) {
+  const mapPayload = assemblyMapByModel.value[modelId] ?? stepMetaPayload?.assemblyMap ?? null
+  const bomRows = Array.isArray(mapPayload?.bom) ? mapPayload.bom : []
+  if (bomRows.length > 0) {
+    const meshes: THREE.Mesh[] = []
+    wrapper.traverse((o: THREE.Object3D) => { if (o instanceof THREE.Mesh) meshes.push(o) })
+    const byPart = new Map<string, THREE.Mesh[]>()
+    bomRows.forEach((b: any) => byPart.set(String(b?.partId ?? ''), []))
+    const unassigned: THREE.Mesh[] = []
+    meshes.forEach((m) => {
+      const pid = String(m.userData?.partId ?? '').trim()
+      if (pid && byPart.has(pid)) byPart.get(pid)!.push(m)
+      else unassigned.push(m)
+    })
+    // Жесткая фиксация: чтобы плоскости/оболочки не жили отдельными строками,
+    // неразмеченные меши принудительно относим к ближайшей уже размеченной детали.
+    if (unassigned.length) {
+      const centers = new Map<string, THREE.Vector3>()
+      byPart.forEach((arr, pid) => {
+        if (!arr.length) return
+        const c = new THREE.Vector3()
+        arr.forEach((m) => c.add(new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3())))
+        c.multiplyScalar(1 / arr.length)
+        centers.set(pid, c)
+      })
+      const fallbackPid = centers.keys().next().value as string | undefined
+      unassigned.forEach((m) => {
+        let bestPid = fallbackPid
+        if (bestPid) {
+          const cm = new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3())
+          let bestD = Number.POSITIVE_INFINITY
+          centers.forEach((cp, pid) => {
+            const d = cm.distanceTo(cp)
+            if (d < bestD) { bestD = d; bestPid = pid }
+          })
+        }
+        if (bestPid) byPart.get(bestPid)?.push(m)
+      })
+    }
+    const roots: ComponentTreeNode[] = bomRows
+      .map((b: any, idx: number) => {
+        const pid = String(b?.partId ?? '')
+        const name = String(b?.name ?? '').trim()
+        const des = String(b?.designation ?? '').trim()
+        const label = des ? `${name} [${des}]` : (name || `Деталь ${idx + 1}`)
+        const targetIds = (byPart.get(pid) || []).map((m) => m.uuid)
+        return {
+          id: `${modelId}:bom:${idx}`,
+          label,
+          visible: targetIds.some((id) => {
+            const found = meshes.find((m) => m.uuid === id)
+            return found ? found.visible : true
+          }),
+          targetIds,
+          children: [],
+        } as ComponentTreeNode
+      })
+      .filter((n) => n.targetIds.length > 0)
+    if (roots.length > 0) {
+      componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
+      return
+    }
+  }
+
+  const buckets = new Map<string, { label: string; ids: string[]; visibleCount: number }>()
+  wrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const inferred = inferComponentLabel(obj)
+    const label = inferred || `Деталь ${buckets.size + 1}`
+    const key = normalizeComponentLabel(label).toLowerCase()
+    const prev = buckets.get(key)
+    if (prev) {
+      prev.ids.push(obj.uuid)
+      if (obj.visible) prev.visibleCount += 1
+      return
+    }
+    buckets.set(key, { label, ids: [obj.uuid], visibleCount: obj.visible ? 1 : 0 })
+  })
+  const fromSpec = extractLabelsFromStepSpecMeta(stepMetaPayload)
+  const useSpecVirtualTree = buckets.size <= 2 && fromSpec.length >= 3
+  const roots: ComponentTreeNode[] = useSpecVirtualTree
+    ? fromSpec
+      .sort((a, b) => a.localeCompare(b, 'ru'))
+      .map((label, idx) => ({
+        id: `${modelId}:spec:${idx}`,
+        label,
+        visible: true,
+        targetIds: [],
+        children: [],
+      }))
+    : [...buckets.values()]
+      .sort((a, b) => a.label.localeCompare(b.label, 'ru'))
+      .map((x, idx) => ({
+        id: `${modelId}:part:${idx}`,
+        label: x.label,
+        visible: x.visibleCount > 0,
+        targetIds: x.ids,
+        children: [],
+      }))
+  componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
+}
+
+function refreshComponentTreeVisibility(modelId: string) {
+  const group = modelGroupsById.get(modelId)
+  const tree = componentTreeByModel.value[modelId]
+  if (!group || !tree) return
+  const byId = new Map<string, boolean>()
+  group.traverse((obj: THREE.Object3D) => byId.set(obj.uuid, obj.visible))
+  const refreshNode = (n: ComponentTreeNode) => {
+    if (n.targetIds.length > 0) {
+      n.visible = n.targetIds.some((id) => byId.get(id) !== false)
+    } else {
+      n.visible = byId.get(n.id) ?? n.visible
+    }
+    n.children.forEach(refreshNode)
+  }
+  tree.forEach(refreshNode)
+  componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: [...tree] }
+}
+
+function flattenComponentTree(nodes: ComponentTreeNode[], depth = 0): ComponentTreeRow[] {
+  const rows: ComponentTreeRow[] = []
+  nodes.forEach((n) => {
+    rows.push({ id: n.id, label: n.label, visible: n.visible, targetIds: n.targetIds, depth })
+    rows.push(...flattenComponentTree(n.children, depth + 1))
+  })
+  return rows
+}
+
+const componentTreeRowsByModel = computed<Record<string, ComponentTreeRow[]>>(() => {
+  const out: Record<string, ComponentTreeRow[]> = {}
+  Object.entries(componentTreeByModel.value).forEach(([modelId, nodes]) => {
+    out[modelId] = flattenComponentTree(nodes)
+  })
+  return out
+})
+
+function toggleComponentVisibility(modelId: string, rowId: string) {
+  const group = modelGroupsById.get(modelId)
+  if (!group) return
+  const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+  if (!row) return
+  if (!row.targetIds.length) return
+  const targetSet = new Set(row.targetIds)
+  const nextVisible = !row.visible
+  group.traverse((obj: THREE.Object3D) => {
+    if (targetSet.has(obj.uuid)) obj.visible = nextVisible
+  })
+  syncOverlayVisibilityForModel(modelId)
+  syncHiddenOutlinesForModel(modelId)
+  refreshComponentTreeVisibility(modelId)
+  scheduleSceneMetricsRecalc()
+}
+
+function setSingleComponentVisibility(modelId: string, obj: THREE.Object3D, visible: boolean) {
+  obj.visible = visible
+  syncOverlayVisibilityForModel(modelId)
+  syncHiddenOutlinesForModel(modelId)
+  refreshComponentTreeVisibility(modelId)
+  scheduleSceneMetricsRecalc()
+}
+
+function clearComponentHighlight() {
+  highlightedComponentMeshes.forEach((mesh) => {
+    if (!mesh.material) return
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    mats.forEach((m: THREE.Material) => {
+      if ('emissive' in m) {
+        (m as THREE.MeshPhongMaterial).emissive.setHex(0x000000)
+      }
+    })
+  })
+  highlightedComponentMeshes.clear()
+}
+
+function selectComponentRow(modelId: string, rowId: string) {
+  const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+  selectedComponentRowId.value = row ? `${modelId}:${rowId}` : null
+  clearComponentHighlight()
+  if (!row) return
+  const group = modelGroupsById.get(modelId)
+  if (!group) return
+  const targetSet = new Set(row.targetIds)
+  group.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material || !targetSet.has(obj.uuid)) return
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m: THREE.Material) => {
+      if ('emissive' in m) {
+        (m as THREE.MeshPhongMaterial).emissive.setHex(0x223344)
+      }
+    })
+    highlightedComponentMeshes.add(obj)
+  })
 }
 
 function disposeAssemblyHighlightGroupMeshes() {
@@ -2093,8 +4282,101 @@ watch(
   { flush: 'post' },
 )
 
+watch([dimArrowSizeMm, dimLineOffsetMm, dimFontSizeMm], () => {
+  rebuildSavedMeasurementsVisuals()
+})
+
 function onCanvasMouseDown(ev: MouseEvent) {
+  if (partContextMenuOpen.value) partContextMenuOpen.value = false
+  if (ev.button === 2) {
+    rightMouseDown = true
+    rightMouseDragged = false
+    rightMouseDownX = ev.clientX
+    rightMouseDownY = ev.clientY
+    contextMenuCanShow.value = tryPickContextTarget(ev.clientX, ev.clientY)
+  }
   if (!camera || !controls || !meshGroup) return
+  if (ev.button === 0 && selectedMeasurementId.value && savedMeasurementsGroup) {
+    const rect = renderer.domElement.getBoundingClientRect()
+    const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
+    const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
+    const rr = new THREE.Raycaster()
+    rr.params.Line = { threshold: 28 }
+    rr.setFromCamera(new THREE.Vector2(mx, my), camera)
+    const hitsDim = rr.intersectObject(savedMeasurementsGroup, true)
+    const hitRow = hitsDim
+      .map((h) => String((h.object as THREE.Object3D).userData?.measurementId ?? ''))
+      .find((id) => !!id)
+    if (hitRow && hitRow === selectedMeasurementId.value) {
+      const row = measurementHistory.value.find((m) => m.id === hitRow)
+      if (row && (row.type === 'distance' || row.type === 'cad-linear')) {
+        const anchorWorld = row.type === 'cad-linear'
+          ? resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)).multiplyScalar(0.5)
+          : resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)).multiplyScalar(0.5)
+        const dirWorld = (() => {
+          if (row.type === 'cad-linear') {
+            const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
+            const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+            let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
+            let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
+            if (row.outputPlaneModelId) {
+              const g = modelGroupsById.get(row.outputPlaneModelId)
+              if (g) {
+                planePoint = g.localToWorld(planePoint)
+                planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
+              }
+            }
+            const n = planeNormal.clone().normalize()
+            const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
+            const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
+            const srcA = strict ? strict.projected : project(a)
+            const srcB = strict ? strict.otherPoint : project(b)
+            const dir = srcB.clone().sub(srcA).normalize()
+            let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+            if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+            return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+          }
+          const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
+          const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+          const baseNormal =
+            (row.modelId2 && row.n2Local ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local) : null)
+            ?? (row.modelId1 && row.n1Local ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local) : null)
+            ?? (row.n2 ? savedToVec(row.n2) : (row.n1 ? savedToVec(row.n1) : null))
+          const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
+          const srcA = strict ? strict.projected : a
+          const srcB = strict ? strict.otherPoint : b
+          const dir = srcB.clone().sub(srcA).normalize()
+          const n = (baseNormal ?? new THREE.Vector3(0, 1, 0)).clone().normalize()
+          let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+          if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+          return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+        })()
+        const p0 = anchorWorld.clone().project(camera)
+        const p1 = anchorWorld.clone().add(dirWorld.clone().multiplyScalar(100)).project(camera)
+        let axisX = (p1.x - p0.x) * rect.width * 0.5
+        let axisY = -(p1.y - p0.y) * rect.height * 0.5
+        const axisLen = Math.hypot(axisX, axisY)
+        if (axisLen > 1e-3) {
+          axisX /= axisLen
+          axisY /= axisLen
+        } else {
+          axisX = 0
+          axisY = -1
+        }
+        draggedMeasurementOffset = {
+          id: row.id,
+          startX: ev.clientX,
+          startY: ev.clientY,
+          startOffset: row.lineOffsetMm ?? dimLineOffsetMm.value,
+          axisX,
+          axisY,
+        }
+        ev.preventDefault()
+        ev.stopPropagation()
+        return
+      }
+    }
+  }
   if (ev.button === 0 && leftButtonMoveModel.value) {
     const rect = renderer.domElement.getBoundingClientRect()
     const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
@@ -2116,7 +4398,105 @@ function onCanvasMouseDown(ev: MouseEvent) {
   }
 }
 
+function onCanvasContextMenu(ev: MouseEvent) {
+  // Меню открываем только на mouseup без перетаскивания; нативное отключаем всегда.
+  const rect = renderer.domElement.getBoundingClientRect()
+  ev.preventDefault()
+  ev.stopPropagation()
+  partContextMenuX.value = ev.clientX - rect.left
+  partContextMenuY.value = ev.clientY - rect.top
+}
+
+function tryPickContextTarget(clientX: number, clientY: number): boolean {
+  if (!camera || !renderer || !meshGroup) return false
+  const rect = renderer.domElement.getBoundingClientRect()
+  const mx = ((clientX - rect.left) / rect.width) * 2 - 1
+  const my = -((clientY - rect.top) / rect.height) * 2 + 1
+  raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
+  const hits = raycaster.intersectObject(meshGroup, true)
+  if (hits.length > 0) {
+    const wrapper = findWrapperGroup(hits[0].object)
+    const partNode = wrapper ? findPartNodeInWrapper(hits[0].object, wrapper) : null
+    if (wrapper && partNode) {
+      contextMenuTargetPart = partNode
+      contextMenuTargetModelId = String(wrapper.userData?.modelId ?? '')
+      contextMenuTargetIsHidden.value = !partNode.visible
+      return true
+    }
+  }
+  const hiddenHits = raycaster.intersectObject(hiddenOutlineGroup, true)
+  if (hiddenHits.length > 0) {
+    const hitObj = hiddenHits[0].object as THREE.Object3D
+    const modelId = String(hitObj.userData?.modelId ?? '')
+    const objectId = String(hitObj.userData?.objectId ?? '')
+    const group = modelGroupsById.get(modelId)
+    if (!group || !objectId) return false
+    let target: THREE.Object3D | null = null
+    group.traverse((obj: THREE.Object3D) => {
+      if (!target && obj.uuid === objectId) target = obj
+    })
+    if (!target) return false
+    contextMenuTargetPart = target
+    contextMenuTargetModelId = modelId
+    contextMenuTargetIsHidden.value = !target.visible
+    return true
+  }
+  return false
+}
+
+function showContextMenuAt(clientX: number, clientY: number) {
+  if (!renderer) return
+  const rect = renderer.domElement.getBoundingClientRect()
+  partContextMenuX.value = clientX - rect.left
+  partContextMenuY.value = clientY - rect.top
+  partContextMenuOpen.value = true
+}
+
+function showSelectedPartFromContextMenu() {
+  if (!contextMenuTargetPart || !contextMenuTargetModelId) return
+  setSingleComponentVisibility(contextMenuTargetModelId, contextMenuTargetPart, true)
+  partContextMenuOpen.value = false
+  contextMenuTargetIsHidden.value = false
+  contextMenuTargetPart = null
+  contextMenuTargetModelId = null
+}
+
+function hideSelectedPartFromContextMenu() {
+  if (!contextMenuTargetPart || !contextMenuTargetModelId) return
+  setSingleComponentVisibility(contextMenuTargetModelId, contextMenuTargetPart, false)
+  partContextMenuOpen.value = false
+  contextMenuTargetIsHidden.value = false
+  contextMenuTargetPart = null
+  contextMenuTargetModelId = null
+}
+
+function onGlobalMouseDown(ev: MouseEvent) {
+  if (!partContextMenuOpen.value) return
+  const target = ev.target as HTMLElement | null
+  if (target?.closest('.viewer-part-context-menu')) return
+  partContextMenuOpen.value = false
+  contextMenuTargetIsHidden.value = false
+}
+
 function onCanvasMouseMovePan(ev: MouseEvent) {
+  if (rightMouseDown) {
+    const dx = ev.clientX - rightMouseDownX
+    const dy = ev.clientY - rightMouseDownY
+    if (Math.hypot(dx, dy) >= RIGHT_DRAG_THRESHOLD_PX) rightMouseDragged = true
+  }
+  if (draggedMeasurementOffset) {
+    ev.preventDefault()
+    ev.stopPropagation()
+    const dx = ev.clientX - draggedMeasurementOffset.startX
+    const dy = ev.clientY - draggedMeasurementOffset.startY
+    const projectedDeltaPx = dx * draggedMeasurementOffset.axisX + dy * draggedMeasurementOffset.axisY
+    const row = measurementHistory.value.find((m) => m.id === draggedMeasurementOffset.id)
+    if (row) {
+      row.lineOffsetMm = draggedMeasurementOffset.startOffset + projectedDeltaPx * 1.4
+      rebuildSavedMeasurementsVisuals()
+    }
+    return
+  }
   if (!draggedModelGroup || !dragStartModelPos || !dragStartIntersection || !camera || !controls) return
   ev.preventDefault()
   ev.stopPropagation()
@@ -2135,6 +4515,20 @@ function onCanvasMouseMovePan(ev: MouseEvent) {
 }
 
 function onCanvasMouseUp(ev: MouseEvent) {
+  if (ev.button === 2) {
+    if (rightMouseDown && !rightMouseDragged && contextMenuCanShow.value && tryPickContextTarget(ev.clientX, ev.clientY)) {
+      showContextMenuAt(ev.clientX, ev.clientY)
+    }
+    rightMouseDown = false
+    rightMouseDragged = false
+    contextMenuCanShow.value = false
+  }
+  if (ev.button === 0 && draggedMeasurementOffset) {
+    draggedMeasurementOffset = null
+    ev.preventDefault()
+    ev.stopPropagation()
+    return
+  }
   if (ev.button === 0 && draggedModelGroup) {
     const movedId = String(draggedModelGroup.userData?.modelId ?? '')
     draggedModelGroup = null
@@ -2145,6 +4539,10 @@ function onCanvasMouseUp(ev: MouseEvent) {
     ev.stopPropagation()
     if (movedId && assemblyMates.value.length) {
       reapplyAllAssemblyMates()
+    } else if (movedId) {
+      meshGroup.updateMatrixWorld(true)
+      refreshSelectedMeasurementAfterTransform()
+      rebuildSavedMeasurementsVisuals()
     }
   }
 }
@@ -2152,6 +4550,7 @@ function onCanvasMouseUp(ev: MouseEvent) {
 function onCanvasWheel(ev: WheelEvent) {
   if (!camera || !controls || !containerRef.value) return
   ev.preventDefault()
+  normalizeMouseSettings()
   const now = performance.now()
   const rect = renderer.domElement.getBoundingClientRect()
   const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
@@ -2177,9 +4576,11 @@ function onCanvasWheel(ev: WheelEvent) {
   const dirFromPoint = camera.position.clone().sub(zoomAnchorPoint).normalize()
   camera.position.copy(zoomAnchorPoint).add(dirFromPoint.multiplyScalar(newDist))
   controls.target.copy(zoomAnchorPoint)
+  rebuildSavedMeasurementsVisuals()
 }
 
 function onCanvasClick(ev: MouseEvent) {
+  if (partContextMenuOpen.value) partContextMenuOpen.value = false
   if (didDragModel) {
     didDragModel = false
     return
@@ -2200,6 +4601,16 @@ function onCanvasClick(ev: MouseEvent) {
     }
     pickAssemblyPlaneFromHit(hits[0])
     return
+  }
+  if ((assemblyPanelOpen.value || (assemblySourceModelId.value && assemblyTargetModelId.value)) && hits.length > 0) {
+    const wrapper = findWrapperGroup(hits[0].object)
+    const modelId = String(wrapper?.userData?.modelId ?? '')
+    const autoTarget = modelId ? inferAutoAssemblyPickTarget(modelId) : null
+    if (autoTarget) {
+      assemblyPickTarget.value = autoTarget
+      pickAssemblyPlaneFromHit(hits[0])
+      return
+    }
   }
   if (sectionModeRef.value) {
     if (hits.length === 0) return
@@ -2230,6 +4641,8 @@ function onCanvasClick(ev: MouseEvent) {
     }
     const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
+    const wrapper = findWrapperGroup(hit.object)
+    const modelId = String(wrapper?.userData?.modelId ?? '')
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
       ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
       : Math.floor(hit.face!.a / 3)
@@ -2242,6 +4655,9 @@ function onCanvasClick(ev: MouseEvent) {
     }
     if (fit) {
       radiusOrDiameterResult = { center: fit.center, radius: fit.radius, normal, isDiameter: false }
+      const localCenter = wrapper ? vecToSaved(wrapper.worldToLocal(fit.center.clone())) : null
+      const localNormal = wrapper ? vecToSaved(worldNormalToLocal(wrapper, normal)) : null
+      saveRadiusMeasurement(fit.center, fit.radius, normal, modelId || null, localCenter, localNormal)
       logger.info(
         'Viewer3D',
         `MeasureClick#${clickId} radius fit: center=${formatVec3(fit.center)}, r=${fit.radius.toFixed(2)}`
@@ -2268,6 +4684,8 @@ function onCanvasClick(ev: MouseEvent) {
     }
     const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
+    const wrapper = findWrapperGroup(hit.object)
+    const modelId = String(wrapper?.userData?.modelId ?? '')
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
       ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
       : Math.floor(hit.face!.a / 3)
@@ -2286,6 +4704,9 @@ function onCanvasClick(ev: MouseEvent) {
       }
       if (!hole) return
       firstClickHole = { center: hole.center.clone(), radius: hole.radius, normal: hole.normal.clone() }
+      firstClickHoleModelId = modelId || null
+      firstClickHoleLocalCenter = wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null
+      firstClickHoleLocalNormal = wrapper ? vecToSaved(worldNormalToLocal(wrapper, hole.normal.clone())) : null
       radiusOrDiameterResult = { center: hole.center, radius: hole.radius, normal: hole.normal, isDiameter: true }
       updateMeasurementGraphics()
       logger.info(
@@ -2298,6 +4719,23 @@ function onCanvasClick(ev: MouseEvent) {
       secondHoleResult = { center: hole.center.clone(), radius: hole.radius, normal: hole.normal.clone() }
       measurementPoints = [firstClickHole.center.clone(), secondHoleResult.center.clone()]
       measurementPointNormals = [null, null]
+      measurementPointModelIds = [firstClickHoleModelId, modelId || null]
+      measurementPointLocals = [
+        firstClickHoleLocalCenter,
+        wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null,
+      ]
+      measurementPointNormalLocals = [firstClickHoleLocalNormal, wrapper ? vecToSaved(worldNormalToLocal(wrapper, hole.normal.clone())) : null]
+      saveDiameterMeasurement(
+        firstClickHole.center,
+        firstClickHole.radius,
+        firstClickHole.normal,
+        firstClickHoleModelId,
+        firstClickHoleLocalCenter,
+        firstClickHoleLocalNormal,
+        hole.center.clone(),
+        modelId || null,
+        wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null,
+      )
     } else {
       const candidates = getSnapCandidates(hit)
       const closest = getClosestSnapPoint(candidates, camera, mouse)
@@ -2305,6 +4743,23 @@ function onCanvasClick(ev: MouseEvent) {
       const worldNormal = hit.face!.normal.clone().transformDirection(mesh.matrixWorld).normalize()
       measurementPoints = [firstClickHole.center.clone(), point]
       measurementPointNormals = [firstClickHole.normal.clone(), worldNormal]
+      measurementPointModelIds = [firstClickHoleModelId, modelId || null]
+      measurementPointLocals = [
+        firstClickHoleLocalCenter,
+        wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null,
+      ]
+      measurementPointNormalLocals = [
+        firstClickHoleLocalNormal,
+        wrapper ? vecToSaved(worldNormalToLocal(wrapper, worldNormal.clone())) : null,
+      ]
+      saveDiameterMeasurement(
+        firstClickHole.center,
+        firstClickHole.radius,
+        firstClickHole.normal,
+        firstClickHoleModelId,
+        firstClickHoleLocalCenter,
+        firstClickHoleLocalNormal,
+      )
     }
     updateMeasurementGraphics()
     logger.info(
@@ -2330,10 +4785,14 @@ function onCanvasClick(ev: MouseEvent) {
       return
     }
     const result = shortestPathOnMesh(arcMesh!, arcFirstPoint, point)
+    const arcWrapper = findWrapperGroup(mesh)
+    const arcModelId = String(arcWrapper?.userData?.modelId ?? '')
     arcFirstPoint = null
     arcMesh = null
     if (result) {
       arcResult = result
+      const arcPathLocal = arcWrapper ? result.path.map((p) => vecToSaved(arcWrapper.worldToLocal(p.clone()))) : null
+      saveArcMeasurement(result.path, result.length, arcModelId || null, arcPathLocal)
       updateMeasurementGraphics()
       logger.info(
         'Viewer3D',
@@ -2342,6 +4801,14 @@ function onCanvasClick(ev: MouseEvent) {
     } else {
       logger.warn('Viewer3D', `MeasureClick#${clickId} arc: path not found`)
     }
+    return
+  }
+  if (measureType === 'cad-linear') {
+    if (hits.length === 0) {
+      cadLinearStatus.value = 'Линейный размер: кликните по плоскости модели.'
+      return
+    }
+    pickCadLinearPlaneFromHit(hits[0])
     return
   }
   if (measureType === 'hole-center-distance') {
@@ -2406,6 +4873,8 @@ function onCanvasClick(ev: MouseEvent) {
   }
   const hit = hits[0]
   const mesh = hit.object as THREE.Mesh
+  const wrapper = findWrapperGroup(hit.object)
+  const modelId = String(wrapper?.userData?.modelId ?? '')
   const face = hit.face!
   const pos = mesh.geometry.attributes.position
   const faceIndex =
@@ -2462,12 +4931,20 @@ function onCanvasClick(ev: MouseEvent) {
     clearMeasurements()
     measurementPoints = [point]
     measurementPointNormals = [worldNormal]
+    measurementPointModelIds = [modelId || null]
+    measurementPointLocals = [wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null]
+    measurementPointNormalLocals = [wrapper ? vecToSaved(worldNormalToLocal(wrapper, worldNormal.clone())) : null]
     const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
   } else {
     measurementPoints.push(point)
     const normalToPush = worldNormal ?? (measurementPointNormals.length > 0 ? measurementPointNormals[0] : null)
     measurementPointNormals.push(normalToPush)
+    measurementPointModelIds.push(modelId || null)
+    measurementPointLocals.push(wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null)
+    measurementPointNormalLocals.push(
+      wrapper && normalToPush ? vecToSaved(worldNormalToLocal(wrapper, normalToPush.clone())) : null,
+    )
     const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
     logger.info(
@@ -2504,6 +4981,20 @@ let arcMesh: THREE.Mesh | null = null
 let holeCenterFirst: THREE.Vector3 | null = null
 let firstClickHole: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
 let secondHoleResult: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
+let firstClickHoleModelId: string | null = null
+let firstClickHoleLocalCenter: SavedVec3 | null = null
+let firstClickHoleLocalNormal: SavedVec3 | null = null
+let cadLinearPlanePoint: THREE.Vector3 | null = null
+let cadLinearPlaneNormal: THREE.Vector3 | null = null
+let cadLinearPlaneModelId: string | null = null
+let cadLinearPlaneLocalPoint: SavedVec3 | null = null
+let cadLinearPlaneLocalNormal: SavedVec3 | null = null
+type CadLinearPickTarget = 'plane1' | 'plane2' | 'display' | null
+const cadLinearPickTarget = ref<CadLinearPickTarget>(null)
+const cadLinearPlane1 = ref<AssemblyPlaneSelection | null>(null)
+const cadLinearPlane2 = ref<AssemblyPlaneSelection | null>(null)
+const cadLinearDisplayPlane = ref<AssemblyPlaneSelection | null>(null)
+const cadLinearStatus = ref('')
 let diameterSecondLabelEl: HTMLDivElement | null = null
 let measureClickSeq = 0
 
@@ -2967,7 +5458,12 @@ function updateMeasurementGraphics() {
     measurementArcPathLine = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xff8800 }))
     measureGroup.add(measurementArcPathLine)
   }
-  if (measureType !== 'distance' && measureType !== 'hole-center-distance' && !(measureType === 'diameter' && measurementPoints.length === 2)) {
+  if (
+    measureType !== 'distance'
+    && measureType !== 'hole-center-distance'
+    && measureType !== 'cad-linear'
+    && !(measureType === 'diameter' && measurementPoints.length === 2)
+  ) {
     logger.info('Viewer3D', `updateMeasurementGraphics done (non-distance): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
@@ -3022,44 +5518,52 @@ function updateMeasurementGraphics() {
     return
   }
   {
-    const delta = B.clone().sub(A)
-    const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
-    const Bprime = B.clone().sub(perpComp)
-    const segs = [
-      { a: A, b: B, color: AXIS_COLOR_X },
-      { a: A, b: Bprime, color: AXIS_COLOR_Y },
-      { a: Bprime, b: B, color: AXIS_COLOR_Z },
-    ]
-    for (const seg of segs) {
-      const geom = new THREE.BufferGeometry().setFromPoints([seg.a, seg.b])
-      const mat = new THREE.LineBasicMaterial({ color: seg.color })
-      const line = new THREE.Line(geom, mat)
-      measureGroup.add(line)
-      measurementTriangleLines.push(line)
-    }
     const nA = measurementPointNormals[0] ?? null
     const nB = measurementPointNormals[1] ?? null
-    let basePoint: THREE.Vector3 | null = null
-    let baseNormal: THREE.Vector3 | null = null
-    let otherPoint: THREE.Vector3 | null = null
-    if (nB) {
-      basePoint = B
-      baseNormal = nB.clone().normalize()
-      otherPoint = A
-    } else if (nA) {
-      basePoint = A
-      baseNormal = nA.clone().normalize()
-      otherPoint = B
+    const strict = projectPerpendicularByNormals(A, B, nA, nB)
+    const srcA = strict ? strict.projected : A
+    const srcB = strict ? strict.otherPoint : B
+    const n = (nB ?? nA ?? new THREE.Vector3(0, 1, 0)).clone().normalize()
+    const dir = srcB.clone().sub(srcA).normalize()
+    let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+    if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+    offsetDir = orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+    const off = Math.max(2, dimLineOffsetMm.value)
+    const pA = srcA.clone().add(offsetDir.clone().multiplyScalar(off))
+    const pB = srcB.clone().add(offsetDir.clone().multiplyScalar(off))
+    const extA = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([srcA, pA]),
+      new THREE.LineBasicMaterial({ color: 0x66ccff }),
+    )
+    const extB = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([srcB, pB]),
+      new THREE.LineBasicMaterial({ color: 0x66ccff }),
+    )
+    const dim = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([pA, pB]),
+      new THREE.LineBasicMaterial({ color: 0x66ccff }),
+    )
+    measureGroup.add(extA, extB, dim)
+    measurementTriangleLines.push(extA, extB, dim)
+    const addArrowPreview = (tip: THREE.Vector3, dirToInside: THREE.Vector3) => {
+      const arrow = Math.max(3, dimArrowSizeMm.value)
+      const u = dirToInside.clone().normalize()
+      const aux = Math.abs(u.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
+      const v = new THREE.Vector3().crossVectors(u, aux).normalize()
+      const b = tip.clone().add(u.clone().multiplyScalar(arrow))
+      const l1 = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([tip, b.clone().add(v.clone().multiplyScalar(arrow * 0.45))]),
+        new THREE.LineBasicMaterial({ color: 0x66ccff }),
+      )
+      const l2 = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([tip, b.clone().add(v.clone().multiplyScalar(-arrow * 0.45))]),
+        new THREE.LineBasicMaterial({ color: 0x66ccff }),
+      )
+      measureGroup.add(l1, l2)
+      measurementTriangleLines.push(l1, l2)
     }
-    if (basePoint && baseNormal && otherPoint) {
-      const v = otherPoint.clone().sub(basePoint)
-      const distSigned = v.dot(baseNormal)
-      const proj = otherPoint.clone().sub(baseNormal.clone().multiplyScalar(distSigned))
-      const perpGeom = new THREE.BufferGeometry().setFromPoints([otherPoint, proj])
-      const perpMat = new THREE.LineBasicMaterial({ color: 0xffff00 })
-      measurementPerpLine = new THREE.Line(perpGeom, perpMat)
-      measureGroup.add(measurementPerpLine)
-    }
+    addArrowPreview(pA, pB.clone().sub(pA))
+    addArrowPreview(pB, pA.clone().sub(pB))
   }
   logger.info('Viewer3D', `updateMeasurementGraphics done: ${(performance.now() - t0).toFixed(1)} ms`)
 }
@@ -3079,6 +5583,9 @@ function clearMeasurements() {
   measurementTriangleLines = []
   measurementPoints = []
   measurementPointNormals = []
+  measurementPointModelIds = []
+  measurementPointLocals = []
+  measurementPointNormalLocals = []
   for (const g of measurementFaceGeometries) g.dispose()
   measurementFaceGeometries = []
   while (measurementPlanesGroup.children.length) {
@@ -3118,6 +5625,14 @@ function clearMeasurements() {
   holeCenterFirst = null
   firstClickHole = null
   secondHoleResult = null
+  firstClickHoleModelId = null
+  firstClickHoleLocalCenter = null
+  firstClickHoleLocalNormal = null
+  cadLinearPlanePoint = null
+  cadLinearPlaneNormal = null
+  cadLinearPlaneModelId = null
+  cadLinearPlaneLocalPoint = null
+  cadLinearPlaneLocalNormal = null
   if (measurementLabelEl) measurementLabelEl.style.display = 'none'
   if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
   if (measurementLabelEl0) measurementLabelEl0.style.display = 'none'
@@ -3136,11 +5651,12 @@ function setMeasureMode(enabled: boolean) {
 }
 
 function setMeasureSnapMode(mode: MeasureSnapMode) {
-  measureSnapMode = mode
+  // Режим привязки выбирается автоматически, ручное переключение отключено.
+  measureSnapMode = 'intersection'
 }
 
 function getMeasureSnapMode(): MeasureSnapMode {
-  return measureSnapMode
+  return 'intersection'
 }
 
 function setMeasureType(type: MeasureType) {
@@ -3148,8 +5664,15 @@ function setMeasureType(type: MeasureType) {
   if (type !== 'distance') {
     measurementPoints = []
     measurementPointNormals = []
+    measurementPointModelIds = []
+    measurementPointLocals = []
+    measurementPointNormalLocals = []
     for (const g of measurementFaceGeometries) g.dispose()
     measurementFaceGeometries = []
+  }
+  if (type !== 'cad-linear') {
+    clearCadLinearPicks()
+    cadLinearStatus.value = ''
   }
   radiusOrDiameterResult = null
   arcResult = null
@@ -3158,10 +5681,20 @@ function setMeasureType(type: MeasureType) {
   holeCenterFirst = null
   firstClickHole = null
   secondHoleResult = null
+  firstClickHoleModelId = null
+  firstClickHoleLocalCenter = null
+  firstClickHoleLocalNormal = null
+  cadLinearPlanePoint = null
+  cadLinearPlaneNormal = null
+  cadLinearPlaneModelId = null
+  cadLinearPlaneLocalPoint = null
+  cadLinearPlaneLocalNormal = null
+  clearCadLinearPicks()
+  cadLinearStatus.value = ''
   updateMeasurementGraphics()
 }
 
-/** Snap candidates for one triangle: 3 vertices, face center, 3 edge midpoints (world). Filtered by measureSnapMode. */
+/** Автопривязка для одной грани: пересечение, вершины, центр, середины рёбер. */
 function getSnapCandidates(hit: THREE.Intersection): THREE.Vector3[] {
   const mesh = hit.object as THREE.Mesh
   const face = hit.face!
@@ -3174,11 +5707,8 @@ function getSnapCandidates(hit: THREE.Intersection): THREE.Vector3[] {
   const midAB = vA.clone().add(vB).multiplyScalar(0.5)
   const midBC = vB.clone().add(vC).multiplyScalar(0.5)
   const midCA = vC.clone().add(vA).multiplyScalar(0.5)
-  if (measureSnapMode === 'vertex') return [vA, vB, vC]
-  if (measureSnapMode === 'face') return [center]
-  if (measureSnapMode === 'edge') return [midAB, midBC, midCA]
-  if (measureSnapMode === 'intersection') return [hit.point.clone()]
-  return [vA, vB, vC, center, midAB, midBC, midCA]
+  // Автопривязка: не требуем ручного выбора "вершина/ребро/грань".
+  return [hit.point.clone(), vA, vB, vC, center, midAB, midBC, midCA]
 }
 
 /** Pick candidate closest to cursor in NDC (within threshold). */
@@ -3419,12 +5949,25 @@ function clearMeshGroup() {
       })
     }
   }
+  overlayGroupByModelId.forEach((_g, id) => removeOverlayForModel(id, true))
+  overlaySourceByModelId.clear()
+  hiddenOutlineByComponentId.forEach((helper) => {
+    hiddenOutlineGroup.remove(helper)
+    helper.geometry.dispose()
+    ;(helper.material as THREE.Material).dispose()
+  })
+  hiddenOutlineByComponentId.clear()
+  componentTreeByModel.value = {}
+  selectedComponentRowId.value = null
+  clearComponentHighlight()
 }
 
 function loadGlbUrl(
   url: string,
   loadStartedAt?: number,
-  opts?: { modelId: string; modelName: string }
+  opts?: { modelId: string; modelName: string },
+  partMeta?: PartColorMeta | null,
+  stepMetaPayload?: any
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const loader = new GLTFLoader()
@@ -3436,12 +5979,27 @@ function loadGlbUrl(
         if (opts) {
           wrapper.userData = { modelId: opts.modelId }
           modelGroupsById.set(opts.modelId, wrapper)
+          if (stepMetaPayload?.assemblyMap) {
+            assemblyMapByModel.value = { ...assemblyMapByModel.value, [opts.modelId]: stepMetaPayload.assemblyMap }
+          }
         } else {
           clearMeshGroup()
           modelGroupsById.clear()
           loadedModels.value = []
         }
         wrapper.add(gltf.scene)
+        const splitCount = splitMergedMeshesUsingSpec(gltf.scene, stepMetaPayload)
+        if (splitCount > 0) logger.info('Viewer3D', `Геометрия разбита на компоненты: +${splitCount} мешей`)
+        if (stepMetaPayload?.assemblyMap) {
+          const mm = applyAssemblyMapMatching(gltf.scene, stepMetaPayload.assemblyMap)
+          logger.info('Viewer3D', `assembly-map matching: ${mm.matched}/${mm.total}`)
+        }
+        ensureExplodeCacheForModel(wrapper)
+        markImportedMeshColors(gltf.scene)
+        if (partMeta) {
+          const r = bindPartMetaToMeshes(gltf.scene, partMeta)
+          logger.info('Viewer3D', `meta.json загружен: привязано ${r.mapped}/${r.totalMeshes} мешей`)
+        }
         if (opts && meshGroup.children.length > 0) {
           const box = new THREE.Box3().setFromObject(wrapper)
           const size = box.getSize(new THREE.Vector3())
@@ -3453,6 +6011,10 @@ function loadGlbUrl(
           if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
         }
         meshGroup.add(wrapper)
+        if (opts) ensureOverlayForModel(opts.modelId, wrapper)
+        if (opts) buildComponentTreeForModel(opts.modelId, wrapper, stepMetaPayload)
+        // applyExplodeForModel(wrapper, explodeAmount.value)
+        updateOverlayVisuals()
         applyShadingMode()
         if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
@@ -3470,6 +6032,7 @@ function loadGlbUrl(
           const inScene = visibleCount < MAX_MODELS_IN_SCENE
           if (!inScene) {
             meshGroup.remove(wrapper)
+            if (opts) removeOverlayForModel(opts.modelId)
             wrapper.visible = false
             modelGroupsById.set(opts.modelId, wrapper)
             logger.info('Viewer3D', `Лимит сцены (${MAX_MODELS_IN_SCENE}): модель добавлена в библиотеку`)
@@ -3563,6 +6126,11 @@ async function loadSTL(
     if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
   }
   meshGroup.add(wrapper)
+  // ensureExplodeCacheForModel(wrapper)
+  if (opts) ensureOverlayForModel(opts.modelId, wrapper)
+  if (opts) buildComponentTreeForModel(opts.modelId, wrapper)
+  // applyExplodeForModel(wrapper, explodeAmount.value)
+  updateOverlayVisuals()
   if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
   if (currentSectionAxis) setSectionAxis(currentSectionAxis)
   else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
@@ -3576,6 +6144,7 @@ async function loadSTL(
     const inScene = visibleCount < MAX_MODELS_IN_SCENE
     if (!inScene) {
       meshGroup.remove(wrapper)
+      if (opts) removeOverlayForModel(opts.modelId)
       wrapper.visible = false
       modelGroupsById.set(opts.modelId, wrapper)
       logger.info('Viewer3D', `Лимит сцены (${MAX_MODELS_IN_SCENE}): модель добавлена в библиотеку`)
@@ -3643,9 +6212,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   })
 }
 
-function handleFile(file: File): Promise<void> {
+function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Promise<void> {
   return new Promise((resolve, reject) => {
     const ext = (file.name.split('.').pop() || '').toLowerCase()
+    const baseName = file.name.replace(/\.[^.]+$/, '').toLowerCase()
+    let partMeta: PartColorMeta | null = metaByBaseName?.get(baseName) ?? null
     logger.info('Viewer3D', `Загрузка модели: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`)
     console.groupCollapsed(`${LOG_PREFIX} Загрузка файла: ${file.name}`)
     console.log('имя:', file.name)
@@ -3657,6 +6228,17 @@ function handleFile(file: File): Promise<void> {
     const reader = new FileReader()
     reader.onload = async () => {
       const buf = reader.result as ArrayBuffer
+      let assemblyMap: any | null = null
+      if (!partMeta) {
+        partMeta = await tryLoadPartMetaByBaseName(baseName)
+      }
+      if (!partMeta && ['step', 'stp', 'igs', 'iges'].includes(ext)) {
+        partMeta = await tryLoadKompasMetaAuto(file.name)
+      }
+      if (['step', 'stp', 'igs', 'iges'].includes(ext)) {
+        assemblyMap = await tryLoadKompasAssemblyMapAuto(file.name)
+      }
+      if (!partMeta) logger.info('Viewer3D', `meta.json не найден для "${baseName}" (используем цвета из GLB/конвертера)`)
     console.log('ArrayBuffer (байт):', buf?.byteLength ?? 0)
     if (ext === 'stl') {
       console.log('формат: STL — загрузка через STLLoader')
@@ -3728,7 +6310,7 @@ function handleFile(file: File): Promise<void> {
         }
         const meta = metaPromise ? await metaPromise : null
         stepMeta.value = meta
-        await loadGlbUrl(glbUrl, performance.now(), opts)
+        await loadGlbUrl(glbUrl, performance.now(), opts, partMeta, { ...(meta || {}), assemblyMap })
         const totalMs = performance.now() - t0
         logger.info('Viewer3D', `Модель загружена: ${file.name} за ${(totalMs / 1000).toFixed(2)} с`)
         console.log(`${LOG_PREFIX} Модель загружена. Всего: ${(totalMs / 1000).toFixed(2)} с`)
@@ -3749,7 +6331,7 @@ function handleFile(file: File): Promise<void> {
       console.groupEnd()
       const url = URL.createObjectURL(file)
       try {
-        await loadGlbUrl(url, performance.now(), opts)
+        await loadGlbUrl(url, performance.now(), opts, partMeta, { ...(stepMeta.value || {}), assemblyMap })
       } finally {
         URL.revokeObjectURL(url)
       }
@@ -3780,13 +6362,22 @@ function handleFile(file: File): Promise<void> {
         .then(async (res) => {
           console.log(`${LOG_PREFIX} JT fetch response ok:`, res.ok, res.status)
           if (!res.ok) {
-            const text = await res.text()
-            let msg = res.statusText
+            let text = ''
             try {
-              const body = JSON.parse(text)
-              msg = body.detail ? `${body.error || ''}: ${body.detail}` : (body.error || msg)
-            } catch (_) {
-              if (text) msg = text.slice(0, 200)
+              text = await res.text()
+            } catch {
+              // some converter backends close body stream on 5xx
+            }
+            let msg = `${res.status} ${res.statusText}`.trim()
+            if (text) {
+              try {
+                const body = JSON.parse(text)
+                msg = body.detail ? `${body.error || ''}: ${body.detail}` : (body.error || msg)
+              } catch (_) {
+                msg = text.slice(0, 300)
+              }
+            } else if (res.status >= 500) {
+              msg = `${msg}. Сервис JT-конвертации недоступен или упал на обработке файла.`
             }
             throw new Error(msg)
           }
@@ -3795,7 +6386,7 @@ function handleFile(file: File): Promise<void> {
         .then((blob) => {
           console.log(`${LOG_PREFIX} JT blob size:`, blob.size, blob.type)
           const url = URL.createObjectURL(blob)
-          return loadGlbUrl(url, performance.now())
+          return loadGlbUrl(url, performance.now(), undefined, null, stepMeta.value)
         })
         .then(() => {
           console.log(`${LOG_PREFIX} JT loadGlbUrl done`)
@@ -3839,14 +6430,25 @@ function openFileDialog() {
       const files = fileInput?.files
       if (files?.length) {
         const arr = Array.from(files)
+        const metaByBaseName = new Map<string, PartColorMeta>()
+        for (const f of arr) {
+          if (!f.name.toLowerCase().endsWith('.json')) continue
+          const baseName = f.name.replace(/\.meta\.json$/i, '').replace(/\.json$/i, '').toLowerCase()
+          try {
+            const parsed = parsePartColorMeta(JSON.parse(await f.text()))
+            if (parsed) metaByBaseName.set(baseName, parsed)
+          } catch {
+            logger.warn('Viewer3D', `Файл ${f.name} пропущен: это невалидный meta.json`)
+          }
+        }
         if (arr.length > MAX_FILES_SELECT) {
           logger.warn('Viewer3D', `Выбрано ${arr.length} файлов, загружаем первые ${MAX_FILES_SELECT}`)
           alert(`Выбрано ${arr.length} файлов. Загружаем первые ${MAX_FILES_SELECT} для стабильной работы.`)
         }
-        const toLoad = arr.slice(0, MAX_FILES_SELECT)
+        const toLoad = arr.filter((f) => !f.name.toLowerCase().endsWith('.json')).slice(0, MAX_FILES_SELECT)
         for (const file of toLoad) {
           try {
-            await handleFile(file)
+            await handleFile(file, metaByBaseName)
           } catch (e) {
             logger.error('Viewer3D', `Ошибка загрузки ${file.name}`, e)
           }
@@ -3964,9 +6566,14 @@ function exportStl(): void {
 
 onMounted(() => {
   initScene()
+  applyDefaultFloatingPanelPositions()
+  setTimeout(() => {
+    clampFloatingPanelsToViewport()
+    setupFloatingPanelsAutoLayout()
+  }, 0)
   document.addEventListener('mousedown', onOrientationClickOutside)
   document.addEventListener('mousedown', onMouseSettingsClickOutside)
-  document.addEventListener('mousedown', onScenePanelOrientationClickOutside)
+  document.addEventListener('mousedown', onGlobalMouseDown)
   window.addEventListener('keydown', onWindowKeyDown)
   getOpenCascade().then(() => {
     console.log(`${LOG_PREFIX} WASM предзагружен (первый STEP/IGES откроется быстрее)`)
@@ -3974,11 +6581,15 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  floatingPanelsResizeObserver?.disconnect()
+  floatingPanelsResizeObserver = null
   window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
   window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
+  window.removeEventListener('mousemove', onAssemblyPanelMouseMove)
+  window.removeEventListener('mouseup', onAssemblyPanelMouseUp)
   document.removeEventListener('mousedown', onOrientationClickOutside)
   document.removeEventListener('mousedown', onMouseSettingsClickOutside)
-  document.removeEventListener('mousedown', onScenePanelOrientationClickOutside)
+  document.removeEventListener('mousedown', onGlobalMouseDown)
   window.removeEventListener('keydown', onWindowKeyDown)
   window.removeEventListener('resize', onResize)
   if (containerRef.value) {
@@ -3987,6 +6598,7 @@ onUnmounted(() => {
   if (renderer?.domElement) {
     renderer.domElement.removeEventListener('click', onCanvasClick)
     renderer.domElement.removeEventListener('mousedown', onCanvasMouseDown, true)
+    renderer.domElement.removeEventListener('contextmenu', onCanvasContextMenu)
     renderer.domElement.removeEventListener('mousemove', onCanvasMouseMove, false)
     renderer.domElement.removeEventListener('mousemove', onCanvasMouseMovePan, true)
     renderer.domElement.removeEventListener('mouseup', onCanvasMouseUp, true)
@@ -4000,6 +6612,10 @@ onUnmounted(() => {
     highlightGroup.remove(c)
     if ('geometry' in c && c.geometry) c.geometry.dispose()
     if ('material' in c && c.material) (c.material as THREE.Material).dispose()
+  }
+  clearSavedMeasurementVisuals()
+  if (savedMeasurementsGroup && scene) {
+    scene.remove(savedMeasurementsGroup)
   }
   if (sectionPlaneMesh) {
     scene.remove(sectionPlaneMesh)
@@ -4041,6 +6657,7 @@ onUnmounted(() => {
     containerRef.value.removeChild(hoverTooltipEl)
   }
   hoverTooltipEl = null
+  clearMeshGroup()
   if (animationId) cancelAnimationFrame(animationId)
   stripStaleAssemblyFaceTriangles()
   disposeAssemblyHighlightGroupMeshes()
@@ -4122,14 +6739,19 @@ function setModelInScene(id: string, inScene: boolean) {
         if (maxX > -Infinity) group.position.x = maxX + size.x / 2 + 30
       }
       meshGroup.add(group)
+      ensureOverlayForModel(id, group)
+      if (!componentTreeByModel.value[id]) buildComponentTreeForModel(id, group)
     }
     if (wireframeModeRef.value) applyWireframeToObject(group, true)
     applyShadingMode()
     group.visible = true
   } else {
     meshGroup.remove(group)
+    removeOverlayForModel(id)
     group.visible = false
   }
+  updateOverlayVisuals()
+  refreshComponentTreeVisibility(id)
   loadedModels.value = loadedModels.value.map((m) => (m.id === id ? { ...m, inScene } : m))
   if (meshGroup.children.length > 0) {
     const box = new THREE.Box3().setFromObject(meshGroup)
@@ -4142,6 +6764,20 @@ function removeModel(id: string) {
   const group = modelGroupsById.get(id)
   if (!group || !meshGroup) return
   meshGroup.remove(group)
+  removeOverlayForModel(id, true)
+  const { [id]: _removed, ...restTrees } = componentTreeByModel.value
+  componentTreeByModel.value = restTrees
+  const { [id]: _removedMap, ...restMaps } = assemblyMapByModel.value
+  assemblyMapByModel.value = restMaps
+  for (const [key, helper] of hiddenOutlineByComponentId.entries()) {
+    if (!key.startsWith(`${id}:`)) continue
+    hiddenOutlineGroup.remove(helper)
+    helper.geometry.dispose()
+    ;(helper.material as THREE.Material).dispose()
+    hiddenOutlineByComponentId.delete(key)
+  }
+  if (selectedComponentRowId.value?.startsWith(`${id}:`)) selectedComponentRowId.value = null
+  clearComponentHighlight()
   group.traverse((obj: THREE.Object3D) => {
     if (obj instanceof THREE.Mesh) {
       obj.geometry?.dispose()
@@ -4156,9 +6792,23 @@ function removeModel(id: string) {
   assemblyMates.value = assemblyMates.value.filter(
     (m) => m.sourceId !== id && m.targetId !== id,
   )
+  measurementHistory.value = measurementHistory.value.filter((m) => {
+    if (m.modelId1 === id || m.modelId2 === id) return false
+    if (m.centerModelId === id || m.secondCenterModelId === id) return false
+    if (m.arcModelId === id) return false
+    if (m.outputPlaneModelId === id) return false
+    return true
+  })
   if (selectedAssemblyMateId.value && !assemblyMates.value.some((m) => m.id === selectedAssemblyMateId.value)) {
     selectedAssemblyMateId.value = null
   }
+  if (selectedMeasurementId.value && !measurementHistory.value.some((m) => m.id === selectedMeasurementId.value)) {
+    selectedMeasurementId.value = null
+    clearMeasurements()
+  } else {
+    refreshSelectedMeasurementAfterTransform()
+  }
+  rebuildSavedMeasurementsVisuals()
   refreshAllAssemblyVisuals()
   loadedFileName = loadedModels.value.length > 0 ? loadedModels.value[loadedModels.value.length - 1].name : null
   if (meshGroup.children.length > 0) {
@@ -4215,12 +6865,15 @@ defineExpose({
 
     <header class="viewer-3d-header" v-show="activeTab === 'viewer'">
       <span class="viewer-3d-title">3D</span>
+      <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть 3D</button>
+      <div class="viewer-header-tabs">
+        <button type="button" :class="{ active: headerToolsTab === 'viewTools' }" @click="headerToolsTab = 'viewTools'">Вид и инструменты</button>
+        <button type="button" :class="{ active: headerToolsTab === 'display' }" @click="headerToolsTab = 'display'">Отображение</button>
+        <button type="button" :class="{ active: headerToolsTab === 'export' }" @click="headerToolsTab = 'export'">Экспорт</button>
+      </div>
       <div class="viewer-3d-tools">
-        <div class="viewer-header-block" data-group="Файл">
-          <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть модель</button>
+        <div v-show="headerToolsTab === 'viewTools'" class="viewer-header-block" data-group="Вид и инструменты">
           <button type="button" class="viewer-3d-btn" @click="resetView">Вид по умолчанию</button>
-        </div>
-        <div class="viewer-header-block" data-group="Вид">
           <div ref="orientationDropdownRef" class="viewer-orientation-dropdown">
           <button
             type="button"
@@ -4260,8 +6913,9 @@ defineExpose({
             </div>
           </Transition>
           </div>
-        </div>
-        <div class="viewer-header-block" data-group="Мышь">
+          <button type="button" class="viewer-3d-btn" title="Фокус на модели (F)" @click="focusModelInView">Фокус</button>
+          <button type="button" class="viewer-3d-btn" title="Перпендикулярно к выбранной грани" @click="viewPerpendicularToFace">Перпендикулярно</button>
+          <button type="button" class="viewer-3d-btn" :class="{ active: showGroundGrid }" title="Сетка пола" @click="toggleGroundGrid">Сетка</button>
           <div ref="mouseSettingsDropdownRef" class="viewer-orientation-dropdown viewer-mouse-dropdown">
           <button
             type="button"
@@ -4311,10 +6965,11 @@ defineExpose({
                 <input
                   v-model.number="mouseZoomSpeed"
                   type="number"
-                  min="0.005"
-                  max="0.2"
+                  min="0.01"
+                  max="0.09"
                   step="0.005"
                   class="viewer-mouse-input"
+                  @change="applyMouseSettings"
                 />
               </div>
               <div class="viewer-mouse-row viewer-mouse-row-check">
@@ -4326,8 +6981,8 @@ defineExpose({
                 <input
                   v-model.number="mouseRotateSpeed"
                   type="number"
-                  min="1"
-                  max="20"
+                  min="2.2"
+                  max="8.8"
                   step="0.5"
                   class="viewer-mouse-input"
                   @change="applyMouseSettings"
@@ -4338,8 +6993,8 @@ defineExpose({
                 <input
                   v-model.number="mousePanSpeed"
                   type="number"
-                  min="0.5"
-                  max="10"
+                  min="0.7"
+                  max="3.5"
                   step="0.5"
                   class="viewer-mouse-input"
                   @change="applyMouseSettings"
@@ -4350,8 +7005,8 @@ defineExpose({
                 <input
                   v-model.number="mouseDamping"
                   type="number"
-                  min="0.05"
-                  max="0.8"
+                  min="0.12"
+                  max="0.4"
                   step="0.01"
                   class="viewer-mouse-input"
                   @change="applyMouseSettings"
@@ -4362,10 +7017,11 @@ defineExpose({
                 <input
                   v-model.number="mouseZoomGestureMs"
                   type="number"
-                  min="100"
-                  max="2000"
+                  min="180"
+                  max="900"
                   step="50"
                   class="viewer-mouse-input"
+                  @change="applyMouseSettings"
                 />
               </div>
               <div class="viewer-mouse-row viewer-mouse-row-check">
@@ -4375,8 +7031,34 @@ defineExpose({
             </div>
           </Transition>
           </div>
+          <button type="button" class="viewer-3d-btn" :class="{ active: sectionMode }" @click="emit('section-mode')">Сечение</button>
+          <button type="button" class="viewer-3d-btn btn-fix" title="Зафиксировать сечение" @click="emit('fix-section')">✓</button>
+          <button type="button" class="viewer-3d-btn btn-clear" title="Снять сечение" @click="emit('clear-section')">✕</button>
+          <template v-if="sectionActive">
+            <input
+              type="number"
+              class="viewer-3d-offset"
+              :min="SECTION_OFFSET_MIN"
+              :max="SECTION_OFFSET_MAX"
+              :step="SECTION_OFFSET_STEP"
+              :value="sectionOffset ?? 0"
+              @input="onHeaderOffsetInput"
+              @wheel.prevent="onHeaderOffsetWheel($event, sectionOffset ?? 0)"
+            />
+            <input
+              type="range"
+              class="viewer-3d-slider"
+              :min="SECTION_OFFSET_MIN"
+              :max="SECTION_OFFSET_MAX"
+              :step="SECTION_OFFSET_STEP"
+              :value="sectionOffset ?? 0"
+              @input="onHeaderOffsetInput"
+            />
+          </template>
+          <button type="button" class="viewer-3d-btn" :class="{ active: measureMode }" @click="emit('measure')">Измерение</button>
+          <button type="button" class="viewer-3d-btn" :class="{ active: assemblyPanelOpen }" @click="assemblyPanelOpen = !assemblyPanelOpen">Сборка</button>
         </div>
-        <div class="viewer-header-block viewer-header-block-frame" data-group="Отображение">
+        <div v-show="headerToolsTab === 'display'" class="viewer-header-block viewer-header-block-frame" data-group="Отображение">
           <button
             type="button"
             class="viewer-3d-btn"
@@ -4406,53 +7088,49 @@ defineExpose({
             :value="frameOpacityRef"
             @input="onFrameOpacityInput"
           />
-        </div>
-        <div class="viewer-header-block" data-group="Сечение">
-          <button
-            type="button"
-            class="viewer-3d-btn"
-            :class="{ active: sectionMode }"
-            title="Клик по модели задаёт плоскость сечения"
-            @click="emit('section-mode')"
-          >
-            Сечение
-          </button>
-          <button type="button" class="viewer-3d-btn btn-fix" title="Зафиксировать сечение" @click="emit('fix-section')">✓</button>
-          <button type="button" class="viewer-3d-btn btn-clear" title="Снять сечение" @click="emit('clear-section')">✕</button>
-          <template v-if="sectionActive">
-            <input
-              type="number"
-              class="viewer-3d-offset"
-              :min="SECTION_OFFSET_MIN"
-              :max="SECTION_OFFSET_MAX"
-              :step="SECTION_OFFSET_STEP"
-              :value="sectionOffset ?? 0"
-              @input="onHeaderOffsetInput"
-              @wheel.prevent="onHeaderOffsetWheel($event, sectionOffset ?? 0)"
-            />
+          <label class="viewer-part-colors-toggle" title="Полупрозрачная цветовая маска поверх модели">
+            <input v-model="overlayEnabled" type="checkbox" @change="onOverlayEnabledChange" />
+            Оверлей
+          </label>
+          <input
+            type="number"
+            class="viewer-frame-opacity-input"
+            :min="OVERLAY_OPACITY_MIN"
+            :max="OVERLAY_OPACITY_MAX"
+            :step="OVERLAY_OPACITY_STEP"
+            :value="overlayOpacity"
+            title="Прозрачность оверлея"
+            @input="onOverlayOpacityInput"
+          />
+          <label class="viewer-scene-shading" title="Режим шейдинга модели">
+            <span>Свет</span>
+            <select class="viewer-scene-select" :value="shadingMode" @change="onShadingModeChange">
+              <option value="lit">Обычный</option>
+              <option value="unlit">Светлый</option>
+            </select>
+          </label>
+          <label class="viewer-scene-shading" title="Пресет освещения">
+            <span>Пресет</span>
+            <select class="viewer-scene-select" :value="lightPreset" @change="onLightPresetChange">
+              <option value="engineering">Инженерный</option>
+              <option value="soft">Мягкий</option>
+            </select>
+          </label>
+          <label class="viewer-scene-shading" title="Яркость оттенка">
+            <span>Тон</span>
             <input
               type="range"
-              class="viewer-3d-slider"
-              :min="SECTION_OFFSET_MIN"
-              :max="SECTION_OFFSET_MAX"
-              :step="SECTION_OFFSET_STEP"
-              :value="sectionOffset ?? 0"
-              @input="onHeaderOffsetInput"
+              class="viewer-scene-tint-range"
+              :min="TINT_BRIGHTNESS_MIN"
+              :max="TINT_BRIGHTNESS_MAX"
+              :step="TINT_BRIGHTNESS_STEP"
+              :value="tintBrightness"
+              @input="onTintBrightnessInput"
+              @wheel.prevent="onTintBrightnessWheel"
             />
-          </template>
+          </label>
         </div>
-        <div class="viewer-header-block" data-group="Измерение">
-          <button
-            type="button"
-            class="viewer-3d-btn"
-            :class="{ active: measureMode }"
-            @click="emit('measure')"
-          >
-            Измерение
-          </button>
-          <button type="button" class="viewer-3d-btn" @click="emit('clear-measurements')">Очистить</button>
-        </div>
-        <div class="viewer-header-block" data-group="Экспорт">
+        <div v-show="headerToolsTab === 'export'" class="viewer-header-block" data-group="Экспорт">
           <button type="button" class="viewer-3d-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
           <button type="button" class="viewer-3d-btn" @click="exportGlb">Экспорт GLB</button>
           <button type="button" class="viewer-3d-btn" @click="exportStl">Экспорт STL</button>
@@ -4505,9 +7183,67 @@ defineExpose({
             </div>
           </div>
         </div>
+        <!--
+          Временно скрыто по запросу: дерево компонентов отключено,
+          пока не будет исправлена корректная группировка/скрытие деталей.
+        <div v-if="Object.keys(componentTreeRowsByModel).length" class="viewer-component-tree">
+          <div class="viewer-component-tree-header">Компоненты</div>
+          <div
+            v-for="m in loadedModels.filter((it) => componentTreeRowsByModel[it.id]?.length)"
+            :key="`tree-${m.id}`"
+            class="viewer-component-model-group"
+          >
+            <div class="viewer-component-model-title">{{ m.name }}</div>
+            <div
+              v-for="row in componentTreeRowsByModel[m.id]"
+              :key="row.id"
+              class="viewer-component-item"
+              :class="{ 'viewer-component-item-selected': selectedComponentRowId === `${m.id}:${row.id}` }"
+              :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+              :title="row.label"
+              @click="selectComponentRow(m.id, row.id)"
+            >
+              <span class="viewer-component-item-label">{{ row.label }}</span>
+              <span class="viewer-component-item-spacer"></span>
+              <button
+                v-if="row.targetIds.length > 0"
+                type="button"
+                class="viewer-component-item-eye-btn"
+                :title="row.visible ? 'Скрыть компонент' : 'Показать компонент'"
+                @click.stop="toggleComponentVisibility(m.id, row.id)"
+              >
+                {{ row.visible ? '👁' : '🚫' }}
+              </button>
+              <span v-else class="viewer-component-item-eye-btn" title="Геометрия объединена в один меш, скрытие по деталям недоступно">•</span>
+            </div>
+          </div>
+        </div>
+        -->
       </div>
       <div class="viewer-main">
         <div ref="containerRef" class="viewer-container" />
+        <div
+          v-if="partContextMenuOpen"
+          class="viewer-part-context-menu"
+          :style="{ left: `${partContextMenuX}px`, top: `${partContextMenuY}px` }"
+        >
+          <button
+            v-if="contextMenuTargetIsHidden"
+            type="button"
+            class="viewer-part-context-menu-item"
+            @click="showSelectedPartFromContextMenu"
+          >
+            Показать деталь
+          </button>
+          <button
+            v-else
+            type="button"
+            class="viewer-part-context-menu-item"
+            @click="hideSelectedPartFromContextMenu"
+          >
+            Скрыть деталь
+          </button>
+        </div>
         <div
           class="viewer-measurements-float"
           :style="{ left: measurementsPanelPos.x + 'px', top: measurementsPanelPos.y + 'px' }"
@@ -4516,41 +7252,72 @@ defineExpose({
             <span>Измерения</span>
             <button type="button" class="viewer-measurements-clear" @click="clearMeasurementHistory">очистить</button>
           </div>
-          <div v-if="measurementHistory.length === 0" class="viewer-measurements-empty">
-            Пока нет измерений.
-          </div>
-          <div v-else class="viewer-measurements-list">
-            <div class="viewer-measurements-table-head">
-              <span>#</span>
-              <span>L, мм</span>
-              <span>⟂, мм</span>
-              <span>△ (P/⊥)</span>
-              <span></span>
+          <div class="viewer-measurements-controls">
+            <select
+              class="viewer-measurements-select"
+              :value="measureType"
+              @change="setMeasureType(($event.target as HTMLSelectElement).value as MeasureType)"
+            >
+              <option value="distance">Расстояние</option>
+              <option value="cad-linear">Размер (с выносом)</option>
+              <option value="radius">Радиус</option>
+              <option value="diameter">Диаметр</option>
+              <option value="hole-center-distance">Межцентровое</option>
+              <option value="arc">Длина дуги</option>
+            </select>
+            <div class="viewer-measurements-dim-row">
+              <span>Стрелка</span>
+              <input v-model.number="dimArrowSizeMm" type="number" class="viewer-measurements-dim-input" min="2" max="60" step="0.5" />
+              <span>Вынос</span>
+              <input v-model.number="dimLineOffsetMm" type="number" class="viewer-measurements-dim-input" min="2" max="400" step="1" />
             </div>
+            <div class="viewer-measurements-dim-row">
+              <span>Шрифт</span>
+              <input v-model.number="dimFontSizeMm" type="number" class="viewer-measurements-dim-input" min="6" max="80" step="1" />
+              <span />
+              <button type="button" class="viewer-measurements-cad-btn" @click="setMeasureMode(!measureModeRef)">
+                {{ measureModeRef ? 'Измерение: вкл' : 'Измерение: выкл' }}
+              </button>
+            </div>
+            <div v-if="measureType === 'cad-linear'" class="viewer-measurements-cad-row">
+              <label>Линейный размер по плоскостям (с выносными стрелками)</label>
+              <div class="viewer-measurements-cad-pick">
+                <input class="viewer-measurements-cad-input" :value="cadLinearPlane1Text" readonly title="1-я измеряемая плоскость" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane1')">Плоскость 1</button>
+              </div>
+              <div class="viewer-measurements-cad-pick">
+                <input class="viewer-measurements-cad-input" :value="cadLinearPlane2Text" readonly title="2-я измеряемая плоскость" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane2')">Плоскость 2</button>
+              </div>
+              <div class="viewer-measurements-cad-pick">
+                <input class="viewer-measurements-cad-input" :value="cadLinearDisplayPlaneText" readonly title="Плоскость отображения выноса" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('display')">Плоскость вывода</button>
+              </div>
+              <button type="button" class="viewer-measurements-cad-new" @click="startNewCadLinearMeasurement">Новый размер</button>
+              <div v-if="cadLinearStatus" class="viewer-measurements-cad-status">{{ cadLinearStatus }}</div>
+            </div>
+          </div>
+          <div v-if="measurementHistory.length === 0" class="viewer-measurements-empty">Пока нет измерений.</div>
+          <div v-else class="viewer-measurements-list">
             <div
-              v-for="(m, idx) in measurementHistory"
+              v-for="(m, idx) in measurementHistory.slice(0, 12)"
               :key="m.id"
               class="viewer-measurements-row"
               :class="{ active: selectedMeasurementId === m.id }"
               @click="restoreMeasurement(m)"
             >
               <span class="viewer-measurements-cell-id">#{{ measurementHistory.length - idx }}</span>
-              <span>{{ m.lengthMm.toFixed(2) }}</span>
-              <span class="viewer-measurements-row-perp">{{ m.surfacePerpMm != null ? m.surfacePerpMm.toFixed(2) : '—' }}</span>
-              <span>{{ m.parallelMm.toFixed(1) }} / {{ m.trianglePerpMm.toFixed(1) }}</span>
-              <button
-                type="button"
-                class="viewer-measurements-row-del"
-                title="Удалить измерение"
-                @click.stop="removeMeasurement(m.id)"
-              >
-                ×
-              </button>
+              <span>{{ measurementTypeLabel(m) }}</span>
+              <span>{{ measurementValueText(m) }}</span>
             </div>
           </div>
         </div>
-        <div class="viewer-assembly-panel" :class="{ open: assemblyPanelOpen }">
-          <div class="viewer-assembly-header">
+        <div
+          class="viewer-assembly-panel"
+          :class="{ open: assemblyPanelOpen }"
+          :style="{ left: assemblyPanelPos.x + 'px', top: assemblyPanelPos.y + 'px' }"
+        >
+          <div class="viewer-assembly-header" @mousedown.prevent="onAssemblyPanelMouseDown">
             <span>Сборка</span>
             <button type="button" class="viewer-assembly-toggle" @click="assemblyPanelOpen = !assemblyPanelOpen">
               {{ assemblyPanelOpen ? '−' : '+' }}
@@ -4558,10 +7325,10 @@ defineExpose({
           </div>
           <div v-if="assemblyPanelOpen" class="viewer-assembly-body">
             <div class="viewer-assembly-row">
-              <label>Тип</label>
+              <label>Тип сопряжения</label>
               <select v-model="assemblyMateType" class="viewer-assembly-select">
-                <option value="plane">Плоскость ↔ плоскость</option>
-                <option value="distance">По расстоянию</option>
+                <option value="plane">По плоскостям</option>
+                <option value="distance">На расстоянии</option>
                 <option value="symmetric">Симметрия по ширине</option>
               </select>
             </div>
@@ -4569,238 +7336,96 @@ defineExpose({
               <label>Источник</label>
               <select v-model="assemblySourceModelId" class="viewer-assembly-select">
                 <option value="">— выберите —</option>
-                <option v-for="m in visibleAssemblyModels" :key="'src-' + m.id" :value="m.id">{{ m.name }}</option>
+                <option v-for="m in visibleAssemblyModels" :key="'src-mini-' + m.id" :value="m.id">{{ m.name }}</option>
               </select>
             </div>
             <div class="viewer-assembly-row">
               <label>Опорная</label>
               <select v-model="assemblyTargetModelId" class="viewer-assembly-select">
                 <option value="">— выберите —</option>
-                <option v-for="m in visibleAssemblyModels" :key="'dst-' + m.id" :value="m.id">{{ m.name }}</option>
+                <option v-for="m in visibleAssemblyModels" :key="'dst-mini-' + m.id" :value="m.id">{{ m.name }}</option>
               </select>
             </div>
-            <div v-show="assemblyMateType !== 'symmetric'" class="viewer-assembly-row">
-              <label>Ось (bbox)</label>
-              <select v-model="assemblyAxis" class="viewer-assembly-select">
-                <option value="x">X</option>
-                <option value="y">Y</option>
-                <option value="z">Z</option>
-              </select>
-            </div>
-            <template v-if="assemblyMateType !== 'symmetric'">
+            <template v-if="assemblyMateType === 'symmetric'">
               <div class="viewer-assembly-row">
-                <label>Плоскость модели 1</label>
+                <label>База: плоскость 1</label>
                 <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblySourcePlaneText" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('source')">Выбрать</button>
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySymBase1Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase1')">Выбрать</button>
                 </div>
               </div>
               <div class="viewer-assembly-row">
-                <label>Плоскость модели 2</label>
+                <label>База: плоскость 2</label>
                 <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblyTargetPlaneText" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('target')">Выбрать</button>
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySymBase2Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase2')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Деталь: плоскость 1</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySymPart1Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart1')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Деталь: плоскость 2</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySymPart2Text" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart2')">Выбрать</button>
                 </div>
               </div>
             </template>
             <template v-else>
               <div class="viewer-assembly-row">
-                <label>База пл. 1</label>
+                <label>Плоскость источника</label>
                 <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblySymBase1Text" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase1')">Выбрать</button>
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySourcePlaneText" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('source')">Выбрать</button>
                 </div>
               </div>
               <div class="viewer-assembly-row">
-                <label>База пл. 2</label>
+                <label>Плоскость опорной</label>
                 <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblySymBase2Text" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symBase2')">Выбрать</button>
-                </div>
-              </div>
-              <div class="viewer-assembly-row">
-                <label>Деталь пл. 1</label>
-                <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblySymPart1Text" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart1')">Выбрать</button>
-                </div>
-              </div>
-              <div class="viewer-assembly-row">
-                <label>Деталь пл. 2</label>
-                <div class="viewer-assembly-pick">
-                  <input class="viewer-assembly-input" :value="assemblySymPart2Text" readonly />
-                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('symPart2')">Выбрать</button>
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblyTargetPlaneText" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('target')">Выбрать</button>
                 </div>
               </div>
             </template>
             <div v-if="assemblyMateType === 'distance'" class="viewer-assembly-row">
               <label>Расстояние, мм</label>
-              <input v-model.number="assemblyDistanceMm" class="viewer-assembly-input" type="number" min="0" step="1" />
+              <input v-model.number="assemblyDistanceMm" type="number" class="viewer-assembly-input" min="0" step="0.1" />
             </div>
             <button type="button" class="viewer-assembly-apply" @click="applyAssemblyMate">Применить сопряжение</button>
-            <div v-if="assemblyMates.length" class="viewer-assembly-mates">
-              <div class="viewer-assembly-mates-title">Зафиксированные связи</div>
+            <button
+              type="button"
+              class="viewer-assembly-apply"
+              :disabled="assemblyMates.length === 0"
+              @click="clearAllAssemblyMates"
+            >
+              Очистить сопряжения
+            </button>
+            <div class="viewer-assembly-note">Выбор плоскостей: нажмите «Выбрать», затем кликните по грани модели в сцене.</div>
+            <div v-if="assemblyStatus" class="viewer-assembly-status">{{ assemblyStatus }}</div>
+            <div v-if="assemblyMates.length > 0" class="viewer-assembly-mates">
+              <div class="viewer-assembly-mates-title">Связи</div>
               <div
-                v-for="(row, idx) in assemblyMates"
-                :key="row.id"
+                v-for="(m, idx) in assemblyMates"
+                :key="m.id"
                 class="viewer-assembly-mate-row"
-                :class="{ 'viewer-assembly-mate-row-active': selectedAssemblyMateId === row.id }"
-                role="button"
+                :class="{ 'viewer-assembly-mate-row-active': selectedAssemblyMateId === m.id }"
                 tabindex="0"
-                @click="selectAssemblyMateRow(row.id)"
-                @keydown.enter.prevent="selectAssemblyMateRow(row.id)"
-                @keydown.space.prevent="selectAssemblyMateRow(row.id)"
+                @click="selectAssemblyMateRow(m.id)"
               >
                 <span class="viewer-assembly-mate-no">#{{ idx + 1 }}</span>
-                <span class="viewer-assembly-mate-type">{{ assemblyMateTypeLabel(row) }}</span>
-                <button
-                  type="button"
-                  class="viewer-assembly-mate-del"
-                  title="Удалить связь"
-                  @click.stop="removeAssemblyMate(row.id)"
-                >
-                  ×
-                </button>
+                <span class="viewer-assembly-mate-type">{{ assemblyMateTypeLabel(m) }}</span>
+                <button type="button" class="viewer-assembly-mate-del" title="Удалить связь" @click.stop="removeAssemblyMate(m.id)">×</button>
               </div>
             </div>
-            <div class="viewer-assembly-note">Связи по выбранным плоскостям сохраняются и снова применяются после перетаскивания детали. Оси отверстий — отдельный этап.</div>
-            <div v-if="assemblyStatus" class="viewer-assembly-status">{{ assemblyStatus }}</div>
           </div>
         </div>
         <div v-if="isLoading" class="loading-overlay">
           <span class="loading-text">Загрузка модели…</span>
-        </div>
-        <div class="viewer-scene-panel">
-          <div class="viewer-scene-panel-row">
-            <div class="viewer-scene-group" data-group="Вид">
-            <div ref="scenePanelOrientationRef" class="viewer-scene-dropdown">
-              <button
-                type="button"
-                class="viewer-scene-btn"
-                :class="{ open: scenePanelOrientationOpen }"
-                :disabled="!loadedModels.some(m => m.inScene)"
-                title="Ориентация вида"
-                @click.stop="scenePanelOrientationOpen = !scenePanelOrientationOpen"
-              >
-                <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18">
-                  <path d="M12 2 L22 8 L22 18 L12 24 L2 18 L2 8 Z" fill="currentColor" opacity="0.4"/>
-                  <path d="M2 8 L12 2 L22 8 L12 14 Z" fill="currentColor" opacity="0.7"/>
-                  <path d="M12 2 L22 8 L12 14 L2 8 Z" fill="currentColor"/>
-                </svg>
-              </button>
-              <Transition name="viewer-orient-fade">
-                <div v-show="scenePanelOrientationOpen" class="viewer-scene-menu">
-                  <button
-                    v-for="opt in ORIENTATION_OPTIONS"
-                    :key="opt.id"
-                    type="button"
-                    class="viewer-scene-item"
-                    :title="opt.tooltip"
-                    @click="setViewOrientation(opt.id); scenePanelOrientationOpen = false"
-                  >
-                    <template v-if="opt.hasIcon">
-                      <span class="viewer-scene-item-label">{{ opt.label }}</span>
-                    </template>
-                    <span v-else class="viewer-scene-item-text">{{ opt.label }}</span>
-                  </button>
-                </div>
-              </Transition>
-            </div>
-            </div>
-            <div class="viewer-scene-group" data-group="Отображение">
-            <div class="viewer-scene-frame-block">
-              <button
-                type="button"
-                class="viewer-scene-btn"
-                :class="{ active: wireframeModeRef }"
-                :title="`Каркас (прозрачные грани ${frameOpacityRef})`"
-                @click="toggleWireframe"
-              >
-                <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                  <path d="M3 3h6v6H3zM15 3h6v6h-6zM3 15h6v6H3zM15 15h6v6h-6z"/>
-                </svg>
-              </button>
-              <input
-                type="number"
-                class="viewer-scene-frame-opacity-input"
-                :min="FRAME_OPACITY_MIN"
-                :max="FRAME_OPACITY_MAX"
-                :step="FRAME_OPACITY_STEP"
-                :value="frameOpacityRef"
-                title="Прозрачность (колёсико или ввод)"
-                @input="onFrameOpacityInput"
-                @wheel.prevent="onFrameOpacityWheel"
-              />
-            </div>
-            <div class="viewer-scene-tint-block" title="Яркость оттенка модели">
-              <span class="viewer-scene-tint-label">Тон</span>
-              <input
-                type="range"
-                class="viewer-scene-tint-range"
-                :min="TINT_BRIGHTNESS_MIN"
-                :max="TINT_BRIGHTNESS_MAX"
-                :step="TINT_BRIGHTNESS_STEP"
-                :value="tintBrightness"
-                @input="onTintBrightnessInput"
-                @wheel.prevent="onTintBrightnessWheel"
-              />
-            </div>
-            <label class="viewer-scene-shading" title="Режим шейдинга модели">
-              <span>Свет</span>
-              <select class="viewer-scene-select" :value="shadingMode" @change="onShadingModeChange">
-                <option value="lit">Обычный</option>
-                <option value="unlit">Светлый (мягкие тени)</option>
-              </select>
-            </label>
-            </div>
-            <div class="viewer-scene-group" data-group="Инструменты">
-            <button
-              type="button"
-              class="viewer-scene-btn"
-              :class="{ active: sectionMode }"
-              title="Сечение"
-              @click="emit('section-mode')"
-            >
-              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M4 4v16M20 4v16M4 12h16"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="viewer-scene-btn"
-              :class="{ active: showGroundGrid }"
-              title="Сетка пола"
-              @click="toggleGroundGrid"
-            >
-              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M3 7h18M3 12h18M3 17h18M7 3v18M12 3v18M17 3v18"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="viewer-scene-btn"
-              title="Фокус на модели (F)"
-              @click="focusModelInView"
-            >
-              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                <path d="M4 8V4h4M16 4h4v4M20 16v4h-4M8 20H4v-4"/>
-                <circle cx="12" cy="12" r="2.2"/>
-              </svg>
-            </button>
-            <button
-              type="button"
-              class="viewer-scene-btn"
-              title="Перпендикулярно (клик по грани модели — затем сюда)"
-              @click="viewPerpendicularToFace"
-            >
-              <svg class="viewer-scene-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="1"/>
-                <path d="M12 3v18M3 12h18"/>
-                <circle cx="12" cy="12" r="2"/>
-              </svg>
-            </button>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -4894,6 +7519,26 @@ defineExpose({
   font-weight: 600;
   color: #fff;
 }
+.viewer-header-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.viewer-header-tabs button {
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(27, 35, 50, 0.9);
+  color: #d7e4ff;
+  padding: 0 10px;
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+.viewer-header-tabs button.active {
+  border-color: #6d8fd0;
+  background: rgba(65, 93, 150, 0.9);
+}
 .viewer-3d-tools {
   display: flex;
   align-items: center;
@@ -4911,6 +7556,16 @@ defineExpose({
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.08);
   position: relative;
+}
+.viewer-measure-select {
+  height: 30px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(33, 45, 68, 0.95);
+  color: #e8f0ff;
+  padding: 0 8px;
+  font-size: 0.72rem;
+  min-width: 148px;
 }
 .viewer-header-block[data-group]::before {
   content: attr(data-group);
@@ -4946,6 +7601,19 @@ defineExpose({
 .viewer-frame-opacity-slider {
   width: 4rem;
   vertical-align: middle;
+}
+.viewer-part-colors-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.74rem;
+  color: #b8c5da;
+  margin-left: 0.15rem;
+}
+.viewer-part-colors-toggle input {
+  width: 0.95rem;
+  height: 0.95rem;
+  accent-color: #6a8bc7;
 }
 .viewer-3d-btn {
   padding: 0.3rem 0.55rem;
@@ -5174,14 +7842,18 @@ defineExpose({
 }
 .viewer-measurements-float {
   position: absolute;
-  width: 290px;
-  max-height: 320px;
+  width: clamp(220px, 30vw, 520px);
+  min-width: 220px;
+  max-width: 92vw;
+  min-height: 220px;
+  max-height: min(78vh, 640px);
   z-index: 1200;
   background: rgba(18, 24, 35, 0.95);
   border: 1px solid #4a5f7a;
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  overflow: hidden;
+  overflow: auto;
+  resize: both;
 }
 .viewer-measurements-float-header {
   display: flex;
@@ -5210,6 +7882,136 @@ defineExpose({
   color: #6f8098;
   font-size: 0.72rem;
 }
+.viewer-measurements-controls {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin: 0.25rem 0.2rem 0.35rem;
+}
+.viewer-measurements-select {
+  width: 100%;
+  height: 28px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(40, 52, 78, 0.92);
+  color: #ecf2ff;
+  padding: 0 8px;
+  font-size: 0.7rem;
+}
+.viewer-measurements-dim-row {
+  display: grid;
+  grid-template-columns: 44px 1fr 44px 1fr;
+  gap: 6px;
+  align-items: center;
+  color: #9db2cf;
+  font-size: 0.66rem;
+}
+.viewer-measurements-dim-input {
+  width: 100%;
+  height: 24px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(40, 52, 78, 0.92);
+  color: #ecf2ff;
+  padding: 0 6px;
+  font-size: 0.68rem;
+}
+.viewer-measurements-cad-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+.viewer-measurements-cad-row > label {
+  font-size: 0.66rem;
+  color: #9db2cf;
+}
+.viewer-measurements-cad-pick {
+  display: flex;
+  gap: 6px;
+}
+.viewer-measurements-cad-input {
+  flex: 1;
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(40, 52, 78, 0.92);
+  color: #ecf2ff;
+  padding: 0 7px;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+.viewer-measurements-cad-btn {
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(86, 122, 194, 0.9);
+  color: #fff;
+  padding: 0 8px;
+  font-size: 0.66rem;
+  cursor: pointer;
+}
+.viewer-measurements-cad-btn:hover {
+  background: rgba(105, 143, 218, 0.95);
+}
+.viewer-measurements-cad-status {
+  font-size: 0.66rem;
+  color: #dce8ff;
+  border: 1px solid rgba(125, 155, 220, 0.25);
+  background: rgba(26, 38, 58, 0.8);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+.viewer-measurements-cad-new {
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(76, 114, 190, 0.9);
+  color: #fff;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+.viewer-measurements-cad-new:hover {
+  background: rgba(95, 132, 210, 0.95);
+}
+.viewer-measurements-cad-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.viewer-measurements-cad-item {
+  height: 24px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(39, 52, 78, 0.92);
+  color: #e7efff;
+  padding: 0 7px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.66rem;
+  cursor: pointer;
+}
+.viewer-measurements-cad-detail {
+  border: 1px solid rgba(125, 155, 220, 0.22);
+  background: rgba(23, 34, 54, 0.82);
+  border-radius: 5px;
+  padding: 5px 7px;
+  font-size: 0.64rem;
+  color: #c8d7f3;
+  display: grid;
+  gap: 3px;
+}
+.viewer-measurements-cad-detail-btn {
+  justify-self: start;
+  height: 22px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(71, 104, 170, 0.9);
+  color: #fff;
+  padding: 0 7px;
+  font-size: 0.62rem;
+  cursor: pointer;
+}
 .viewer-measurements-list {
   max-height: 270px;
   overflow: auto;
@@ -5220,7 +8022,7 @@ defineExpose({
 }
 .viewer-measurements-table-head {
   display: grid;
-  grid-template-columns: 34px 64px 64px 1fr 24px;
+  grid-template-columns: 34px 40px 64px 64px 1fr 24px;
   gap: 6px;
   align-items: center;
   font-size: 0.64rem;
@@ -5230,7 +8032,7 @@ defineExpose({
 }
 .viewer-measurements-row {
   display: grid;
-  grid-template-columns: 34px 64px 64px 1fr 24px;
+  grid-template-columns: 34px 40px 64px 64px 1fr 24px;
   gap: 6px;
   align-items: center;
   border: 1px solid #3a4a6a;
@@ -5274,15 +8076,21 @@ defineExpose({
 }
 .viewer-assembly-panel {
   position: absolute;
-  right: 10px;
+  left: 330px;
   top: 56px;
   z-index: 12;
-  width: 300px;
+  width: clamp(220px, 24vw, 360px);
+  min-width: 220px;
+  max-width: 92vw;
+  min-height: 56px;
+  max-height: 80vh;
   background: rgba(18, 24, 35, 0.95);
   border: 1px solid rgba(115, 145, 200, 0.4);
   border-radius: 8px;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
   color: #e7efff;
+  resize: both;
+  overflow: auto;
 }
 .viewer-assembly-header {
   display: flex;
@@ -5292,6 +8100,8 @@ defineExpose({
   border-bottom: 1px solid rgba(115, 145, 200, 0.22);
   font-size: 0.8rem;
   font-weight: 600;
+  cursor: move;
+  user-select: none;
 }
 .viewer-assembly-toggle {
   width: 24px;
@@ -5330,6 +8140,9 @@ defineExpose({
   display: flex;
   gap: 6px;
   align-items: center;
+}
+.viewer-assembly-input-pick {
+  cursor: pointer;
 }
 .viewer-assembly-pick-btn {
   height: 28px;
@@ -5434,6 +8247,72 @@ defineExpose({
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+.viewer-component-tree {
+  margin: 0.25rem 0.4rem 0.4rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  padding-top: 0.45rem;
+  max-height: 34vh;
+  overflow-y: auto;
+}
+.viewer-component-tree-header {
+  font-size: 0.74rem;
+  color: #cfd7e7;
+  margin-bottom: 0.25rem;
+}
+.viewer-component-model-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.35rem;
+}
+.viewer-component-model-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: #9fb0cb;
+}
+.viewer-component-item {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(45, 58, 83, 0.45);
+  color: #dde6f4;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  text-align: left;
+  padding: 0.2rem 0.35rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.viewer-component-item:hover {
+  background: rgba(88, 116, 168, 0.45);
+}
+.viewer-component-item-selected {
+  border-color: rgba(150, 190, 255, 0.55);
+  background: rgba(82, 120, 186, 0.38);
+}
+.viewer-component-item-spacer {
+  flex: 1;
+}
+.viewer-component-item-eye-btn {
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(26, 34, 51, 0.9);
+  color: #e2e9f5;
+  border-radius: 4px;
+  width: 1.35rem;
+  height: 1.35rem;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+.viewer-component-item-eye-btn:hover {
+  background: rgba(97, 128, 184, 0.65);
+}
+.viewer-component-item-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .viewer-models-card {
   flex-shrink: 0;
@@ -5592,6 +8471,30 @@ defineExpose({
   position: absolute;
   inset: 0;
 }
+.viewer-part-context-menu {
+  position: absolute;
+  z-index: 30;
+  min-width: 9rem;
+  background: rgba(24, 28, 40, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  padding: 0.3rem;
+}
+.viewer-part-context-menu-item {
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: #e3e9f5;
+  padding: 0.35rem 0.45rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.viewer-part-context-menu-item:hover {
+  background: rgba(102, 129, 180, 0.35);
+}
 .viewer-scene-panel {
   position: absolute;
   top: 8px;
@@ -5601,26 +8504,83 @@ defineExpose({
   background: rgba(30, 36, 51, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 8px;
-  padding: 6px;
+  padding: clamp(4px, 0.5vw, 6px) clamp(6px, 0.9vw, 10px);
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
   overflow: visible;
   isolation: isolate;
+  max-width: calc(100vw - 16px);
+  width: max-content;
 }
 .viewer-scene-panel-row {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   flex-wrap: wrap;
+  max-width: 100%;
 }
 .viewer-scene-group {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   padding: 0.85rem 4px 2px;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(20, 24, 35, 0.45);
   position: relative;
+}
+.viewer-scene-group[data-group="Вид"] {
+  order: 1;
+}
+.viewer-scene-group[data-group="Инструменты"] {
+  order: 2;
+}
+.viewer-scene-group[data-group="Отображение"] {
+  order: 3;
+  flex-basis: 100%;
+  justify-content: center;
+}
+@media (max-width: 1200px) {
+  .viewer-scene-panel {
+    max-width: calc(100vw - 10px);
+  }
+  .viewer-scene-group {
+    gap: 4px;
+    padding: 0.7rem 4px 2px;
+  }
+  .viewer-scene-group[data-group]::before {
+    font-size: 0.54rem;
+  }
+  .viewer-scene-btn,
+  .viewer-scene-toggle,
+  .viewer-scene-select {
+    height: 22px;
+    font-size: 0.62rem;
+  }
+}
+@media (max-width: 900px) {
+  .viewer-measurements-float,
+  .viewer-assembly-panel {
+    min-width: 180px;
+    width: clamp(180px, 44vw, 300px);
+  }
+  .viewer-scene-panel-row {
+    gap: 3px;
+  }
+  .viewer-scene-group {
+    padding: 0.62rem 3px 2px;
+  }
+  .viewer-scene-group[data-group]::before {
+    left: 0.28rem;
+    top: 0.1rem;
+  }
+  .viewer-scene-btn,
+  .viewer-scene-toggle,
+  .viewer-scene-select {
+    height: 20px;
+    font-size: 0.58rem;
+  }
 }
 .viewer-scene-group[data-group]::before {
   content: attr(data-group);
@@ -5687,6 +8647,19 @@ defineExpose({
   gap: 4px;
   font-size: 0.7rem;
   color: #d0d6e6;
+}
+.viewer-scene-part-colors {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  color: #d0d6e6;
+  margin-left: 0.2rem;
+}
+.viewer-scene-part-colors input {
+  width: 0.9rem;
+  height: 0.9rem;
+  accent-color: #6a8bc7;
 }
 .viewer-scene-select {
   height: 24px;

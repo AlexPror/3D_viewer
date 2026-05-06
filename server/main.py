@@ -1,5 +1,7 @@
 import hashlib
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, UploadFile
@@ -7,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from spec_builder import build_spec_from_assembly
+from kompas_metadata import read_kompas_metadata, build_assembly_map
 
 try:
     from step_to_glb import step_to_glb_bytes, is_server_conversion_available
@@ -272,6 +275,33 @@ async def step_metadata(file: UploadFile = File(...)) -> dict[str, Any]:
 STEP_TO_GLB_MAX_BYTES = 100 * 1024 * 1024
 
 
+def _discover_a3d_files(root_dir: str) -> list[dict[str, Any]]:
+    """
+    Рекурсивно находит .a3d в папке.
+    Возвращает отсортированный список (сначала самые новые).
+    """
+    root = Path(root_dir).expanduser()
+    if not root.exists() or not root.is_dir():
+        return []
+    found: list[dict[str, Any]] = []
+    for p in root.rglob("*.a3d"):
+        try:
+            st = p.stat()
+            found.append(
+                {
+                    "name": p.name,
+                    "path": str(p.resolve()),
+                    "dir": str(p.parent.resolve()),
+                    "size_bytes": int(st.st_size),
+                    "mtime": float(st.st_mtime),
+                }
+            )
+        except Exception:
+            continue
+    found.sort(key=lambda x: x["mtime"], reverse=True)
+    return found
+
+
 @app.get("/api/convert/step-to-glb/status")
 def convert_step_to_glb_status() -> dict[str, Any]:
     """Проверка: доступна ли серверная конвертация STEP → GLB."""
@@ -308,4 +338,205 @@ async def convert_step_to_glb(file: UploadFile = File(...)) -> Response:
             media_type="text/plain",
         )
     return Response(content=glb_bytes, media_type="model/gltf-binary")
+
+
+@app.get("/api/convert/jt/status")
+def convert_jt_status() -> dict[str, Any]:
+    """
+    Явный статус JT-конвертации.
+    Пока конвертер не встроен в локальный backend.
+    """
+    return {
+        "available": False,
+        "message": "JT conversion is not configured on this backend",
+    }
+
+
+@app.post("/api/convert/jt")
+async def convert_jt(file: UploadFile = File(...)) -> Response:
+    """
+    Заглушка для JT-конвертации.
+    Нужен внешний сервис или отдельный модуль конвертации JT -> GLB.
+    """
+    _ = await file.read()
+    return Response(
+        content=b"JT conversion endpoint is not configured. Set VITE_CONVERTER_URL to external JT converter.",
+        status_code=501,
+        media_type="text/plain",
+    )
+
+
+@app.get("/api/kompas/assemblies/resolve")
+def resolve_kompas_assemblies(root_dir: str) -> dict[str, Any]:
+    """
+    Сценарий:
+    - 0 сборок -> mode='none'
+    - 1 сборка -> mode='auto', selected=...
+    - >1 сборки -> mode='select', assemblies=[...]
+    """
+    assemblies = _discover_a3d_files(root_dir)
+    if not assemblies:
+        return {
+            "mode": "none",
+            "root_dir": os.path.abspath(os.path.expanduser(root_dir)),
+            "assemblies": [],
+            "message": "Сборки .a3d не найдены",
+        }
+    if len(assemblies) == 1:
+        return {
+            "mode": "auto",
+            "root_dir": os.path.abspath(os.path.expanduser(root_dir)),
+            "selected": assemblies[0],
+            "count": 1,
+        }
+    return {
+        "mode": "select",
+        "root_dir": os.path.abspath(os.path.expanduser(root_dir)),
+        "assemblies": assemblies,
+        "count": len(assemblies),
+    }
+
+
+@app.get("/api/kompas/metadata")
+def kompas_metadata(assembly_path: str) -> dict[str, Any]:
+    """
+    Читает metadata напрямую из сборки КОМПАС (.a3d).
+    Возвращает parts/instances/meshBindings/tree/bom для фронтенда.
+    """
+    try:
+        meta = read_kompas_metadata(assembly_path)
+        return {
+            "ok": True,
+            "mode": "direct",
+            "metadata": meta,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "assembly_path": os.path.abspath(os.path.expanduser(assembly_path)),
+        }
+
+
+@app.get("/api/kompas/metadata/auto")
+def kompas_metadata_auto(root_dir: str) -> dict[str, Any]:
+    """
+    Режим автовыбора:
+    - если сборка одна: сразу возвращаем metadata;
+    - если несколько: отдаём список на выбор;
+    - если нет: mode='none'.
+    """
+    resolved = resolve_kompas_assemblies(root_dir)
+    mode = resolved.get("mode")
+    if mode == "none":
+        return {
+            "ok": False,
+            "mode": "none",
+            "root_dir": resolved.get("root_dir"),
+            "assemblies": [],
+            "message": resolved.get("message", "Сборки .a3d не найдены"),
+        }
+    if mode == "select":
+        return {
+            "ok": True,
+            "mode": "select",
+            "root_dir": resolved.get("root_dir"),
+            "assemblies": resolved.get("assemblies", []),
+            "count": resolved.get("count", 0),
+        }
+
+    selected = resolved.get("selected") or {}
+    selected_path = selected.get("path")
+    if not selected_path:
+        return {
+            "ok": False,
+            "mode": "error",
+            "error": "Resolve returned auto mode without selected.path",
+            "root_dir": resolved.get("root_dir"),
+        }
+
+    try:
+        meta = read_kompas_metadata(selected_path)
+        return {
+            "ok": True,
+            "mode": "auto",
+            "selected": selected,
+            "metadata": meta,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "mode": "auto",
+            "selected": selected,
+            "error": str(e),
+        }
+
+
+@app.get("/api/kompas/assembly-map")
+def kompas_assembly_map(assembly_path: str) -> dict[str, Any]:
+    """
+    Контракт для будущего матчинга:
+    parts/instances/tree/bom + signatures.
+    """
+    try:
+        return {
+            "ok": True,
+            "mode": "direct",
+            "assemblyMap": build_assembly_map(assembly_path),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "assembly_path": os.path.abspath(os.path.expanduser(assembly_path)),
+        }
+
+
+@app.get("/api/kompas/assembly-map/auto")
+def kompas_assembly_map_auto(root_dir: str) -> dict[str, Any]:
+    """
+    Авто-режим для assembly-map:
+    - none/select/auto так же, как metadata.
+    """
+    resolved = resolve_kompas_assemblies(root_dir)
+    mode = resolved.get("mode")
+    if mode == "none":
+        return {
+            "ok": False,
+            "mode": "none",
+            "root_dir": resolved.get("root_dir"),
+            "assemblies": [],
+            "message": resolved.get("message", "Сборки .a3d не найдены"),
+        }
+    if mode == "select":
+        return {
+            "ok": True,
+            "mode": "select",
+            "root_dir": resolved.get("root_dir"),
+            "assemblies": resolved.get("assemblies", []),
+            "count": resolved.get("count", 0),
+        }
+    selected = resolved.get("selected") or {}
+    selected_path = selected.get("path")
+    if not selected_path:
+        return {
+            "ok": False,
+            "mode": "error",
+            "error": "Resolve returned auto mode without selected.path",
+            "root_dir": resolved.get("root_dir"),
+        }
+    try:
+        return {
+            "ok": True,
+            "mode": "auto",
+            "selected": selected,
+            "assemblyMap": build_assembly_map(selected_path),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "mode": "auto",
+            "selected": selected,
+            "error": str(e),
+        }
 

@@ -28,8 +28,8 @@ export function getOpenCascade(): Promise<any> {
 
 const GLB_PATH = '/output.glb'
 
-/** false = быстрый путь (STEPControl_Reader), true = пробовать XCAF (дольше, у твоих файлов детали не находятся). */
-const ENABLE_XCAF_GEOMETRY = false
+/** false = быстрый путь (STEPControl_Reader), true = пробовать XCAF (дольше, но сохраняет/назначает цвета деталей при успехе). */
+const ENABLE_XCAF_GEOMETRY = true
 
 function getInputPath(ext: string): string {
   if (ext === 'step' || ext === 'stp') return '/input.stp'
