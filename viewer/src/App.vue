@@ -242,7 +242,8 @@ const collabAssetSuggestions = ref<Array<Record<string, unknown>>>([])
 const collabSuggestLoading = ref(false)
 
 /** Заготовка дерева Яндекс.Диска в духе проводника VS Code / Cursor (позже — API Диска) */
-type YandexSampleFolder = { id: string; name: string; children: { id: string; name: string }[] }
+type YandexSampleFile = { id: string; name: string; href?: string }
+type YandexSampleFolder = { id: string; name: string; children: YandexSampleFile[] }
 const yandexDiskSampleTree: YandexSampleFolder[] = [
   {
     id: 'yd_spec',
@@ -274,10 +275,51 @@ const yandexDiskOpen = ref<Record<string, boolean>>({
   yd_dw: false,
   yd_3d: false,
 })
+const diskTreeTab = ref<'pdf' | '3d'>('pdf')
+const workspaceMode = ref<'engineering' | 'production'>('engineering')
 
 function yandexDiskToggleFolder(id: string) {
   yandexDiskOpen.value = { ...yandexDiskOpen.value, [id]: !yandexDiskOpen.value[id] }
 }
+
+function getFileExt(name: string): string {
+  const dot = name.lastIndexOf('.')
+  if (dot <= 0 || dot === name.length - 1) return ''
+  return name.slice(dot + 1).toLowerCase()
+}
+
+function isPdfTreeFile(file: YandexSampleFile): boolean {
+  const ext = getFileExt(file.name)
+  return ext === 'pdf' || ext === 'dwg' || ext === 'dxf' || ext === 'frw'
+}
+
+function isModelTreeFile(file: YandexSampleFile): boolean {
+  const ext = getFileExt(file.name)
+  return ext === 'glb' || ext === 'gltf' || ext === 'stl' || ext === 'step' || ext === 'stp' || ext === 'iges' || ext === 'igs' || ext === 'm3d' || ext === 'a3d'
+}
+
+const yandexPdfTree = computed(() =>
+  yandexDiskSampleTree
+    .map((folder) => ({ ...folder, children: folder.children.filter((file) => isPdfTreeFile(file)) }))
+    .filter((folder) => folder.children.length > 0)
+)
+
+const yandexModelTree = computed(() =>
+  yandexDiskSampleTree
+    .map((folder) => ({ ...folder, children: folder.children.filter((file) => isModelTreeFile(file)) }))
+    .filter((folder) => folder.children.length > 0)
+)
+
+const productionLinks = computed(() =>
+  yandexPdfTree.value.flatMap((folder) =>
+    folder.children.map((file) => ({
+      id: file.id,
+      title: file.name,
+      folder: folder.name,
+      href: file.href || '#',
+    }))
+  )
+)
 
 const WORKSPACE_LS_SIDEBAR = 'workspace.sidebarWidthPx'
 const WORKSPACE_LS_RIGHT = 'workspace.rightPanelWidthPx'
@@ -2158,6 +2200,28 @@ onUnmounted(() => {
 <template>
   <div class="app" :class="{ 'is-dragging-file': isDraggingFile }">
     <div v-if="isDraggingFile" class="drop-overlay">Отпустите файл (PDF или 3D)</div>
+    <div class="workspace-mode-switch" role="tablist" aria-label="Режим интерфейса">
+      <button
+        type="button"
+        class="workspace-mode-switch-btn"
+        :class="{ 'is-active': workspaceMode === 'engineering' }"
+        role="tab"
+        :aria-selected="workspaceMode === 'engineering'"
+        @click="workspaceMode = 'engineering'"
+      >
+        Инженерный режим
+      </button>
+      <button
+        type="button"
+        class="workspace-mode-switch-btn"
+        :class="{ 'is-active': workspaceMode === 'production' }"
+        role="tab"
+        :aria-selected="workspaceMode === 'production'"
+        @click="workspaceMode = 'production'"
+      >
+        Производство (QR)
+      </button>
+    </div>
     <ViewerToolbar
       :view-mode="viewMode"
       @update:view-mode="onViewModeChange"
@@ -2206,7 +2270,7 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
-    <div class="workspace">
+    <div v-if="workspaceMode === 'engineering'" class="workspace">
       <aside
         class="ide-sidebar ide-sidebar--disk"
         aria-label="Файлы проекта на Яндекс.Диске"
@@ -2216,8 +2280,30 @@ onUnmounted(() => {
           <span class="ide-sidebar-title">Яндекс.Диск</span>
           <span class="ide-sidebar-pill">заготовка</span>
         </div>
+        <div class="ide-tree-tabs" role="tablist" aria-label="Деревья файлов">
+          <button
+            type="button"
+            class="ide-tree-tab"
+            :class="{ 'is-active': diskTreeTab === 'pdf' }"
+            role="tab"
+            :aria-selected="diskTreeTab === 'pdf'"
+            @click="diskTreeTab = 'pdf'"
+          >
+            Дерево PDF
+          </button>
+          <button
+            type="button"
+            class="ide-tree-tab"
+            :class="{ 'is-active': diskTreeTab === '3d' }"
+            role="tab"
+            :aria-selected="diskTreeTab === '3d'"
+            @click="diskTreeTab = '3d'"
+          >
+            Дерево 3D
+          </button>
+        </div>
         <div class="ide-tree" role="tree">
-          <div v-for="folder in yandexDiskSampleTree" :key="folder.id" class="ide-tree-folder">
+          <div v-for="folder in (diskTreeTab === 'pdf' ? yandexPdfTree : yandexModelTree)" :key="folder.id" class="ide-tree-folder">
             <button
               type="button"
               class="ide-tree-row ide-tree-row--folder"
@@ -2237,9 +2323,7 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-        <p class="ide-sidebar-hint">
-          Структура как в Cursor / VS Code: папки проекта и вложения. Позже здесь будет доступ к API Яндекс.Диска и выбор файла для вьюера.
-        </p>
+        <p class="ide-sidebar-hint">В режиме PDF и 3D деревья независимые: выбор чертежа не переключает модель автоматически.</p>
       </aside>
       <div
         class="workspace-splitter"
@@ -2260,14 +2344,22 @@ onUnmounted(() => {
               : undefined
           "
         >
+        <div class="pdf-panel-header">
+          <span class="pdf-panel-title">2D PDF</span>
+          <div class="pdf-panel-actions">
+            <button type="button" class="pdf-panel-btn" @click="onOpenPdf">Открыть 2D PDF</button>
+            <button type="button" class="pdf-panel-btn" :disabled="!pdfFile" @click="onScreenshot2d">Скриншот 2D</button>
+          </div>
+        </div>
         <PdfViewer
           v-if="pdfFile"
           ref="pdfViewerRef"
           :pdf-url="pdfFile.url"
           :pdf-name="pdfFile.name"
-          @screenshot-2d="onScreenshot2d"
         />
-        <div v-else class="panel-placeholder">Выберите PDF (чертежи, спецификация)</div>
+        <div v-else class="panel-placeholder panel-placeholder--pdf">
+          <span>Выберите PDF (чертежи, спецификация)</span>
+        </div>
         </div>
         <div
           v-if="viewMode === 'split'"
@@ -2706,6 +2798,32 @@ onUnmounted(() => {
         <div v-if="collabStatus" class="collab-status">{{ collabStatus }}</div>
       </aside>
     </div>
+    <div v-else class="production-mode">
+      <div class="production-card">
+        <h2 class="production-title">QR-страница для монтажа и производства</h2>
+        <p class="production-hint">
+          По QR открывается облегченная мобильная страница с ссылками на чертежи из проекта. 3D подключается только по необходимости.
+        </p>
+        <div class="production-qr-placeholder">
+          <span class="production-qr-code">QR</span>
+          <div class="production-qr-text">
+            <div>Ссылка страницы модуля:</div>
+            <code>https://viewer.example/m/project-001/module-m1</code>
+          </div>
+        </div>
+      </div>
+      <div class="production-card">
+        <h3 class="production-title production-title-small">Ссылки на чертежи (из дерева PDF)</h3>
+        <ul v-if="productionLinks.length" class="production-links">
+          <li v-for="link in productionLinks" :key="link.id" class="production-link-row">
+            <span class="production-link-title">{{ link.title }}</span>
+            <span class="production-link-folder">{{ link.folder }}</span>
+            <a :href="link.href" class="production-link-open" target="_blank" rel="noopener noreferrer">Открыть</a>
+          </li>
+        </ul>
+        <div v-else class="production-empty">В дереве PDF пока нет файлов для публикации.</div>
+      </div>
+    </div>
     <ScreenshotEditorModal
       v-if="showScreenshotModal && screenshotImageUrl"
       :image-url="screenshotImageUrl!"
@@ -2888,6 +3006,27 @@ onUnmounted(() => {
 .report-screenshot-btn-remove:hover {
   background: #b43c3c;
 }
+.workspace-mode-switch {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.35rem 0.6rem 0.2rem;
+  background: #141920;
+  border-bottom: 1px solid #2a3548;
+}
+.workspace-mode-switch-btn {
+  border: 1px solid #3a4a6a;
+  background: #253247;
+  color: #b5c7e4;
+  font-size: 0.72rem;
+  padding: 0.22rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.workspace-mode-switch-btn.is-active {
+  background: #3f5f97;
+  color: #eef3ff;
+  border-color: #5c80c1;
+}
 .content {
   flex: 1 1 auto;
   min-width: 0;
@@ -2938,6 +3077,27 @@ onUnmounted(() => {
   border-radius: 3px;
   background: #252f42;
   color: #7a8faa;
+}
+.ide-tree-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid #2a3548;
+}
+.ide-tree-tab {
+  border: 1px solid #324865;
+  background: #202b3d;
+  color: #a9bad6;
+  font-size: 0.68rem;
+  line-height: 1.1;
+  padding: 0.22rem 0.45rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ide-tree-tab.is-active {
+  background: #395f96;
+  border-color: #5d83c7;
+  color: #f0f5ff;
 }
 .ide-tree {
   flex: 1;
@@ -3005,6 +3165,95 @@ onUnmounted(() => {
   color: #5f7394;
   border-top: 1px solid #2a3548;
   background: rgba(0, 0, 0, 0.12);
+}
+.production-mode {
+  flex: 1;
+  overflow: auto;
+  padding: 0.8rem;
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: minmax(320px, 1fr);
+  background: #111622;
+}
+.production-card {
+  border: 1px solid #33445f;
+  border-radius: 8px;
+  background: #1a2334;
+  padding: 0.8rem;
+}
+.production-title {
+  margin: 0 0 0.45rem;
+  font-size: 1rem;
+  color: #d9e7ff;
+}
+.production-title-small {
+  font-size: 0.9rem;
+}
+.production-hint {
+  margin: 0 0 0.6rem;
+  color: #9ab0d3;
+  font-size: 0.78rem;
+}
+.production-qr-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  border: 1px dashed #4d6389;
+  background: rgba(10, 16, 26, 0.42);
+  border-radius: 6px;
+  padding: 0.6rem;
+}
+.production-qr-code {
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #e3ebff 0%, #b8c8ea 100%);
+  color: #23324a;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.production-qr-text {
+  color: #b5c5df;
+  font-size: 0.76rem;
+}
+.production-links {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.42rem;
+}
+.production-link-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 0.5rem;
+  align-items: center;
+  border: 1px solid #2e405d;
+  border-radius: 6px;
+  padding: 0.42rem 0.5rem;
+  background: rgba(17, 24, 38, 0.6);
+}
+.production-link-title {
+  color: #d2def2;
+  font-size: 0.78rem;
+}
+.production-link-folder {
+  color: #7f97bc;
+  font-size: 0.7rem;
+}
+.production-link-open {
+  color: #8fb1ff;
+  font-size: 0.74rem;
+  text-decoration: none;
+}
+.production-link-open:hover {
+  text-decoration: underline;
+}
+.production-empty {
+  color: #7f94b6;
+  font-size: 0.76rem;
 }
 .collab-panel {
   min-width: 260px;
@@ -3645,6 +3894,48 @@ onUnmounted(() => {
   height: 100%;
   color: #888;
   font-size: 0.95rem;
+}
+.panel-placeholder--pdf {
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.pdf-panel-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.4rem 0.6rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+}
+.pdf-panel-title {
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.pdf-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.pdf-panel-btn {
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(80, 110, 150, 0.5);
+  color: #e0e0e0;
+  border-radius: 4px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.pdf-panel-btn:hover {
+  background: rgba(100, 130, 180, 0.6);
+}
+.pdf-panel-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .viewer-panel {
   position: relative;

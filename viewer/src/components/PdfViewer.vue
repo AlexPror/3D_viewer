@@ -523,10 +523,6 @@ function getScreenshotPage(): number {
   return screenshotPage.value
 }
 
-const emit = defineEmits<{
-  'screenshot-2d': []
-}>()
-
 onMounted(() => {
   window.addEventListener('mousemove', onPanMouseMove)
   window.addEventListener('mouseup', onPanMouseUp)
@@ -567,7 +563,6 @@ defineExpose({
     <div v-else-if="error" class="pdf-error">{{ error }}</div>
     <template v-else>
       <div class="pdf-toolbar">
-        <span class="pdf-toolbar-title">2D PDF</span>
         <label class="pdf-screenshot-label">
           Страница:
           <select v-model.number="screenshotPage" class="pdf-page-select">
@@ -582,14 +577,6 @@ defineExpose({
           <button type="button" class="pdf-zoom-btn" title="100%" @click="setZoomPreset(1)">100%</button>
           <button type="button" class="pdf-zoom-btn" title="6400%" @click="setZoomPreset(64)">6400%</button>
         </div>
-        <button
-          type="button"
-          class="pdf-screenshot-btn"
-          title="Текущая страница PDF → редактор (как скриншот 3D, без захвата экрана Windows)"
-          @click="emit('screenshot-2d')"
-        >
-          Скриншот 2D
-        </button>
       </div>
       <div class="pdf-content">
         <aside class="pdf-thumbs">
@@ -662,27 +649,11 @@ defineExpose({
   flex-shrink: 0;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.75rem;
   padding: 0.5rem 0.75rem;
   background: #252525;
   border-bottom: 1px solid #333;
-}
-.pdf-toolbar-title {
-  font-weight: 600;
-  color: #fff;
-}
-.pdf-screenshot-btn {
-  margin-left: auto;
-  padding: 0.3rem 0.55rem;
-  font-size: 0.82rem;
-  border-radius: 4px;
-  cursor: pointer;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  color: #e0e0e0;
-  background: rgba(80, 110, 150, 0.5);
-}
-.pdf-screenshot-btn:hover {
-  background: rgba(100, 130, 180, 0.6);
 }
 .pdf-screenshot-label {
   font-size: 0.9rem;

@@ -11,23 +11,8 @@ import { logger } from '../lib/logger'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
-const activeTab = ref<'viewer' | 'spec'>('viewer')
 const headerToolsTab = ref<'viewTools' | 'display' | 'export'>('viewTools')
 const stepMeta = ref<any | null>(null)
-
-/** Разделы спецификации по ГОСТ 2.106-96 с начальным номером позиции для каждого раздела. */
-const gostSpecSections = computed(() => {
-  const spec = stepMeta.value?.spec
-  if (!spec?.sections || typeof spec.sections !== 'object') return []
-  const sections = spec.sections as Record<string, unknown[]>
-  let pos = 1
-  return Object.entries(sections).map(([sectionName, rows]) => {
-    const list = Array.isArray(rows) ? rows : []
-    const startPos = pos
-    pos += list.length
-    return { sectionName, rows: list, startPos }
-  })
-})
 
 const props = defineProps<{
   sectionMode?: boolean
@@ -6852,25 +6837,11 @@ defineExpose({
 <template>
   <div class="viewer-wrap">
     <div class="viewer-tabs">
-      <button
-        type="button"
-        :class="{ active: activeTab === 'viewer' }"
-        @click="activeTab = 'viewer'"
-      >
-        3D / 2D
-      </button>
-      <button
-        type="button"
-        :class="{ active: activeTab === 'spec' }"
-        @click="activeTab = 'spec'"
-      >
-        Спецификация
-      </button>
+      <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть 3D</button>
     </div>
 
-    <header class="viewer-3d-header" v-show="activeTab === 'viewer'">
+    <header class="viewer-3d-header">
       <span class="viewer-3d-title">3D</span>
-      <button type="button" class="viewer-3d-btn" @click="openFileDialog">Открыть 3D</button>
       <div class="viewer-header-tabs">
         <button type="button" :class="{ active: headerToolsTab === 'viewTools' }" @click="headerToolsTab = 'viewTools'">Вид и инструменты</button>
         <button type="button" :class="{ active: headerToolsTab === 'display' }" @click="headerToolsTab = 'display'">Отображение</button>
@@ -7142,7 +7113,7 @@ defineExpose({
         </div>
       </div>
     </header>
-    <div class="viewer-body" v-show="activeTab === 'viewer'">
+    <div class="viewer-body">
       <div class="viewer-models-sidebar">
         <div class="viewer-models-header">
           <span class="viewer-models-title">Модели</span>
@@ -7435,50 +7406,6 @@ defineExpose({
       </div>
     </div>
 
-    <div v-show="activeTab === 'spec'" class="spec-panel">
-      <div v-if="stepMeta && stepMeta.spec" class="spec-section gost-spec" :key="(stepMeta.sha1 || stepMeta.filename || '') + '_' + (stepMeta.spec?.totals?.item_count ?? 0)">
-        <table class="spec-table gost-spec-table">
-          <thead>
-            <tr>
-              <th class="gost-th-pos">Поз.</th>
-              <th class="gost-th-designation">Обозначение</th>
-              <th class="gost-th-name">Наименование</th>
-              <th class="gost-th-qty">Кол.</th>
-              <th class="gost-th-mass-unit">Масса ед., кг</th>
-              <th class="gost-th-mass-total">Масса общ., кг</th>
-              <th class="gost-th-note">Примечание</th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-for="block in gostSpecSections" :key="block.sectionName">
-              <tr class="gost-section-header">
-                <td colspan="7" class="gost-section-name">{{ block.sectionName }}</td>
-              </tr>
-              <tr
-                v-for="(row, idx) in block.rows"
-                :key="block.sectionName + '|' + (row.designation || '') + '|' + (row.name || '') + '|' + idx"
-                class="gost-data-row"
-              >
-                <td class="gost-pos">{{ block.startPos + idx }}</td>
-                <td class="gost-designation">{{ row.designation || '—' }}</td>
-                <td class="gost-name">{{ row.name || '—' }}</td>
-                <td class="gost-qty">{{ row.qty }}</td>
-                <td class="gost-mass-unit">{{ row.mass_unit != null && row.mass_unit > 0 ? row.mass_unit.toFixed(3) : '—' }}</td>
-                <td class="gost-mass-total">{{ row.mass_total != null && row.mass_total > 0 ? row.mass_total.toFixed(3) : '—' }}</td>
-                <td class="gost-note">{{ row.note || '' }}</td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
-        <div class="spec-totals">
-          Итого позиций: {{ stepMeta.spec.totals.item_count }},
-          общая масса: {{ stepMeta.spec.totals.mass_total.toFixed(2) }} кг
-        </div>
-      </div>
-      <div v-else>
-        Загрузите STEP, чтобы увидеть спецификацию.
-      </div>
-    </div>
   </div>
 </template>
 
@@ -7496,19 +7423,6 @@ defineExpose({
   padding: 0.25rem 0.6rem;
   background: #111;
   border-bottom: 1px solid #333;
-}
-.viewer-tabs button {
-  border: none;
-  background: #2a2a2a;
-  color: #ccc;
-  padding: 0.25rem 0.75rem;
-  border-radius: 4px 4px 0 0;
-  cursor: pointer;
-  font-size: 0.9rem;
-}
-.viewer-tabs button.active {
-  background: #3d6af2;
-  color: #fff;
 }
 .viewer-3d-header {
   flex-shrink: 0;
@@ -8385,87 +8299,6 @@ defineExpose({
 }
 .viewer-models-btn-remove:hover {
   background: #b43c3c;
-}
-.spec-panel {
-  padding: 0.5rem 0.75rem;
-  overflow: auto;
-  max-height: 100%;
-  background: #1a1a1a;
-  color: #eee;
-}
-.spec-section {
-  margin-bottom: 1rem;
-}
-.spec-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-  table-layout: fixed;
-}
-.spec-table th,
-.spec-table td {
-  border: 1px solid #444;
-  padding: 4px 8px;
-  vertical-align: middle;
-}
-.spec-totals {
-  margin-top: 0.5rem;
-  font-weight: 500;
-}
-
-/* ГОСТ 2.106-96: размеры граф по усмотрению разработчика */
-.gost-spec-table {
-  font-size: 0.9rem;
-}
-.gost-th-pos,
-.gost-pos {
-  width: 40px;
-  min-width: 40px;
-  text-align: center;
-}
-.gost-th-designation,
-.gost-designation {
-  width: 140px;
-  min-width: 120px;
-}
-.gost-th-name,
-.gost-name {
-  width: auto;
-  min-width: 180px;
-}
-.gost-th-qty,
-.gost-qty {
-  width: 50px;
-  min-width: 50px;
-  text-align: center;
-}
-.gost-th-mass-unit,
-.gost-mass-unit {
-  width: 90px;
-  min-width: 80px;
-  text-align: right;
-}
-.gost-th-mass-total,
-.gost-mass-total {
-  width: 95px;
-  min-width: 85px;
-  text-align: right;
-}
-.gost-th-note,
-.gost-note {
-  width: 120px;
-  min-width: 80px;
-}
-.gost-section-header td {
-  font-weight: 600;
-  padding: 6px 8px;
-  border-bottom: 1px solid #666;
-}
-.gost-section-name {
-  text-decoration: underline;
-}
-.gost-data-row td {
-  background: rgba(30, 30, 30, 0.5);
 }
 .viewer-main {
   flex: 1;
