@@ -309,6 +309,20 @@ class CollabApiTestCase(unittest.TestCase):
             self.assertEqual(evt.get("type"), "chat.message.created")
             self.assertEqual(evt.get("channelId"), channel_id)
 
+    def test_websocket_auth_via_first_message(self) -> None:
+        token = self.register_and_login("ws_auth_msg@example.com", "Ws Auth Msg")
+        headers = {"Authorization": f"Bearer {token}"}
+        project_resp = self.client.post("/api/projects", json={"name": "Ws Auth Body"}, headers=headers)
+        self.assertEqual(project_resp.status_code, 200, project_resp.text)
+        project_id = project_resp.json()["project"]["id"]
+
+        with self.client.websocket_connect(f"/api/projects/{project_id}/ws") as ws:
+            ws.send_json({"type": "ws.auth", "token": token})
+            connected_evt = ws.receive_json()
+            self.assertEqual(connected_evt.get("type"), "ws.connected")
+            sync_evt = ws.receive_json()
+            self.assertEqual(sync_evt.get("type"), "yjs.sync")
+
     def test_patch_member_role(self) -> None:
         gip_token = self.register_and_login("gip_role@example.com", "Gip Role")
         gip_headers = {"Authorization": f"Bearer {gip_token}"}

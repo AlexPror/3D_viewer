@@ -1,6 +1,8 @@
 import hashlib
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +13,15 @@ from pathlib import Path
 import asyncio
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from spec_builder import build_spec_from_assembly
 from kompas_metadata import read_kompas_metadata, build_assembly_map
-from collab_auth import create_token, decode_token, hash_password, token_expiration_iso, verify_password
+from collab_auth import create_token, decode_token, hash_password, token_expiration_iso, verify_password, warn_if_default_auth_secret
+from yadisk_routes import router as yadisk_router
 from collab_store import (
     PROJECT_MEMBER_ROLES,
     add_member,
@@ -71,13 +74,20 @@ except Exception:
 
 
 app = FastAPI(title="3d_viewer local server", version="0.2.0")
+app.include_router(yadisk_router)
+
+_cors_extra = os.environ.get("COLLAB_CORS_ORIGINS", "").strip()
+if _cors_extra:
+    _cors_origins = [o.strip() for o in _cors_extra.split(",") if o.strip()]
+else:
+    _cors_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,6 +97,86 @@ app.add_middleware(
 _cache: dict[str, Any] = {}
 
 init_collab_db()
+warn_if_default_auth_secret()
+
+_REQUIRE_AUTH_HEAVY_APIS = os.environ.get("COLLAB_REQUIRE_AUTH_HEAVY_APIS", "").lower() in ("1", "true", "yes")
+
+_AUTH_RATE_LOCK = threading.Lock()
+_AUTH_RATE_BUCKETS: dict[str, list[float]] = {}
+_AUTH_RATE_WINDOW_SEC = 60.0
+_AUTH_RATE_MAX_PER_WINDOW = int(os.environ.get("COLLAB_AUTH_RATE_LIMIT_PER_MINUTE", "60"))
+
+
+def _client_ip(request: Request) -> str:
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _enforce_auth_rate_limit(request: Request) -> None:
+    if _AUTH_RATE_MAX_PER_WINDOW <= 0:
+        return
+    ip = _client_ip(request)
+    now = time.time()
+    with _AUTH_RATE_LOCK:
+        bucket = _AUTH_RATE_BUCKETS.setdefault(ip, [])
+        bucket[:] = [t for t in bucket if now - t < _AUTH_RATE_WINDOW_SEC]
+        if len(bucket) >= _AUTH_RATE_MAX_PER_WINDOW:
+            raise HTTPException(status_code=429, detail="Too many requests; try again later")
+        bucket.append(now)
+
+
+def _extract_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authorization must be Bearer token")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty token")
+    return token
+
+
+def _current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    token = _extract_token(authorization)
+    payload = decode_token(token)
+    user_id = str(payload.get("sub", ""))
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token subject")
+    user = get_user_by_id(user_id)
+    if not user or not bool(user.get("is_active", 0)):
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
+
+
+def _require_project_member(project_id: str, user_id: str) -> dict[str, Any]:
+    membership = get_membership(project_id, user_id)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Project access denied")
+    return membership
+
+
+def _require_heavy_auth_if_configured(authorization: str | None = Header(default=None)) -> None:
+    """When COLLAB_REQUIRE_AUTH_HEAVY_APIS=1, heavy CPU/file endpoints need a valid Bearer token."""
+    if not _REQUIRE_AUTH_HEAVY_APIS:
+        return
+    _current_user(authorization)
+
+
+def _authenticate_ws_user(project_id: str, token: str) -> str | None:
+    try:
+        payload = decode_token(token.strip())
+    except Exception:
+        return None
+    uid = str(payload.get("sub", ""))
+    if not uid:
+        return None
+    user = get_user_by_id(uid)
+    if not user or not bool(user.get("is_active", 0)):
+        return None
+    if not get_membership(project_id, uid):
+        return None
+    return uid
 
 
 _re_x2 = re.compile(r"\\X2\\([0-9A-Fa-f]+)\\X0\\")
@@ -291,7 +381,10 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/step/metadata")
-async def step_metadata(file: UploadFile = File(...)) -> dict[str, Any]:
+async def step_metadata(
+    file: UploadFile = File(...),
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     data = await file.read()
     digest = hashlib.sha1(data).hexdigest()
     if digest in _cache:
@@ -366,7 +459,10 @@ def convert_step_to_glb_status() -> dict[str, Any]:
 
 
 @app.post("/api/convert/step-to-glb")
-async def convert_step_to_glb(file: UploadFile = File(...)) -> Response:
+async def convert_step_to_glb(
+    file: UploadFile = File(...),
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> Response:
     """
     Конвертация STEP/STP в GLB на сервере (для больших файлов).
     Возвращает бинарный GLB или 501/413/500.
@@ -407,7 +503,10 @@ def convert_jt_status() -> dict[str, Any]:
 
 
 @app.post("/api/convert/jt")
-async def convert_jt(file: UploadFile = File(...)) -> Response:
+async def convert_jt(
+    file: UploadFile = File(...),
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> Response:
     """
     Заглушка для JT-конвертации.
     Нужен внешний сервис или отдельный модуль конвертации JT -> GLB.
@@ -421,7 +520,10 @@ async def convert_jt(file: UploadFile = File(...)) -> Response:
 
 
 @app.get("/api/kompas/assemblies/resolve")
-def resolve_kompas_assemblies(root_dir: str) -> dict[str, Any]:
+def resolve_kompas_assemblies(
+    root_dir: str,
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     """
     Сценарий:
     - 0 сборок -> mode='none'
@@ -452,7 +554,10 @@ def resolve_kompas_assemblies(root_dir: str) -> dict[str, Any]:
 
 
 @app.get("/api/kompas/metadata")
-def kompas_metadata(assembly_path: str) -> dict[str, Any]:
+def kompas_metadata(
+    assembly_path: str,
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     """
     Читает metadata напрямую из сборки КОМПАС (.a3d).
     Возвращает parts/instances/meshBindings/tree/bom для фронтенда.
@@ -473,7 +578,10 @@ def kompas_metadata(assembly_path: str) -> dict[str, Any]:
 
 
 @app.get("/api/kompas/metadata/auto")
-def kompas_metadata_auto(root_dir: str) -> dict[str, Any]:
+def kompas_metadata_auto(
+    root_dir: str,
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     """
     Режим автовыбора:
     - если сборка одна: сразу возвращаем metadata;
@@ -527,7 +635,10 @@ def kompas_metadata_auto(root_dir: str) -> dict[str, Any]:
 
 
 @app.get("/api/kompas/assembly-map")
-def kompas_assembly_map(assembly_path: str) -> dict[str, Any]:
+def kompas_assembly_map(
+    assembly_path: str,
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     """
     Контракт для будущего матчинга:
     parts/instances/tree/bom + signatures.
@@ -547,7 +658,10 @@ def kompas_assembly_map(assembly_path: str) -> dict[str, Any]:
 
 
 @app.get("/api/kompas/assembly-map/auto")
-def kompas_assembly_map_auto(root_dir: str) -> dict[str, Any]:
+def kompas_assembly_map_auto(
+    root_dir: str,
+    _: None = Depends(_require_heavy_auth_if_configured),
+) -> dict[str, Any]:
     """
     Авто-режим для assembly-map:
     - none/select/auto так же, как metadata.
@@ -647,8 +761,8 @@ class RealtimeHub:
         self._lock = asyncio.Lock()
         self._by_project: dict[str, set[WebSocket]] = {}
 
-    async def connect(self, project_id: str, ws: WebSocket) -> None:
-        await ws.accept()
+    async def register(self, project_id: str, ws: WebSocket) -> None:
+        """Добавляет уже принятый (`accept`) сокет в комнату проекта."""
         async with self._lock:
             self._by_project.setdefault(project_id, set()).add(ws)
 
@@ -686,6 +800,21 @@ _hub = RealtimeHub()
 _project_yjs_updates: dict[str, list[str]] = {}
 _yjs_updates_lock = asyncio.Lock()
 _YJS_SYNC_CHUNK = 120
+_YJS_MAX_UPDATE_B64_CHARS = max(4096, int(os.environ.get("COLLAB_YJS_MAX_UPDATE_B64_CHARS", str(750_000))))
+_YJS_MAX_STORED_UPDATES = max(100, int(os.environ.get("COLLAB_YJS_MAX_STORED_UPDATES", str(6000))))
+
+
+async def _append_yjs_update(project_id: str, raw: str) -> bool:
+    """Ограничивает размер одного апдейта и общий объём истории в памяти."""
+    if len(raw) > _YJS_MAX_UPDATE_B64_CHARS:
+        return False
+    async with _yjs_updates_lock:
+        lst = _project_yjs_updates.setdefault(project_id, [])
+        lst.append(raw)
+        over = len(lst) - _YJS_MAX_STORED_UPDATES
+        if over > 0:
+            del lst[0:over]
+    return True
 
 
 async def _send_yjs_history(ws: WebSocket, project_id: str) -> None:
@@ -700,38 +829,9 @@ async def _send_yjs_history(ws: WebSocket, project_id: str) -> None:
         await ws.send_json({"type": "yjs.sync", "updates": chunk, "final": final})
 
 
-def _extract_token(authorization: str | None) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Authorization must be Bearer token")
-    token = authorization[7:].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Empty token")
-    return token
-
-
-def _current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    token = _extract_token(authorization)
-    payload = decode_token(token)
-    user_id = str(payload.get("sub", ""))
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token subject")
-    user = get_user_by_id(user_id)
-    if not user or not bool(user.get("is_active", 0)):
-        raise HTTPException(status_code=401, detail="User not found or inactive")
-    return user
-
-
-def _require_project_member(project_id: str, user_id: str) -> dict[str, Any]:
-    membership = get_membership(project_id, user_id)
-    if not membership:
-        raise HTTPException(status_code=403, detail="Project access denied")
-    return membership
-
-
 @app.post("/api/auth/register")
-def auth_register(payload: RegisterRequest) -> dict[str, Any]:
+def auth_register(payload: RegisterRequest, request: Request) -> dict[str, Any]:
+    _enforce_auth_rate_limit(request)
     exists = get_user_by_email(payload.email)
     if exists:
         raise HTTPException(status_code=409, detail="User already exists")
@@ -755,7 +855,8 @@ def auth_register(payload: RegisterRequest) -> dict[str, Any]:
 
 
 @app.post("/api/auth/login")
-def auth_login(payload: LoginRequest) -> dict[str, Any]:
+def auth_login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    _enforce_auth_rate_limit(request)
     user = get_user_by_email(str(payload.email))
     if not user or not verify_password(payload.password, str(user.get("password_hash", ""))):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -1203,24 +1304,33 @@ def get_attachment_file(project_id: str, attachment_id: str, user: dict[str, Any
 
 @app.websocket("/api/projects/{project_id}/ws")
 async def project_ws(project_id: str, ws: WebSocket) -> None:
-    token = ws.query_params.get("token", "").strip()
-    if not token:
-        await ws.close(code=4401)
-        return
-    try:
-        payload = decode_token(token)
-    except Exception:
-        await ws.close(code=4401)
-        return
-    user_id = str(payload.get("sub", ""))
-    user = get_user_by_id(user_id)
-    if not user:
-        await ws.close(code=4401)
-        return
-    if not get_membership(project_id, user_id):
-        await ws.close(code=4403)
-        return
-    await _hub.connect(project_id, ws)
+    await ws.accept()
+    query_token = ws.query_params.get("token", "").strip()
+    user_id: str | None = None
+
+    if query_token:
+        user_id = _authenticate_ws_user(project_id, query_token)
+        if not user_id:
+            await ws.close(code=4401)
+            return
+    else:
+        try:
+            first = await ws.receive_json()
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            await ws.close(code=4400)
+            return
+        if str(first.get("type", "")) != "ws.auth":
+            await ws.close(code=4408)
+            return
+        auth_token = str(first.get("token", "")).strip()
+        user_id = _authenticate_ws_user(project_id, auth_token)
+        if not user_id:
+            await ws.close(code=4401)
+            return
+
+    await _hub.register(project_id, ws)
     try:
         await ws.send_json(
             {
@@ -1237,9 +1347,7 @@ async def project_ws(project_id: str, ws: WebSocket) -> None:
                 await ws.send_json({"type": "pong"})
             elif action == "yjs.update":
                 raw = str(data.get("update", "")).strip()
-                if raw:
-                    async with _yjs_updates_lock:
-                        _project_yjs_updates.setdefault(project_id, []).append(raw)
+                if raw and await _append_yjs_update(project_id, raw):
                     await _hub.broadcast_except(
                         project_id,
                         {"type": "yjs.update", "update": raw},
@@ -1247,7 +1355,7 @@ async def project_ws(project_id: str, ws: WebSocket) -> None:
                     )
             elif action == "yjs.awareness":
                 raw = str(data.get("update", "")).strip()
-                if raw:
+                if raw and len(raw) <= _YJS_MAX_UPDATE_B64_CHARS:
                     await _hub.broadcast_except(
                         project_id,
                         {"type": "yjs.awareness", "update": raw},

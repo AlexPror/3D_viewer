@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -9,8 +10,18 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+_log = logging.getLogger("collab.auth")
 
 AUTH_SECRET = os.environ.get("COLLAB_AUTH_SECRET", "dev-secret-change-me")
+
+
+def warn_if_default_auth_secret() -> None:
+    """Call once at startup: default secret is unsafe for production."""
+    if AUTH_SECRET == "dev-secret-change-me":
+        _log.warning(
+            "COLLAB_AUTH_SECRET is unset or uses the development default; "
+            "set a long random secret in production."
+        )
 TOKEN_TTL_SECONDS = int(os.environ.get("COLLAB_TOKEN_TTL_SECONDS", "43200"))  # 12h
 
 

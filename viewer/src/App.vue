@@ -13,6 +13,8 @@ import LogPanel from './components/LogPanel.vue'
 import ScreenshotEditorModal from './components/ScreenshotEditorModal.vue'
 import CollabRoleIcon from './components/CollabRoleIcon.vue'
 import CollaborativeEditor from './components/CollaborativeEditor.vue'
+import YandexDiskTree from './components/YandexDiskTree.vue'
+import type { DiskNode } from './components/YandexDiskTree.vue'
 
 const viewMode = ref<ViewMode>('split')
 const viewerRef = ref<InstanceType<typeof Viewer3D> | null>(null)
@@ -241,45 +243,211 @@ const collabAssetPairsLoading = ref(false)
 const collabAssetSuggestions = ref<Array<Record<string, unknown>>>([])
 const collabSuggestLoading = ref(false)
 
-/** Заготовка дерева Яндекс.Диска в духе проводника VS Code / Cursor (позже — API Диска) */
-type YandexSampleFile = { id: string; name: string; href?: string }
-type YandexSampleFolder = { id: string; name: string; children: YandexSampleFile[] }
-const yandexDiskSampleTree: YandexSampleFolder[] = [
-  {
-    id: 'yd_spec',
-    name: '00_Спецификация',
-    children: [
-      { id: 'yd_f1', name: 'Ведомость_РН.xlsx' },
-      { id: 'yd_f2', name: 'Спецификация_оборудование.pdf' },
-    ],
-  },
-  {
-    id: 'yd_dw',
-    name: '01_Чертежи',
-    children: [
-      { id: 'yd_f3', name: 'КР-01-00_общие_данные.pdf' },
-      { id: 'yd_f4', name: 'КМ_лист_1.dwg' },
-    ],
-  },
-  {
-    id: 'yd_3d',
-    name: '02_Модели',
-    children: [
-      { id: 'yd_f5', name: 'сборка_M1.glb' },
-      { id: 'yd_f6', name: 'узел_клапана.step' },
-    ],
-  },
-]
-const yandexDiskOpen = ref<Record<string, boolean>>({
-  yd_spec: true,
-  yd_dw: false,
-  yd_3d: false,
-})
+/** Яндекс.Диск: публичная папка (ссылка) или OAuth (весь диск) — дерево с ленивой подгрузкой */
 const diskTreeTab = ref<'pdf' | '3d'>('pdf')
 const workspaceMode = ref<'engineering' | 'production'>('engineering')
+const yandexDiskMode = ref<'none' | 'public' | 'oauth'>('none')
+const yandexDiskConnected = ref(false)
+const yandexDiskStatus = ref('Диск не подключен')
+const yandexDiskUrlInput = ref('')
+const yandexDiskRootNodes = ref<DiskNode[]>([])
 
-function yandexDiskToggleFolder(id: string) {
-  yandexDiskOpen.value = { ...yandexDiskOpen.value, [id]: !yandexDiskOpen.value[id] }
+async function yadiskFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${collabApiBase.value}${path}`, {
+    credentials: 'include',
+    ...init,
+    headers: {
+      ...(init?.body && !(init.headers instanceof Headers) ? { 'Content-Type': 'application/json' } : {}),
+      ...((init?.headers as Record<string, string> | undefined) || {}),
+    },
+  })
+}
+
+function diskNodeFromApi(raw: Record<string, unknown>): DiskNode {
+  const t = raw.type === 'dir' ? 'dir' : 'file'
+  return {
+    type: t,
+    name: String(raw.name || ''),
+    path: String(raw.path || ''),
+    href: (raw.href as string) || null,
+    mime_type: (raw.mime_type as string) || null,
+    size: typeof raw.size === 'number' ? raw.size : null,
+    children: undefined,
+    expanded: false,
+    loaded: false,
+    loading: false,
+  }
+}
+
+async function loadYandexPublicRoot() {
+  const publicUrl = yandexDiskUrlInput.value.trim()
+  if (!publicUrl) {
+    yandexDiskStatus.value = 'Введите URL публичной папки или файла'
+    return
+  }
+  if (!/^https?:\/\//i.test(publicUrl)) {
+    yandexDiskStatus.value = 'URL должен начинаться с http:// или https://'
+    return
+  }
+  yandexDiskStatus.value = 'Загрузка списка (публичная ссылка)…'
+  const res = await yadiskFetch('/api/yadisk/public/list', {
+    method: 'POST',
+    body: JSON.stringify({ public_url: publicUrl, path: '', limit: 500, offset: 0 }),
+  })
+  if (!res.ok) {
+    const t = await res.text()
+    yandexDiskStatus.value = `Ошибка API: ${res.status} ${t.slice(0, 200)}`
+    return
+  }
+  const data = (await res.json()) as { items?: Record<string, unknown>[] }
+  const items = (data.items || []).map((x) => diskNodeFromApi(x))
+  yandexDiskRootNodes.value = items
+  yandexDiskMode.value = 'public'
+  yandexDiskConnected.value = true
+  yandexDiskStatus.value = `Публичная папка: в корне ${items.length} элемент(ов)`
+}
+
+async function loadYandexPrivateRoot() {
+  yandexDiskStatus.value = 'Загрузка корня диска (OAuth)…'
+  const res = await yadiskFetch(`/api/yadisk/private/list?path=${encodeURIComponent('disk:/')}&limit=500&offset=0`)
+  if (!res.ok) {
+    const t = await res.text()
+    yandexDiskStatus.value = `Ошибка API: ${res.status} ${t.slice(0, 200)}`
+    yandexDiskRootNodes.value = []
+    return
+  }
+  const data = (await res.json()) as { items?: Record<string, unknown>[] }
+  const items = (data.items || []).map((x) => diskNodeFromApi(x))
+  yandexDiskRootNodes.value = items
+  yandexDiskMode.value = 'oauth'
+  yandexDiskConnected.value = true
+  yandexDiskStatus.value = `OAuth: в корне диска ${items.length} элемент(ов)`
+}
+
+async function loadYandexDiskChildren(node: DiskNode) {
+  if (node.type !== 'dir' || node.loading || node.loaded) return
+  node.loading = true
+  try {
+    let res: Response
+    if (yandexDiskMode.value === 'public') {
+      const publicUrl = yandexDiskUrlInput.value.trim()
+      const subPath = node.path.trim()
+      res = await yadiskFetch('/api/yadisk/public/list', {
+        method: 'POST',
+        body: JSON.stringify({
+          public_url: publicUrl,
+          path: subPath,
+          limit: 500,
+          offset: 0,
+        }),
+      })
+    } else {
+      res = await yadiskFetch(
+        `/api/yadisk/private/list?path=${encodeURIComponent(node.path)}&limit=500&offset=0`
+      )
+    }
+    if (!res.ok) {
+      const t = await res.text()
+      yandexDiskStatus.value = `Ошибка вложенной папки: ${res.status} ${t.slice(0, 160)}`
+      node.children = []
+      node.loaded = true
+      return
+    }
+    const data = (await res.json()) as { items?: Record<string, unknown>[] }
+    node.children = (data.items || []).map((x) => diskNodeFromApi(x))
+    node.loaded = true
+  } finally {
+    node.loading = false
+  }
+}
+
+async function onYandexDiskToggleDir(node: DiskNode) {
+  if (node.type !== 'dir') return
+  if (!node.expanded) {
+    if (!node.loaded) await loadYandexDiskChildren(node)
+    node.expanded = true
+  } else {
+    node.expanded = false
+  }
+}
+
+async function startYandexOAuth() {
+  yandexDiskStatus.value = 'Получение ссылки на Яндекс OAuth…'
+  const res = await yadiskFetch('/api/yadisk/oauth/url')
+  if (!res.ok) {
+    const t = await res.text()
+    yandexDiskStatus.value = `OAuth недоступен: ${res.status} ${t.slice(0, 240)}`
+    return
+  }
+  const data = (await res.json()) as { authorize_url?: string }
+  const url = data.authorize_url
+  if (!url) {
+    yandexDiskStatus.value = 'Сервер не вернул authorize_url'
+    return
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
+  yandexDiskStatus.value =
+    'В открывшейся вкладке войдите в Яндекс; после «Разрешить» дерево подгрузится на этой странице.'
+}
+
+async function finishYandexOAuthFromRedirect() {
+  yandexDiskMode.value = 'oauth'
+  yandexDiskConnected.value = true
+  await loadYandexPrivateRoot()
+}
+
+async function checkYandexOAuthSession() {
+  try {
+    const res = await yadiskFetch('/api/yadisk/oauth/status')
+    if (!res.ok) return
+    const data = (await res.json()) as { connected?: boolean }
+    if (data.connected) {
+      yandexDiskMode.value = 'oauth'
+      yandexDiskConnected.value = true
+      if (!yandexDiskRootNodes.value.length) await loadYandexPrivateRoot()
+      else yandexDiskStatus.value = 'Яндекс.Диск (OAuth) подключён'
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function refreshYandexDisk() {
+  if (!yandexDiskConnected.value) {
+    yandexDiskStatus.value = 'Сначала загрузите публичную папку или войдите через Яндекс'
+    return
+  }
+  if (yandexDiskMode.value === 'public') await loadYandexPublicRoot()
+  else if (yandexDiskMode.value === 'oauth') await loadYandexPrivateRoot()
+  else yandexDiskStatus.value = 'Нет активного режима'
+}
+
+async function disconnectYandexDisk() {
+  if (yandexDiskMode.value === 'oauth') {
+    try {
+      await yadiskFetch('/api/yadisk/oauth/logout', { method: 'POST' })
+    } catch {
+      /* noop */
+    }
+  }
+  yandexDiskConnected.value = false
+  yandexDiskMode.value = 'none'
+  yandexDiskRootNodes.value = []
+  yandexDiskStatus.value = 'Подключение сброшено'
+}
+
+function openYandexDiskUrl() {
+  const url = yandexDiskUrlInput.value.trim()
+  if (!url) {
+    yandexDiskStatus.value = 'Введите URL публичной папки/файла'
+    return
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    yandexDiskStatus.value = 'URL должен начинаться с http:// или https://'
+    return
+  }
+  yandexDiskStatus.value = `URL принят: ${url}`
+  window.open(url, '_blank', 'noopener,noreferrer')
 }
 
 function getFileExt(name: string): string {
@@ -288,38 +456,43 @@ function getFileExt(name: string): string {
   return name.slice(dot + 1).toLowerCase()
 }
 
-function isPdfTreeFile(file: YandexSampleFile): boolean {
+function isPdfTreeFile(file: { name: string }): boolean {
   const ext = getFileExt(file.name)
   return ext === 'pdf' || ext === 'dwg' || ext === 'dxf' || ext === 'frw'
 }
 
-function isModelTreeFile(file: YandexSampleFile): boolean {
+function isModelTreeFile(file: { name: string }): boolean {
   const ext = getFileExt(file.name)
   return ext === 'glb' || ext === 'gltf' || ext === 'stl' || ext === 'step' || ext === 'stp' || ext === 'iges' || ext === 'igs' || ext === 'm3d' || ext === 'a3d'
 }
 
-const yandexPdfTree = computed(() =>
-  yandexDiskSampleTree
-    .map((folder) => ({ ...folder, children: folder.children.filter((file) => isPdfTreeFile(file)) }))
-    .filter((folder) => folder.children.length > 0)
-)
+function collectPdfProductionLinks(
+  nodes: DiskNode[],
+  parentFolder: string
+): Array<{ id: string; title: string; folder: string; href: string }> {
+  const out: Array<{ id: string; title: string; folder: string; href: string }> = []
+  for (const n of nodes) {
+    if (n.type === 'dir') {
+      const folderLabel = n.name || 'Папка'
+      if (n.children?.length) {
+        out.push(...collectPdfProductionLinks(n.children, folderLabel))
+      }
+    } else if (isPdfTreeFile(n)) {
+      out.push({
+        id: n.path || n.name,
+        title: n.name,
+        folder: parentFolder,
+        href: n.href || '#',
+      })
+    }
+  }
+  return out
+}
 
-const yandexModelTree = computed(() =>
-  yandexDiskSampleTree
-    .map((folder) => ({ ...folder, children: folder.children.filter((file) => isModelTreeFile(file)) }))
-    .filter((folder) => folder.children.length > 0)
-)
-
-const productionLinks = computed(() =>
-  yandexPdfTree.value.flatMap((folder) =>
-    folder.children.map((file) => ({
-      id: file.id,
-      title: file.name,
-      folder: folder.name,
-      href: file.href || '#',
-    }))
-  )
-)
+const productionLinks = computed(() => {
+  if (!yandexDiskConnected.value || !yandexDiskRootNodes.value.length) return []
+  return collectPdfProductionLinks(yandexDiskRootNodes.value, 'Корень')
+})
 
 const WORKSPACE_LS_SIDEBAR = 'workspace.sidebarWidthPx'
 const WORKSPACE_LS_RIGHT = 'workspace.rightPanelWidthPx'
@@ -492,6 +665,8 @@ const collabSendingText = ref(false)
 const collabDateTick = ref(0)
 let collabDayTimer: ReturnType<typeof setInterval> | null = null
 let collabWs: WebSocket | null = null
+/** Ложим Yjs-трафик только после ws.connected (или при legacy-подключении сразу после открытия с тем же сервером). */
+let collabWsYjsEnabled = false
 
 const MONTHS_RU_SHORT = [
   'янв',
@@ -1700,6 +1875,7 @@ async function collabLoadMessages() {
 }
 
 function collabDisconnectWs() {
+  collabWsYjsEnabled = false
   if (collabNotesAwareness.value && collabWs?.readyState === WebSocket.OPEN) {
     try {
       collabNotesAwareness.value.setLocalState(null)
@@ -1728,6 +1904,8 @@ function collabConnectWs() {
   collabDisconnectWs()
   if (!collabToken.value || !collabProjectId.value) return
 
+  collabWsYjsEnabled = false
+
   const doc = new Y.Doc()
   collabNotesDoc.value = doc
 
@@ -1743,13 +1921,13 @@ function collabConnectWs() {
 
   doc.on('update', (update: Uint8Array, origin: unknown) => {
     if (origin === 'remote' || origin === 'sync') return
-    if (!collabWs || collabWs.readyState !== WebSocket.OPEN) return
+    if (!collabWsYjsEnabled || !collabWs || collabWs.readyState !== WebSocket.OPEN) return
     collabWs.send(JSON.stringify({ type: 'yjs.update', update: uint8ToBase64(update) }))
   })
 
   awareness.on('update', ({ added, updated, removed }, origin: unknown) => {
     if (origin === 'remote') return
-    if (!collabWs || collabWs.readyState !== WebSocket.OPEN) return
+    if (!collabWsYjsEnabled || !collabWs || collabWs.readyState !== WebSocket.OPEN) return
     const changed = Array.from(new Set([...added, ...updated, ...removed]))
     if (changed.length === 0) return
     const u = encodeAwarenessUpdate(awareness, changed)
@@ -1757,10 +1935,19 @@ function collabConnectWs() {
   })
 
   const wsBase = collabApiBase.value.replace(/^http/, 'ws')
-  collabWs = new WebSocket(`${wsBase}/api/projects/${collabProjectId.value}/ws?token=${encodeURIComponent(collabToken.value)}`)
+  collabWs = new WebSocket(`${wsBase}/api/projects/${collabProjectId.value}/ws`)
+  collabWs.onopen = () => {
+    const t = collabToken.value
+    if (collabWs && collabWs.readyState === WebSocket.OPEN && t) {
+      collabWs.send(JSON.stringify({ type: 'ws.auth', token: t }))
+    }
+  }
   collabWs.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data)
+      if (msg.type === 'ws.connected') {
+        collabWsYjsEnabled = true
+      }
       if (msg.type === 'yjs.sync' && collabNotesDoc.value && Array.isArray(msg.updates)) {
         for (const u of msg.updates as string[]) {
           Y.applyUpdate(collabNotesDoc.value, base64ToUint8(u), 'sync')
@@ -2183,6 +2370,26 @@ onMounted(() => {
       localStorage.removeItem('collabToken')
     })
   }
+  const ys = new URLSearchParams(window.location.search)
+  const yErr = ys.get('yadisk_err')
+  const yOk = ys.get('yadisk_oauth')
+  if (yErr || yOk) {
+    const u = new URL(window.location.href)
+    u.searchParams.delete('yadisk_err')
+    u.searchParams.delete('yadisk_oauth')
+    const qs = u.searchParams.toString()
+    window.history.replaceState({}, '', `${u.pathname}${qs ? `?${qs}` : ''}${u.hash}`)
+  }
+  if (yErr) {
+    try {
+      yandexDiskStatus.value = `OAuth: ${decodeURIComponent(yErr)}`
+    } catch {
+      yandexDiskStatus.value = `OAuth: ${yErr}`
+    }
+  } else if (yOk === '1') {
+    void finishYandexOAuthFromRedirect()
+  }
+  void checkYandexOAuthSession()
 })
 
 onUnmounted(() => {
@@ -2200,31 +2407,11 @@ onUnmounted(() => {
 <template>
   <div class="app" :class="{ 'is-dragging-file': isDraggingFile }">
     <div v-if="isDraggingFile" class="drop-overlay">Отпустите файл (PDF или 3D)</div>
-    <div class="workspace-mode-switch" role="tablist" aria-label="Режим интерфейса">
-      <button
-        type="button"
-        class="workspace-mode-switch-btn"
-        :class="{ 'is-active': workspaceMode === 'engineering' }"
-        role="tab"
-        :aria-selected="workspaceMode === 'engineering'"
-        @click="workspaceMode = 'engineering'"
-      >
-        Инженерный режим
-      </button>
-      <button
-        type="button"
-        class="workspace-mode-switch-btn"
-        :class="{ 'is-active': workspaceMode === 'production' }"
-        role="tab"
-        :aria-selected="workspaceMode === 'production'"
-        @click="workspaceMode = 'production'"
-      >
-        Производство (QR)
-      </button>
-    </div>
     <ViewerToolbar
       :view-mode="viewMode"
+      :workspace-mode="workspaceMode"
       @update:view-mode="onViewModeChange"
+      @update:workspace-mode="workspaceMode = $event"
       @open-pdf="onOpenPdf"
       @open-file="onOpenFile"
       @export-report="onExportReport"
@@ -2246,7 +2433,7 @@ onUnmounted(() => {
         <input v-model="reportAuthor" type="text" class="report-params-input" placeholder="Фамилия Имя" />
       </div>
       <div v-if="reportScreenshots.length === 0" class="report-screenshots-empty">
-        Делайте скриншоты кнопками «Скриншот 2D» / «Скриншот 3D» — после закрытия редактора они появятся здесь и попадут в отчёт.
+        Делайте скриншоты кнопками «Скриншот 2D» / «Скриншот 3D» на панелях чертежа и 3D — после закрытия редактора они появятся здесь; PDF отчёт собирается через «Файл» → «Отчёт…» или кнопку «Отчёт» в шапке.
       </div>
       <div v-else class="report-screenshots-list">
         <div
@@ -2278,7 +2465,30 @@ onUnmounted(() => {
       >
         <div class="ide-sidebar-header">
           <span class="ide-sidebar-title">Яндекс.Диск</span>
-          <span class="ide-sidebar-pill">заготовка</span>
+          <span class="ide-sidebar-pill">API</span>
+        </div>
+        <div class="ide-disk-actions">
+          <div class="ide-disk-row ide-disk-row--wrap">
+            <button
+              type="button"
+              class="ide-disk-btn ide-disk-btn-primary"
+              :disabled="!yandexDiskUrlInput.trim()"
+              @click="loadYandexPublicTree"
+            >
+              Публичная
+            </button>
+            <button type="button" class="ide-disk-btn ide-disk-btn-primary" @click="startYandexOAuth">OAuth</button>
+            <template v-if="yandexDiskConnected">
+              <button type="button" class="ide-disk-btn" @click="refreshYandexDisk">Обновить</button>
+              <button type="button" class="ide-disk-btn ide-disk-btn-danger" @click="disconnectYandexDisk">Сбросить</button>
+            </template>
+          </div>
+          <div class="ide-disk-row">
+            <input v-model="yandexDiskUrlInput" type="url" class="ide-disk-url-input" placeholder="Публичная ссылка на папку" />
+            <button type="button" class="ide-disk-btn" @click="openYandexDiskUrl">В браузере</button>
+          </div>
+          <div class="ide-disk-status">{{ yandexDiskStatus }}</div>
+          <p v-if="yandexDiskMode === 'oauth'" class="ide-disk-hint-mini">Полный доступ к диску (OAuth). Ссылка нужна только для режима «Публичная».</p>
         </div>
         <div class="ide-tree-tabs" role="tablist" aria-label="Деревья файлов">
           <button
@@ -2303,25 +2513,16 @@ onUnmounted(() => {
           </button>
         </div>
         <div class="ide-tree" role="tree">
-          <div v-for="folder in (diskTreeTab === 'pdf' ? yandexPdfTree : yandexModelTree)" :key="folder.id" class="ide-tree-folder">
-            <button
-              type="button"
-              class="ide-tree-row ide-tree-row--folder"
-              :aria-expanded="yandexDiskOpen[folder.id] ? 'true' : 'false'"
-              @click="yandexDiskToggleFolder(folder.id)"
-            >
-              <span class="ide-tree-chevron">{{ yandexDiskOpen[folder.id] ? '▼' : '▶' }}</span>
-              <span class="ide-tree-icon" aria-hidden="true">📁</span>
-              <span class="ide-tree-label">{{ folder.name }}</span>
-            </button>
-            <div v-show="yandexDiskOpen[folder.id]" class="ide-tree-children">
-              <div v-for="file in folder.children" :key="file.id" class="ide-tree-row ide-tree-row--file">
-                <span class="ide-tree-chevron ide-tree-chevron--spacer" aria-hidden="true" />
-                <span class="ide-tree-icon" aria-hidden="true">📄</span>
-                <span class="ide-tree-label">{{ file.name }}</span>
-              </div>
-            </div>
+          <div v-if="!yandexDiskRootNodes.length" class="ide-tree-empty">
+            Укажите публичную ссылку и нажмите «Публичная», либо «OAuth» для всего диска.
           </div>
+          <YandexDiskTree
+            v-else
+            :nodes="yandexDiskRootNodes"
+            :tab="diskTreeTab"
+            :show-file="diskTreeTab === 'pdf' ? isPdfTreeFile : isModelTreeFile"
+            @toggle-dir="onYandexDiskToggleDir($event)"
+          />
         </div>
         <p class="ide-sidebar-hint">В режиме PDF и 3D деревья независимые: выбор чертежа не переключает модель автоматически.</p>
       </aside>
@@ -2347,7 +2548,6 @@ onUnmounted(() => {
         <div class="pdf-panel-header">
           <span class="pdf-panel-title">2D PDF</span>
           <div class="pdf-panel-actions">
-            <button type="button" class="pdf-panel-btn" @click="onOpenPdf">Открыть 2D PDF</button>
             <button type="button" class="pdf-panel-btn" :disabled="!pdfFile" @click="onScreenshot2d">Скриншот 2D</button>
           </div>
         </div>
@@ -2358,7 +2558,7 @@ onUnmounted(() => {
           :pdf-name="pdfFile.name"
         />
         <div v-else class="panel-placeholder panel-placeholder--pdf">
-          <span>Выберите PDF (чертежи, спецификация)</span>
+          <span>Меню «Файл» → «Открыть 2D PDF», дерево Яндекс.Диска или перетащите PDF сюда</span>
         </div>
         </div>
         <div
@@ -3006,27 +3206,6 @@ onUnmounted(() => {
 .report-screenshot-btn-remove:hover {
   background: #b43c3c;
 }
-.workspace-mode-switch {
-  display: flex;
-  gap: 0.35rem;
-  padding: 0.35rem 0.6rem 0.2rem;
-  background: #141920;
-  border-bottom: 1px solid #2a3548;
-}
-.workspace-mode-switch-btn {
-  border: 1px solid #3a4a6a;
-  background: #253247;
-  color: #b5c7e4;
-  font-size: 0.72rem;
-  padding: 0.22rem 0.55rem;
-  border-radius: 4px;
-  cursor: pointer;
-}
-.workspace-mode-switch-btn.is-active {
-  background: #3f5f97;
-  color: #eef3ff;
-  border-color: #5c80c1;
-}
 .content {
   flex: 1 1 auto;
   min-width: 0;
@@ -3063,6 +3242,61 @@ onUnmounted(() => {
   gap: 0.35rem;
   padding: 0.42rem 0.5rem;
   border-bottom: 1px solid #2a3548;
+}
+.ide-disk-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.45rem;
+  border-bottom: 1px solid #2a3548;
+  background: rgba(0, 0, 0, 0.18);
+}
+.ide-disk-row {
+  display: flex;
+  gap: 0.35rem;
+}
+.ide-disk-row--wrap {
+  flex-wrap: wrap;
+}
+.ide-disk-hint-mini {
+  margin: 0;
+  font-size: 0.62rem;
+  line-height: 1.35;
+  color: #6d849e;
+}
+.ide-disk-btn {
+  border: 1px solid #3f516d;
+  background: #2a384f;
+  color: #d7e3f6;
+  font-size: 0.7rem;
+  padding: 0.22rem 0.45rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ide-disk-btn:hover {
+  background: #354968;
+}
+.ide-disk-btn-primary {
+  background: #3f5f97;
+  border-color: #5c80c1;
+}
+.ide-disk-btn-danger {
+  background: #6c3a44;
+  border-color: #8d4d5a;
+}
+.ide-disk-url-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #3f516d;
+  background: #1d2737;
+  color: #d7e3f6;
+  border-radius: 4px;
+  padding: 0.22rem 0.42rem;
+  font-size: 0.7rem;
+}
+.ide-disk-status {
+  font-size: 0.66rem;
+  color: #8ea4c7;
 }
 .ide-sidebar-title {
   font-size: 0.72rem;
@@ -3104,6 +3338,12 @@ onUnmounted(() => {
   min-height: 0;
   overflow: auto;
   padding: 0.28rem 0;
+}
+.ide-tree-empty {
+  padding: 0.5rem 0.65rem;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: #7a8faa;
 }
 .ide-tree-folder {
   margin-bottom: 0.06rem;

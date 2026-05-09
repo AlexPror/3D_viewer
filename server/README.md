@@ -22,8 +22,12 @@ Health check: `http://localhost:8000/api/health`
 Путь можно переопределить переменной `COLLAB_DB_PATH`.
 
 Доп. переменные:
-- `COLLAB_AUTH_SECRET` — секрет подписи токена (обязательно сменить в проде)
+- `COLLAB_AUTH_SECRET` — секрет подписи токена (обязательно сменить в проде; при дефолте в лог пишется предупреждение)
 - `COLLAB_TOKEN_TTL_SECONDS` — TTL токена (по умолчанию 43200)
+- `COLLAB_AUTH_RATE_LIMIT_PER_MINUTE` — лимит попыток входа/регистрации с одного IP за минуту (по умолчанию 60; `0` — без лимита)
+- `COLLAB_CORS_ORIGINS` — через запятую origin’ы для браузера (если не задано — только localhost Vite)
+- `COLLAB_REQUIRE_AUTH_HEAVY_APIS` — если `1`/`true`, эндпоинты STEP/конвертации/КОМПАС требуют заголовок `Authorization: Bearer …`
+- `COLLAB_YJS_MAX_UPDATE_B64_CHARS` / `COLLAB_YJS_MAX_STORED_UPDATES` — ограничение размера одного Yjs-апдейта и длины истории в памяти на проект
 - `YANDEX_TELEMOST_OAUTH` — OAuth-токен для [API Яндекс Телемоста](https://yandex.ru/dev/telemost/doc/) (создание комнаты по запросу `GET /api/projects/{id}/telemost`; без токена вкладка Телемоста показывает подсказку администратору)
 
 Endpoints:
@@ -49,7 +53,7 @@ Endpoints:
 - `POST /api/projects/{project_id}/channels/{channel_id}/read`
 - `POST /api/projects/{project_id}/attachments/upload`
 - `GET /api/projects/{project_id}/attachments/{attachment_id}`
-- `WS /api/projects/{project_id}/ws?token=<bearer-token>` — после `ws.connected` сервер шлёт цепочку `yjs.sync` (история CRDT для совместных заметок); клиенты шлют `yjs.update` и `yjs.awareness` (курсоры), сервер ретранслирует участникам проекта
+- `WS /api/projects/{project_id}/ws` — после `accept` клиент присылает `{"type":"ws.auth","token":"<jwt>"}` (предпочтительно) или передаёт legacy `?token=` в query; далее `ws.connected` и цепочка `yjs.sync` (CRDT заметок); клиенты шлют `yjs.update` / `yjs.awareness`, сервер ретранслирует участникам проекта
 
 Для защищенных endpoint используйте:
 `Authorization: Bearer <token>`
@@ -72,4 +76,12 @@ Returns `{ "available": true|false, "max_file_bytes": N }`.
 Multipart form-data: `file` — STEP (`.stp`/`.step`).  
 Конвертирует STEP в GLB на сервере; возвращает бинарный GLB (`model/gltf-binary`) или 501/413/500.  
 Лимит размера файла: 100 МБ. Вьюер сначала пробует этот endpoint для STEP; при недоступности или ошибке используется конвертация в браузере (WASM).
+
+### Яндекс.Диск (`/api/yadisk`)
+
+Переменные: `YANDEX_CLIENT_ID`, `YANDEX_CLIENT_SECRET`, `YANDEX_OAUTH_REDIRECT_URI`, `YANDEX_OAUTH_SUCCESS_REDIRECT` (см. код `yadisk_routes.py`).
+
+- `POST /api/yadisk/public/list` — содержимое по публичной ссылке
+- `GET /api/yadisk/oauth/url`, `GET /api/yadisk/oauth/callback`, `GET /api/yadisk/oauth/status`, `POST /api/yadisk/oauth/logout`
+- `GET /api/yadisk/private/list` — листинг при OAuth-сессии (cookie)
 
