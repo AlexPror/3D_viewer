@@ -383,10 +383,6 @@ export async function loadStepOrIgesToGlbUrl(
   console.log(`${LOG_PREFIX} WASM готов: ${((performance.now() - tWasm) / 1000).toFixed(2)} с`)
 
   const ext = extension.toLowerCase()
-  if (ext === 'dxf') {
-    console.warn(`${LOG_PREFIX} DXF пока не поддерживается`)
-    throw new Error('Формат DXF пока не поддерживается')
-  }
 
   const filename = getInputPath(ext)
   oc.FS.writeFile(filename, new Uint8Array(arrayBuffer))

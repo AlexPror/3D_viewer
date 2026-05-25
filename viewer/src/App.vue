@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, shallowRef, watch } fr
 import * as Y from 'yjs'
 import { Awareness, encodeAwarenessUpdate, applyAwarenessUpdate } from 'y-protocols/awareness'
 import { logger } from './lib/logger'
+import { findSidecarFileForPdf } from './lib/pdfMarkup'
 import { jsPDF } from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import type { ViewMode, MeasureSnapMode, MeasureType } from './components/ViewerToolbar.vue'
@@ -18,8 +19,13 @@ import type { DiskNode } from './components/YandexDiskTree.vue'
 
 const viewMode = ref<ViewMode>('split')
 const viewerRef = ref<InstanceType<typeof Viewer3D> | null>(null)
+const assemblyProjectFileInputRef = ref<HTMLInputElement | null>(null)
 const pdfViewerRef = ref<InstanceType<typeof PdfViewer> | null>(null)
-const pdfFile = ref<{ url: string; name: string } | null>(null)
+const pdfFile = ref<{
+  url: string
+  name: string
+  markupSidecarBytes?: ArrayBuffer | null
+} | null>(null)
 interface ReportScreenshotItem {
   id: string
   type: '2d' | '3d'
@@ -138,6 +144,14 @@ const measureSnapMode = ref<MeasureSnapMode>('intersection')
 const measureType = ref<MeasureType>('distance')
 const isDraggingFile = ref(false)
 const collabApiBase = ref((import.meta.env.VITE_COLLAB_API_BASE as string | undefined) || 'http://localhost:8000')
+
+function collabFetchErrorMessage(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e)
+  if (e instanceof TypeError || /failed to fetch|network|connection refused/i.test(msg)) {
+    return `Сервер чата не запущен (${collabApiBase.value}). В папке server: python -m uvicorn main:app --reload --port 8000`
+  }
+  return msg || 'ошибка сети'
+}
 const collabToken = ref(localStorage.getItem('collabToken') || '')
 const collabUser = ref<{ id: string; email: string; displayName: string } | null>(null)
 const collabEmail = ref('')
@@ -497,9 +511,56 @@ const productionLinks = computed(() => {
 const WORKSPACE_LS_SIDEBAR = 'workspace.sidebarWidthPx'
 const WORKSPACE_LS_RIGHT = 'workspace.rightPanelWidthPx'
 const WORKSPACE_LS_CENTER_PDF = 'workspace.centerPdfWidthPx'
+const WORKSPACE_LS_DISK_COLLAPSED = 'workspace.diskPanelCollapsed'
+const WORKSPACE_LS_CHAT_COLLAPSED = 'workspace.chatPanelCollapsed'
+const COLLAPSED_PANEL_PX = 36
 
 const sidebarWidth = ref(248)
 const rightPanelWidth = ref(380)
+const diskPanelCollapsed = ref(false)
+const chatPanelCollapsed = ref(false)
+let sidebarWidthBeforeCollapse = 248
+let rightPanelWidthBeforeCollapse = 380
+
+const effectiveSidebarWidth = computed(() =>
+  diskPanelCollapsed.value ? COLLAPSED_PANEL_PX : sidebarWidth.value,
+)
+const effectiveRightPanelWidth = computed(() =>
+  chatPanelCollapsed.value ? COLLAPSED_PANEL_PX : rightPanelWidth.value,
+)
+
+function persistWorkspaceLayout() {
+  try {
+    localStorage.setItem(WORKSPACE_LS_SIDEBAR, String(sidebarWidth.value))
+    localStorage.setItem(WORKSPACE_LS_RIGHT, String(rightPanelWidth.value))
+    localStorage.setItem(WORKSPACE_LS_DISK_COLLAPSED, diskPanelCollapsed.value ? '1' : '0')
+    localStorage.setItem(WORKSPACE_LS_CHAT_COLLAPSED, chatPanelCollapsed.value ? '1' : '0')
+  } catch {
+    /* noop */
+  }
+}
+
+function toggleDiskPanel() {
+  if (diskPanelCollapsed.value) {
+    diskPanelCollapsed.value = false
+    sidebarWidth.value = clampWorkspaceWidth(sidebarWidthBeforeCollapse, 160, 480)
+  } else {
+    sidebarWidthBeforeCollapse = sidebarWidth.value
+    diskPanelCollapsed.value = true
+  }
+  persistWorkspaceLayout()
+}
+
+function toggleChatPanel() {
+  if (chatPanelCollapsed.value) {
+    chatPanelCollapsed.value = false
+    rightPanelWidth.value = clampWorkspaceWidth(rightPanelWidthBeforeCollapse, 260, 720)
+  } else {
+    rightPanelWidthBeforeCollapse = rightPanelWidth.value
+    chatPanelCollapsed.value = true
+  }
+  persistWorkspaceLayout()
+}
 /** Ширина панели PDF в режиме «Разделение» (2D | 3D), px */
 const centerPdfWidth = ref(440)
 
@@ -511,6 +572,8 @@ function clampWorkspaceWidth(w: number, min: number, max: number): number {
 let workspaceSplitterDrag: { kind: 'left' | 'right'; startX: number; sw: number; rw: number } | null = null
 
 function onWorkspaceSplitterDown(kind: 'left' | 'right', e: MouseEvent) {
+  if (kind === 'left' && diskPanelCollapsed.value) return
+  if (kind === 'right' && chatPanelCollapsed.value) return
   e.preventDefault()
   workspaceSplitterDrag = {
     kind,
@@ -539,12 +602,7 @@ function onWorkspaceSplitterUp() {
   document.body.classList.remove('workspace-resizing')
   window.removeEventListener('mousemove', onWorkspaceSplitterMove)
   window.removeEventListener('mouseup', onWorkspaceSplitterUp)
-  try {
-    localStorage.setItem(WORKSPACE_LS_SIDEBAR, String(sidebarWidth.value))
-    localStorage.setItem(WORKSPACE_LS_RIGHT, String(rightPanelWidth.value))
-  } catch {
-    /* noop */
-  }
+  persistWorkspaceLayout()
 }
 
 let centerSplitterDrag: { startX: number; startW: number } | null = null
@@ -638,6 +696,144 @@ async function collabLoadTelemost() {
     telemostHint.value = e instanceof Error ? e.message : 'Ошибка'
   } finally {
     telemostLoading.value = false
+  }
+}
+
+const telemostCallBanner = ref<{ title: string; joinUrl: string } | null>(null)
+const saveActionToast = ref('')
+const pdfMarkupDirty = ref(false)
+
+function dismissTelemostBanner() {
+  telemostCallBanner.value = null
+}
+
+function showSaveToast(message: string) {
+  saveActionToast.value = message
+  window.setTimeout(() => {
+    if (saveActionToast.value === message) saveActionToast.value = ''
+  }, 2800)
+}
+
+const activeFocusContext = computed<'pdf' | '3d'>(() => {
+  if (viewMode.value === '2d') return 'pdf'
+  if (viewMode.value === '3d') return '3d'
+  return pdfFile.value ? 'pdf' : '3d'
+})
+
+async function telemostJoinFromMenu() {
+  if (!collabToken.value || !collabProjectId.value) {
+    window.alert('Войдите в чат и выберите проект.')
+    return
+  }
+  rightWorkAreaTab.value = 'telemost'
+  await collabLoadTelemost()
+  if (telemostJoinUrl.value) {
+    window.open(telemostJoinUrl.value, '_blank', 'noopener,noreferrer')
+  } else if (telemostHint.value) {
+    window.alert(telemostHint.value)
+  }
+}
+
+async function telemostCreateMeetingFromMenu() {
+  const title = window.prompt('Название встречи (подгруппа):', 'Встреча команды')
+  if (!title?.trim()) return
+  if (!collabProjectId.value) {
+    window.alert('Выберите проект в чате.')
+    return
+  }
+  await collabLoadTelemost()
+  const joinUrl = telemostJoinUrl.value || ''
+  try {
+    const key = `deskreview.telemostRooms.${collabProjectId.value}`
+    const raw = localStorage.getItem(key)
+    const rooms: { id: string; title: string; joinUrl: string; createdAt: string }[] = raw ? JSON.parse(raw) : []
+    rooms.unshift({
+      id: `room_${Date.now()}`,
+      title: title.trim(),
+      joinUrl,
+      createdAt: new Date().toISOString(),
+    })
+    localStorage.setItem(key, JSON.stringify(rooms.slice(0, 20)))
+  } catch {
+    /* noop */
+  }
+  telemostCallBanner.value = { title: title.trim(), joinUrl }
+  rightWorkAreaTab.value = 'telemost'
+}
+
+async function onWorkspaceSave() {
+  if (activeFocusContext.value === 'pdf' && pdfFile.value) {
+    const r = await pdfViewerRef.value?.exportPdfWithRemarks?.()
+    if (r?.ok && r.fileName) {
+      const msg =
+        r.mode === 'flattened'
+          ? `PDF с пометками на листе: ${r.fileName}`
+          : `Замечания проекта: ${r.fileName} и файл слоя`
+      showSaveToast(msg)
+    }
+    else if (r?.ok === false) showSaveToast('Не удалось экспортировать PDF')
+    else showSaveToast('Откройте PDF и добавьте пометки')
+    return
+  }
+  showSaveToast('3D: сохранение замечаний — этап 3d (Ctrl+S)')
+}
+
+async function onWorkspaceSaveAs() {
+  await onWorkspaceSave()
+}
+
+function onPdfMarkupDirty(dirty: boolean) {
+  pdfMarkupDirty.value = dirty
+}
+
+function confirmPdfMarkupDiscard(): boolean {
+  return pdfViewerRef.value?.confirmDiscardMarkup?.() ?? true
+}
+
+function onBeforeUnload(ev: BeforeUnloadEvent) {
+  if (pdfMarkupDirty.value) {
+    ev.preventDefault()
+    ev.returnValue = ''
+  }
+}
+
+function onWorkspaceUndo() {
+  showSaveToast('Отмена (Ctrl+Z) — в разработке для активной панели')
+}
+
+function onShowLogs() {
+  viewMode.value = 'log'
+}
+
+function onExportReportEmail() {
+  window.alert('Отправка скриншот-отчёта по почте — в разработке.')
+}
+
+async function onExportReportChat() {
+  if (reportScreenshots.value.length === 0) {
+    window.alert('Добавьте скриншоты в панель отчёта.')
+    return
+  }
+  for (const item of reportScreenshots.value) {
+    await sendScreenshotToChat(item)
+  }
+}
+
+function onWorkspaceKeydown(e: KeyboardEvent) {
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return
+  if (e.ctrlKey && e.key === 's') {
+    e.preventDefault()
+    void onWorkspaceSave()
+  } else if (e.ctrlKey && e.key === 'z') {
+    e.preventDefault()
+    onWorkspaceUndo()
+  } else if (e.key === 'Escape') {
+    if (pdfViewerRef.value?.cancelMarkupAction?.()) {
+      e.preventDefault()
+      return
+    }
+    viewerRef.value?.cancelActiveTool?.()
   }
 }
 
@@ -861,6 +1057,19 @@ const MODEL_EXTENSIONS = ['stl', 'step', 'stp', 'igs', 'iges', 'glb', 'gltf']
 
 let pdfInput: HTMLInputElement | null = null
 
+async function openLocalPdfFile(file: File, siblings?: Iterable<File>) {
+  if (!confirmPdfMarkupDiscard()) return
+  logger.info('App', `PDF открыт: ${file.name}`)
+  if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
+  let markupSidecarBytes: ArrayBuffer | null = null
+  const sidecar = siblings ? findSidecarFileForPdf(siblings, file.name) : undefined
+  if (sidecar) {
+    markupSidecarBytes = await sidecar.arrayBuffer()
+    logger.info('App', `Слой замечаний подхвачен: ${sidecar.name}`)
+  }
+  pdfFile.value = { url: URL.createObjectURL(file), name: file.name, markupSidecarBytes }
+}
+
 function onDragOver(e: DragEvent) {
   if (!e.dataTransfer?.types.includes('Files')) return
   e.preventDefault()
@@ -876,15 +1085,18 @@ async function onDrop(e: DragEvent) {
   isDraggingFile.value = false
   if (!e.dataTransfer?.types.includes('Files')) return
   e.preventDefault()
-  const file = e.dataTransfer.files?.[0]
-  if (!file) return
-  const ext = (file.name.split('.').pop() || '').toLowerCase()
-  if (ext === 'pdf') {
-    logger.info('App', `PDF открыт: ${file.name}`)
-    if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
-    pdfFile.value = { url: URL.createObjectURL(file), name: file.name }
+  const dropped = e.dataTransfer.files
+  if (!dropped?.length) return
+  const pdf = Array.from(dropped).find(
+    (f) => (f.name.split('.').pop() || '').toLowerCase() === 'pdf',
+  )
+  if (pdf) {
+    await openLocalPdfFile(pdf, dropped)
     return
   }
+  const first = dropped[0]
+  if (!first) return
+  const ext = (first.name.split('.').pop() || '').toLowerCase()
   if (MODEL_EXTENSIONS.includes(ext)) {
     if (viewMode.value === '2d' || viewMode.value === 'log') viewMode.value = 'split'
     const modelFiles = Array.from(e.dataTransfer.files || [])
@@ -913,14 +1125,18 @@ function onOpenPdf() {
   if (!pdfInput) {
     pdfInput = document.createElement('input')
     pdfInput.type = 'file'
-    pdfInput.accept = '.pdf'
+    pdfInput.multiple = true
+    pdfInput.accept = '.pdf,application/pdf,.json,application/json'
     pdfInput.onchange = () => {
-      const file = pdfInput?.files?.[0]
-      if (file) {
-        logger.info('App', `PDF выбран: ${file.name}`)
-        if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
-        pdfFile.value = { url: URL.createObjectURL(file), name: file.name }
+      const picked = pdfInput?.files
+      if (!picked?.length) {
+        if (pdfInput) pdfInput.value = ''
+        return
       }
+      const pdf = Array.from(picked).find(
+        (f) => (f.name.split('.').pop() || '').toLowerCase() === 'pdf',
+      )
+      if (pdf) void openLocalPdfFile(pdf, picked)
       if (pdfInput) pdfInput.value = ''
     }
   }
@@ -1301,6 +1517,38 @@ function onClearMeasurements() {
   logger.info('App', 'onClearMeasurements вызван')
   viewerRef.value?.clearMeasurements?.()
   pdfViewerRef.value?.clearMeasurements?.()
+}
+
+function onSaveAssemblyProject() {
+  viewerRef.value?.saveAssemblyProjectJson?.()
+}
+
+function onOpenAssemblyProject() {
+  assemblyProjectFileInputRef.value?.click()
+}
+
+function onAssemblyProjectFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    try {
+      const json = JSON.parse(reader.result as string)
+      const apply = viewerRef.value?.applyAssemblyProjectJson
+      if (!apply) return
+      const res = apply(json)
+      if (!res.ok) {
+        alert(res.message)
+        logger.warn('App', `Проект сборки: ${res.message}`)
+      }
+    } catch (e) {
+      logger.error('App', 'Проект сборки: ошибка разбора JSON', e)
+      alert('Не удалось разобрать файл (ожидается JSON проекта сборки).')
+    }
+  }
+  reader.readAsText(file, 'utf-8')
 }
 
 async function onScreenshot3D() {
@@ -2037,7 +2285,7 @@ async function collabSubmitAuth() {
     await collabBootstrap()
     collabStatus.value = 'Подключено'
   } catch (e) {
-    collabStatus.value = `Ошибка: ${e instanceof Error ? e.message : 'auth'}`
+    collabStatus.value = collabFetchErrorMessage(e)
   } finally {
     collabBusy.value = false
   }
@@ -2351,9 +2599,19 @@ onMounted(() => {
     const sw = localStorage.getItem(WORKSPACE_LS_SIDEBAR)
     const rw = localStorage.getItem(WORKSPACE_LS_RIGHT)
     const cw = localStorage.getItem(WORKSPACE_LS_CENTER_PDF)
-    if (sw) sidebarWidth.value = clampWorkspaceWidth(Number(sw), 160, 480)
-    if (rw) rightPanelWidth.value = clampWorkspaceWidth(Number(rw), 260, 720)
+    if (sw) {
+      sidebarWidth.value = clampWorkspaceWidth(Number(sw), 160, 480)
+      sidebarWidthBeforeCollapse = sidebarWidth.value
+    }
+    if (rw) {
+      rightPanelWidth.value = clampWorkspaceWidth(Number(rw), 260, 720)
+      rightPanelWidthBeforeCollapse = rightPanelWidth.value
+    }
     if (cw) centerPdfWidth.value = clampWorkspaceWidth(Number(cw), 160, 1200)
+    const diskCol = localStorage.getItem(WORKSPACE_LS_DISK_COLLAPSED)
+    const chatCol = localStorage.getItem(WORKSPACE_LS_CHAT_COLLAPSED)
+    if (diskCol === '1') diskPanelCollapsed.value = true
+    if (chatCol === '1') chatPanelCollapsed.value = true
   } catch {
     /* noop */
   }
@@ -2365,7 +2623,7 @@ onMounted(() => {
   }, 60_000)
   if (collabToken.value) {
     collabBootstrap().catch((e) => {
-      collabStatus.value = `Ошибка подключения: ${e instanceof Error ? e.message : 'bootstrap'}`
+      collabStatus.value = collabFetchErrorMessage(e)
       collabToken.value = ''
       localStorage.removeItem('collabToken')
     })
@@ -2390,9 +2648,13 @@ onMounted(() => {
     void finishYandexOAuthFromRedirect()
   }
   void checkYandexOAuthSession()
+  window.addEventListener('keydown', onWorkspaceKeydown)
+  window.addEventListener('beforeunload', onBeforeUnload)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', onWorkspaceKeydown)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   window.removeEventListener('dragover', onDragOver)
   window.removeEventListener('drop', onDrop)
   window.removeEventListener('dragleave', onDragLeave)
@@ -2407,6 +2669,16 @@ onUnmounted(() => {
 <template>
   <div class="app" :class="{ 'is-dragging-file': isDraggingFile }">
     <div v-if="isDraggingFile" class="drop-overlay">Отпустите файл (PDF или 3D)</div>
+    <input
+      ref="assemblyProjectFileInputRef"
+      type="file"
+      accept=".json,application/json"
+      class="sr-only"
+      aria-hidden="true"
+      tabindex="-1"
+      style="position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none"
+      @change="onAssemblyProjectFile"
+    />
     <ViewerToolbar
       :view-mode="viewMode"
       :workspace-mode="workspaceMode"
@@ -2415,7 +2687,32 @@ onUnmounted(() => {
       @open-pdf="onOpenPdf"
       @open-file="onOpenFile"
       @export-report="onExportReport"
+      @export-report-email="onExportReportEmail"
+      @export-report-chat="onExportReportChat"
+      @save-assembly-project="onSaveAssemblyProject"
+      @open-assembly-project="onOpenAssemblyProject"
+      @save-pdf="onWorkspaceSave"
+      @save-pdf-as="onWorkspaceSaveAs"
+      @save-3d="onWorkspaceSave"
+      @save-3d-as="onWorkspaceSaveAs"
+      @show-logs="onShowLogs"
+      @telemost-join-project="telemostJoinFromMenu"
+      @telemost-create-meeting="telemostCreateMeetingFromMenu"
     />
+    <div v-if="telemostCallBanner" class="telemost-call-banner" role="status">
+      <span>Звонок: {{ telemostCallBanner.title }}</span>
+      <a
+        v-if="telemostCallBanner.joinUrl"
+        class="telemost-call-banner-link"
+        :href="telemostCallBanner.joinUrl"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        Подключиться
+      </a>
+      <button type="button" class="telemost-call-banner-dismiss" @click="dismissTelemostBanner">×</button>
+    </div>
+    <div v-if="saveActionToast" class="workspace-save-toast">{{ saveActionToast }}</div>
     <div class="report-screenshots-panel">
       <div class="report-screenshots-header">
         <span class="report-screenshots-title">Скриншоты для отчёта</span>
@@ -2460,13 +2757,25 @@ onUnmounted(() => {
     <div v-if="workspaceMode === 'engineering'" class="workspace">
       <aside
         class="ide-sidebar ide-sidebar--disk"
+        :class="{ 'ide-sidebar--collapsed': diskPanelCollapsed }"
         aria-label="Файлы проекта на Яндекс.Диске"
-        :style="{ flex: `0 0 ${sidebarWidth}px`, width: `${sidebarWidth}px` }"
+        :style="{ flex: `0 0 ${effectiveSidebarWidth}px`, width: `${effectiveSidebarWidth}px` }"
       >
         <div class="ide-sidebar-header">
-          <span class="ide-sidebar-title">Яндекс.Диск</span>
-          <span class="ide-sidebar-pill">API</span>
+          <template v-if="!diskPanelCollapsed">
+            <span class="ide-sidebar-title">Яндекс.Диск</span>
+            <span class="ide-sidebar-pill">API</span>
+          </template>
+          <button
+            type="button"
+            class="ide-panel-collapse-btn"
+            :title="diskPanelCollapsed ? 'Развернуть панель диска' : 'Свернуть панель диска'"
+            @click="toggleDiskPanel"
+          >
+            {{ diskPanelCollapsed ? '⟩' : '⟨' }}
+          </button>
         </div>
+        <template v-if="!diskPanelCollapsed">
         <div class="ide-disk-actions">
           <div class="ide-disk-row ide-disk-row--wrap">
             <button
@@ -2525,9 +2834,12 @@ onUnmounted(() => {
           />
         </div>
         <p class="ide-sidebar-hint">В режиме PDF и 3D деревья независимые: выбор чертежа не переключает модель автоматически.</p>
+        </template>
+        <div v-else class="ide-sidebar-collapsed-label" title="Яндекс.Диск">Диск</div>
       </aside>
       <div
         class="workspace-splitter"
+        :class="{ 'workspace-splitter--disabled': diskPanelCollapsed }"
         title="Изменить ширину панели"
         @mousedown.prevent="onWorkspaceSplitterDown('left', $event)"
       />
@@ -2548,6 +2860,9 @@ onUnmounted(() => {
         <div class="pdf-panel-header">
           <span class="pdf-panel-title">2D PDF</span>
           <div class="pdf-panel-actions">
+            <button type="button" class="pdf-panel-btn pdf-panel-btn-open" title="Выбрать PDF на диске" @click="onOpenPdf">
+              Открыть PDF
+            </button>
             <button type="button" class="pdf-panel-btn" :disabled="!pdfFile" @click="onScreenshot2d">Скриншот 2D</button>
           </div>
         </div>
@@ -2556,6 +2871,9 @@ onUnmounted(() => {
           ref="pdfViewerRef"
           :pdf-url="pdfFile.url"
           :pdf-name="pdfFile.name"
+          :markup-sidecar-bytes="pdfFile.markupSidecarBytes ?? null"
+          @open-pdf="onOpenPdf"
+          @markup-dirty="onPdfMarkupDirty"
         />
         <div v-else class="panel-placeholder panel-placeholder--pdf">
           <span>Меню «Файл» → «Открыть 2D PDF», дерево Яндекс.Диска или перетащите PDF сюда</span>
@@ -2602,15 +2920,25 @@ onUnmounted(() => {
       </div>
       <div
         class="workspace-splitter"
+        :class="{ 'workspace-splitter--disabled': chatPanelCollapsed }"
         title="Изменить ширину чата"
         @mousedown.prevent="onWorkspaceSplitterDown('right', $event)"
       />
       <aside
         class="collab-panel"
-        :style="{ flex: `0 0 ${rightPanelWidth}px`, width: `${rightPanelWidth}px` }"
+        :class="{ 'collab-panel--collapsed': chatPanelCollapsed }"
+        :style="{ flex: `0 0 ${effectiveRightPanelWidth}px`, width: `${effectiveRightPanelWidth}px` }"
       >
         <div class="collab-panel-head">
-          <div class="collab-work-tabs" role="tablist">
+          <button
+            type="button"
+            class="ide-panel-collapse-btn ide-panel-collapse-btn--chat"
+            :title="chatPanelCollapsed ? 'Развернуть чат' : 'Свернуть чат'"
+            @click="toggleChatPanel"
+          >
+            {{ chatPanelCollapsed ? '⟨' : '⟩' }}
+          </button>
+          <div v-if="!chatPanelCollapsed" class="collab-work-tabs" role="tablist">
             <button
               type="button"
               class="collab-work-tab"
@@ -2642,8 +2970,10 @@ onUnmounted(() => {
               Телемост
             </button>
           </div>
-          <button v-if="collabToken" type="button" class="collab-btn collab-btn--compact" @click="collabLogout">Выйти</button>
+          <button v-if="collabToken && !chatPanelCollapsed" type="button" class="collab-btn collab-btn--compact" @click="collabLogout">Выйти</button>
         </div>
+        <div v-if="chatPanelCollapsed" class="ide-sidebar-collapsed-label ide-sidebar-collapsed-label--chat" title="Чат">Чат</div>
+        <template v-else>
         <div v-show="rightWorkAreaTab === 'telemost'" class="collab-telemost">
           <p class="collab-hint collab-hint--tight">
             Один звонок на проект: сервер создаёт комнату Телемоста при первом открытии вкладки (нужен OAuth API у администратора). Участникам достаточно нажать «Подключиться».
@@ -2996,6 +3326,7 @@ onUnmounted(() => {
         </div>
         </div>
         <div v-if="collabStatus" class="collab-status">{{ collabStatus }}</div>
+        </template>
       </aside>
     </div>
     <div v-else class="production-mode">
@@ -3233,6 +3564,97 @@ onUnmounted(() => {
 .ide-sidebar--disk {
   min-width: 160px;
   max-width: 480px;
+}
+.ide-sidebar--collapsed {
+  min-width: 0;
+  max-width: none;
+}
+.ide-panel-collapse-btn {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1;
+  border: 1px solid #3d4d68;
+  border-radius: 4px;
+  background: #252f42;
+  color: #c8d6ee;
+  cursor: pointer;
+}
+.ide-panel-collapse-btn:hover {
+  background: #395f96;
+  border-color: #5d83c7;
+}
+.ide-panel-collapse-btn--chat {
+  margin-right: 0.35rem;
+}
+.ide-sidebar-collapsed-label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  color: #8ea4c7;
+  padding: 0.5rem 0;
+  user-select: none;
+}
+.ide-sidebar-collapsed-label--chat {
+  transform: rotate(180deg);
+}
+.workspace-splitter--disabled {
+  pointer-events: none;
+  opacity: 0.35;
+  cursor: default;
+}
+.collab-panel--collapsed {
+  min-width: 0;
+}
+.collab-panel--collapsed .collab-panel-head {
+  flex-direction: column;
+  align-items: center;
+  padding: 0.35rem 0.2rem;
+}
+.telemost-call-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.4rem 0.85rem;
+  background: rgba(50, 90, 60, 0.55);
+  border-bottom: 1px solid rgba(100, 160, 110, 0.45);
+  font-size: 0.82rem;
+  color: #d8f0dc;
+}
+.telemost-call-banner-link {
+  color: #9ee8b0;
+  font-weight: 600;
+}
+.telemost-call-banner-dismiss {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: #c8e8cc;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0 0.35rem;
+}
+.workspace-save-toast {
+  position: fixed;
+  bottom: 1.25rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5000;
+  padding: 0.55rem 1rem;
+  border-radius: 8px;
+  background: rgba(30, 40, 58, 0.95);
+  border: 1px solid #4a6fc7;
+  color: #e8eef8;
+  font-size: 0.82rem;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
 }
 .ide-sidebar-header {
   flex-shrink: 0;

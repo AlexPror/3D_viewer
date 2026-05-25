@@ -2,10 +2,21 @@
 setlocal
 cd /d "%~dp0"
 
-echo Starting local metadata server...
-start "3D Viewer Server" cmd /k "%~dp0server\run-server.bat"
+echo.
+echo DeskReview — локальный запуск (сервер + фронт)
+echo.
 
-echo Starting frontend (Vite)...
-start "3D Viewer Frontend" cmd /k "%~dp0run-frontend.bat"
+echo [1/2] Сервер чата и API: http://localhost:8000
+start "DeskReview Server" cmd /k "%~dp0server\run-server.bat"
 
-echo Done. Close windows to stop.
+echo      Ожидание старта сервера...
+timeout /t 4 /nobreak >nul
+
+echo [2/2] Фронтенд Vite: http://localhost:5173
+start "DeskReview Frontend" cmd /k "%~dp0run-frontend.bat"
+
+echo.
+echo Готово. Два окна: Server и Frontend. Закройте окно — процесс остановится.
+echo   API:   http://localhost:8000
+echo   Сайт:  http://localhost:5173
+echo.

@@ -3,7 +3,7 @@ import { onMounted, onUnmounted, ref } from 'vue'
 
 export type ViewMode = '2d' | '3d' | 'split' | 'log'
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
-export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance'
+export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance' | 'cad-linear'
 
 defineProps<{
   viewMode: ViewMode
@@ -16,34 +16,40 @@ const emit = defineEmits<{
   'open-pdf': []
   'open-file': []
   'export-report': []
+  'save-assembly-project': []
+  'open-assembly-project': []
+  'save-pdf': []
+  'save-pdf-as': []
+  'save-3d': []
+  'save-3d-as': []
+  'show-logs': []
+  'export-report-email': []
+  'export-report-chat': []
+  'telemost-join-project': []
+  'telemost-create-meeting': []
 }>()
 
-const fileMenuOpen = ref(false)
-const fileMenuRef = ref<HTMLElement | null>(null)
+type MenuId = 'file' | 'mode' | 'logs' | 'report' | 'telemost' | null
+const openMenu = ref<MenuId>(null)
 
-function closeFileMenu() {
-  fileMenuOpen.value = false
+function setMenu(id: MenuId) {
+  openMenu.value = openMenu.value === id ? null : id
 }
 
-function onOpenPdf() {
-  emit('open-pdf')
-  closeFileMenu()
+function closeMenus() {
+  openMenu.value = null
 }
 
-function onOpenFile() {
-  emit('open-file')
-  closeFileMenu()
-}
-
-function onExportReport() {
-  emit('export-report')
-  closeFileMenu()
+function run(fn: () => void) {
+  fn()
+  closeMenus()
 }
 
 function onDocumentClick(ev: MouseEvent) {
-  const el = fileMenuRef.value
-  if (!el || fileMenuOpen.value === false) return
-  if (!el.contains(ev.target as Node)) closeFileMenu()
+  const t = ev.target as Node
+  if (!(t instanceof Element)) return
+  if (t.closest('.toolbar-menu-wrap')) return
+  closeMenus()
 }
 
 onMounted(() => document.addEventListener('click', onDocumentClick))
@@ -53,150 +59,173 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 <template>
   <header class="toolbar">
     <div class="toolbar-row">
-      <div class="toolbar-left">
-        <span class="title">3D Viewer</span>
-        <div class="workspace-switch" role="tablist" aria-label="Режим интерфейса">
-          <button
-            type="button"
-            class="workspace-switch-btn"
-            :class="{ 'is-active': workspaceMode === 'engineering' }"
-            role="tab"
-            :aria-selected="workspaceMode === 'engineering'"
-            @click="emit('update:workspaceMode', 'engineering')"
-          >
-            Инженерный
-          </button>
-          <button
-            type="button"
-            class="workspace-switch-btn"
-            :class="{ 'is-active': workspaceMode === 'production' }"
-            role="tab"
-            :aria-selected="workspaceMode === 'production'"
-            @click="emit('update:workspaceMode', 'production')"
-          >
-            Производство (QR)
-          </button>
-        </div>
+      <div class="toolbar-brand">
+        <span class="title">DeskReview</span>
       </div>
 
-      <div class="toolbar-center">
-        <div ref="fileMenuRef" class="file-menu-wrap">
+      <nav class="toolbar-menus" aria-label="Главное меню">
+        <div class="toolbar-menu-wrap">
           <button
             type="button"
-            class="file-menu-trigger"
-            :class="{ 'is-open': fileMenuOpen }"
+            class="toolbar-menu-trigger"
+            :class="{ 'is-open': openMenu === 'file' }"
             aria-haspopup="true"
-            :aria-expanded="fileMenuOpen"
-            @click.stop="fileMenuOpen = !fileMenuOpen"
+            :aria-expanded="openMenu === 'file'"
+            @click.stop="setMenu('file')"
           >
-            <svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm4 18H6V4h7v5h5v11z"
-              />
-            </svg>
             Файл
           </button>
-          <div v-show="fileMenuOpen" class="file-menu-dropdown" role="menu">
-            <button type="button" class="file-menu-item" role="menuitem" @click="onOpenPdf">
+          <div v-show="openMenu === 'file'" class="toolbar-menu-dropdown" role="menu">
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('open-pdf'))">
               Открыть 2D PDF…
             </button>
-            <button type="button" class="file-menu-item" role="menuitem" @click="onOpenFile">
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('open-file'))">
               Открыть 3D модель…
             </button>
-            <div class="file-menu-divider" />
-            <button type="button" class="file-menu-item file-menu-item--soon" disabled title="В разработке">
+            <div class="toolbar-menu-divider" />
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('save-pdf'))">
+              Сохранить замечания проекта (Ctrl+S)
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('save-pdf-as'))">
+              Сохранить замечания проекта…
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('save-3d'))">
+              Сохранить 3D
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('save-3d-as'))">
+              Сохранить 3D как…
+            </button>
+            <div class="toolbar-menu-divider" />
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('save-assembly-project'))">
               Сохранить проект сборки…
             </button>
-            <button type="button" class="file-menu-item file-menu-item--soon" disabled title="В разработке">
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('open-assembly-project'))">
               Открыть проект сборки…
-            </button>
-            <div class="file-menu-divider" />
-            <button type="button" class="file-menu-item" role="menuitem" @click="onExportReport">
-              Отчёт PDF из скриншотов…
             </button>
           </div>
         </div>
 
-        <span class="toolbar-label">Экран</span>
-        <div class="layout-modes" role="tablist" aria-label="Макет области просмотра">
+        <div class="toolbar-menu-wrap">
           <button
             type="button"
-            class="layout-btn"
-            :class="{ active: viewMode === '2d' }"
-            role="tab"
-            :aria-selected="viewMode === '2d'"
-            title="Только чертёж PDF"
-            @click="emit('update:viewMode', '2d')"
+            class="toolbar-menu-trigger"
+            :class="{ 'is-open': openMenu === 'mode' }"
+            aria-haspopup="true"
+            :aria-expanded="openMenu === 'mode'"
+            @click.stop="setMenu('mode')"
           >
-            <svg class="layout-ico" viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm4 18H6V4h7v5h5v11zm-3-8H9v2h6v-2zm0-4H9v2h6V8z"
-              />
-            </svg>
-            <span class="layout-text">2D</span>
+            Режим
           </button>
+          <div v-show="openMenu === 'mode'" class="toolbar-menu-dropdown toolbar-menu-dropdown--wide" role="menu">
+            <div class="toolbar-menu-group-label">Интерфейс</div>
+            <button
+              type="button"
+              class="toolbar-menu-item"
+              role="menuitem"
+              :class="{ 'is-checked': workspaceMode === 'engineering' }"
+              @click="run(() => emit('update:workspaceMode', 'engineering'))"
+            >
+              Инженерный
+            </button>
+            <button
+              type="button"
+              class="toolbar-menu-item"
+              role="menuitem"
+              :class="{ 'is-checked': workspaceMode === 'production' }"
+              @click="run(() => emit('update:workspaceMode', 'production'))"
+            >
+              Производство (QR)
+            </button>
+            <div class="toolbar-menu-divider" />
+            <div class="toolbar-menu-group-label">Макет экрана</div>
+            <button
+              type="button"
+              class="toolbar-menu-item"
+              role="menuitem"
+              :class="{ 'is-checked': viewMode === '2d' }"
+              @click="run(() => emit('update:viewMode', '2d'))"
+            >
+              Только 2D PDF
+            </button>
+            <button
+              type="button"
+              class="toolbar-menu-item"
+              role="menuitem"
+              :class="{ 'is-checked': viewMode === '3d' }"
+              @click="run(() => emit('update:viewMode', '3d'))"
+            >
+              Только 3D
+            </button>
+            <button
+              type="button"
+              class="toolbar-menu-item"
+              role="menuitem"
+              :class="{ 'is-checked': viewMode === 'split' }"
+              @click="run(() => emit('update:viewMode', 'split'))"
+            >
+              Совмещённый (2D + 3D)
+            </button>
+          </div>
+        </div>
+
+        <div class="toolbar-menu-wrap">
           <button
             type="button"
-            class="layout-btn"
-            :class="{ active: viewMode === '3d' }"
-            role="tab"
-            :aria-selected="viewMode === '3d'"
-            title="Только 3D"
-            @click="emit('update:viewMode', '3d')"
+            class="toolbar-menu-trigger"
+            :class="{ 'is-open': openMenu === 'logs' }"
+            aria-haspopup="true"
+            :aria-expanded="openMenu === 'logs'"
+            @click.stop="run(() => emit('show-logs'))"
           >
-            <svg class="layout-ico" viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M12 2l10 5v10l-10 5L2 17V7l10-5zm0 2.18L4.47 8.5 12 12.82 19.53 8.5 12 4.18zM4 9.72v6.56l7 3.5v-7.04l-7-4.02zm16 0l-7 4.02v7.04l7-3.5V9.72z"
-              />
-            </svg>
-            <span class="layout-text">3D</span>
-          </button>
-          <button
-            type="button"
-            class="layout-btn"
-            :class="{ active: viewMode === 'split' }"
-            role="tab"
-            :aria-selected="viewMode === 'split'"
-            title="Чертёж и модель рядом"
-            @click="emit('update:viewMode', 'split')"
-          >
-            <svg class="layout-ico" viewBox="0 0 24 24" aria-hidden="true">
-              <path fill="currentColor" d="M4 4h8v16H4V4zm8 0h8v7h-8V4zm0 9h8v7h-8v-7z" />
-            </svg>
-            <span class="layout-text">Совмещ.</span>
-          </button>
-          <button
-            type="button"
-            class="layout-btn"
-            :class="{ active: viewMode === 'log' }"
-            role="tab"
-            :aria-selected="viewMode === 'log'"
-            title="Панель логов"
-            @click="emit('update:viewMode', 'log')"
-          >
-            <svg class="layout-ico" viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14H7v-2h5v2zm5-4H7v-2h10v2zm0-4H7V7h10v2z"
-              />
-            </svg>
-            <span class="layout-text">Лог</span>
+            Логи
           </button>
         </div>
 
-        <button type="button" class="toolbar-report-btn" title="Собрать PDF из скриншотов 2D/3D" @click="emit('export-report')">
-          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"
-            />
-          </svg>
-          Отчёт
-        </button>
-      </div>
+        <div class="toolbar-menu-wrap">
+          <button
+            type="button"
+            class="toolbar-menu-trigger"
+            :class="{ 'is-open': openMenu === 'report' }"
+            aria-haspopup="true"
+            :aria-expanded="openMenu === 'report'"
+            @click.stop="setMenu('report')"
+          >
+            Скриншот-отчёт
+          </button>
+          <div v-show="openMenu === 'report'" class="toolbar-menu-dropdown" role="menu">
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('export-report'))">
+              Экспорт скриншот-отчёта в PDF…
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('export-report-email'))">
+              Отправить скриншот-отчёт по почте…
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('export-report-chat'))">
+              Отправить скриншот-отчёт в чат
+            </button>
+          </div>
+        </div>
+
+        <div class="toolbar-menu-wrap">
+          <button
+            type="button"
+            class="toolbar-menu-trigger toolbar-menu-trigger--telemost"
+            :class="{ 'is-open': openMenu === 'telemost' }"
+            aria-haspopup="true"
+            :aria-expanded="openMenu === 'telemost'"
+            @click.stop="setMenu('telemost')"
+          >
+            Телемост
+          </button>
+          <div v-show="openMenu === 'telemost'" class="toolbar-menu-dropdown" role="menu">
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('telemost-join-project'))">
+              Присоединиться к звонку проекта
+            </button>
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('telemost-create-meeting'))">
+              Создать отдельную встречу…
+            </button>
+          </div>
+        </div>
+      </nav>
     </div>
   </header>
 </template>
@@ -218,92 +247,67 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
   gap: 0.65rem 1rem;
   padding: 0.45rem 0.85rem;
 }
-.toolbar-left {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.65rem 1rem;
-  min-width: 0;
+.toolbar-brand {
+  flex-shrink: 0;
 }
 .title {
-  font-weight: 600;
-  color: #fff;
-  flex-shrink: 0;
-  font-size: 1rem;
+  font-weight: 700;
+  color: #f0c878;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
 }
-.workspace-switch {
-  display: flex;
-  gap: 0.35rem;
-  flex-wrap: wrap;
-}
-.workspace-switch-btn {
-  border: 1px solid #3a4a6a;
-  background: #253247;
-  color: #b5c7e4;
-  font-size: 0.72rem;
-  padding: 0.28rem 0.6rem;
-  border-radius: 4px;
-  cursor: pointer;
-}
-.workspace-switch-btn.is-active {
-  background: #3f5f97;
-  color: #eef3ff;
-  border-color: #5c80c1;
-}
-.toolbar-center {
+.toolbar-menus {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.5rem 0.65rem;
+  gap: 0.35rem;
   flex: 1;
   min-width: 0;
 }
-.toolbar-label {
-  font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: #7a8aa5;
-  margin-right: -0.15rem;
-}
-
-.file-menu-wrap {
+.toolbar-menu-wrap {
   position: relative;
 }
-.file-menu-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.38rem 0.65rem;
-  font-size: 0.85rem;
+.toolbar-menu-trigger {
+  padding: 0.38rem 0.7rem;
+  font-size: 0.84rem;
   border-radius: 6px;
   cursor: pointer;
   border: 1px solid rgba(100, 130, 180, 0.55);
   background: rgba(70, 95, 135, 0.55);
   color: #e8eef8;
 }
-.file-menu-trigger:hover,
-.file-menu-trigger.is-open {
+.toolbar-menu-trigger:hover,
+.toolbar-menu-trigger.is-open {
   background: rgba(90, 115, 165, 0.75);
   border-color: rgba(130, 160, 210, 0.75);
 }
-.file-menu-trigger .ico {
-  width: 1.1rem;
-  height: 1.1rem;
-  opacity: 0.95;
+.toolbar-menu-trigger--telemost {
+  border-color: rgba(120, 160, 120, 0.55);
+  background: rgba(60, 95, 70, 0.5);
 }
-.file-menu-dropdown {
+.toolbar-menu-dropdown {
   position: absolute;
   top: calc(100% + 4px);
   left: 0;
-  min-width: 15rem;
+  min-width: 16rem;
   padding: 0.35rem 0;
   background: #252b38;
   border: 1px solid #3d4d68;
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  z-index: 200;
+  z-index: 300;
 }
-.file-menu-item {
+.toolbar-menu-dropdown--wide {
+  min-width: 14rem;
+}
+.toolbar-menu-group-label {
+  padding: 0.25rem 0.85rem 0.15rem;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #7a8aa5;
+}
+.toolbar-menu-item {
   display: block;
   width: 100%;
   text-align: left;
@@ -314,85 +318,20 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
   color: #e0e8f0;
   cursor: pointer;
 }
-.file-menu-item:hover:not(:disabled) {
+.toolbar-menu-item:hover:not(:disabled) {
   background: rgba(74, 111, 199, 0.45);
 }
-.file-menu-item:disabled {
+.toolbar-menu-item.is-checked {
+  color: #9ec4ff;
+  font-weight: 600;
+}
+.toolbar-menu-item:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
-.file-menu-item--soon {
-  color: #8a96a8;
-}
-.file-menu-divider {
+.toolbar-menu-divider {
   height: 1px;
   margin: 0.3rem 0;
   background: rgba(255, 255, 255, 0.08);
-}
-
-.layout-modes {
-  display: flex;
-  gap: 0.25rem;
-  flex-wrap: wrap;
-  align-items: center;
-}
-.layout-btn {
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.12rem;
-  min-width: 3.35rem;
-  padding: 0.35rem 0.45rem 0.3rem;
-  border-radius: 8px;
-  cursor: pointer;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(55, 75, 110, 0.45);
-  color: #c8d4ec;
-}
-.layout-btn:hover {
-  background: rgba(70, 95, 140, 0.55);
-}
-.layout-btn.active {
-  background: #4a6fc7;
-  border-color: #6b8fd8;
-  color: #fff;
-}
-.layout-ico {
-  width: 1.35rem;
-  height: 1.35rem;
-  opacity: 0.95;
-}
-.layout-text {
-  font-size: 0.68rem;
-  font-weight: 600;
-  line-height: 1;
-}
-
-.toolbar-report-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  margin-left: auto;
-  padding: 0.38rem 0.65rem;
-  font-size: 0.82rem;
-  border-radius: 6px;
-  cursor: pointer;
-  border: 1px solid rgba(160, 130, 70, 0.55);
-  background: rgba(110, 85, 45, 0.45);
-  color: #f0e6d4;
-}
-.toolbar-report-btn:hover {
-  background: rgba(140, 110, 55, 0.55);
-}
-.toolbar-report-btn .ico {
-  width: 1.05rem;
-  height: 1.05rem;
-}
-
-@media (max-width: 900px) {
-  .toolbar-report-btn {
-    margin-left: 0;
-  }
 }
 </style>
