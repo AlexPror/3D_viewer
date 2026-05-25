@@ -1,4 +1,5 @@
 import { PDFDocument, rgb, type PDFPage } from 'pdf-lib'
+import { type RemarkStatus, normalizeRemarkStatus } from './remarkStatus'
 
 export type PdfMarkupTool =
   | 'arrow'
@@ -26,7 +27,13 @@ export const DEFAULT_MARKUP_STYLE: PdfMarkupDrawStyle = {
   fontRel: 0.022,
 }
 
-type PdfMarkupVectorBase = {
+type PdfMarkupRemarkMeta = {
+  remarkStatus?: RemarkStatus
+  remarkNote?: string
+  createdAt?: string
+}
+
+type PdfMarkupVectorBase = PdfMarkupRemarkMeta & {
   id: string
   x1: number
   y1: number
@@ -43,7 +50,7 @@ export type PdfMarkupShape =
   | (PdfMarkupVectorBase & { type: 'rect' })
   | (PdfMarkupVectorBase & { type: 'ellipse' })
   | (PdfMarkupVectorBase & { type: 'polyline'; points: PdfMarkupPoint[] })
-  | {
+  | (PdfMarkupRemarkMeta & {
       id: string
       type: 'text'
       x1: number
@@ -53,7 +60,7 @@ export type PdfMarkupShape =
       text: string
       fontSize?: number
       color?: string
-    }
+    })
 
 export interface PdfMarkupDocument {
   documentKey: string
@@ -166,6 +173,25 @@ export function pagesWithMarkup(doc: PdfMarkupDocument): number[] {
     .map(([p]) => Number(p))
     .filter((n) => Number.isFinite(n) && n >= 1)
     .sort((a, b) => a - b)
+}
+
+export function shapeRemarkStatus(shape: PdfMarkupShape): RemarkStatus {
+  return normalizeRemarkStatus(shape.remarkStatus)
+}
+
+export function ensureMarkupRemarkMeta(doc: PdfMarkupDocument): void {
+  const fallbackTs = doc.updatedAt ?? new Date().toISOString()
+  for (const shapes of Object.values(doc.pages)) {
+    if (!shapes) continue
+    for (const sh of shapes) {
+      sh.remarkStatus = normalizeRemarkStatus(sh.remarkStatus)
+      if (!sh.createdAt) sh.createdAt = fallbackTs
+    }
+  }
+}
+
+export function defaultRemarkMeta(): PdfMarkupRemarkMeta {
+  return { remarkStatus: 'open', remarkNote: '', createdAt: new Date().toISOString() }
 }
 
 export function shapeLabel(shape: PdfMarkupShape, index: number): string {

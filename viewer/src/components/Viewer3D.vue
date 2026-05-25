@@ -8,6 +8,42 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js'
 import { STLExporter } from 'three/addons/exporters/STLExporter.js'
 import { loadStepOrIgesToGlbUrl, getOpenCascade } from '../lib/stepLoader'
 import { logger } from '../lib/logger'
+import {
+  type Model3dComment,
+  type Model3dRemarksDocument,
+  type Model3dViewState,
+  buildModel3dRemarksFile,
+  createEmptyModel3dRemarks,
+  downloadJsonBlob,
+  encodeModel3dRemarksFile,
+  formatModel3dRemarksFileName,
+  loadModel3dRemarks,
+  modelRemarksDocumentKey,
+  newModel3dCommentId,
+  parseModel3dRemarksBytes,
+  saveModel3dRemarks,
+  cloneModel3dRemarks,
+  normalizeModel3dRemarksDocument,
+  type Model3dAnchor3d,
+} from '../lib/model3dRemarks'
+import {
+  type RemarkStatus,
+  type RemarkStatusFilter,
+  REMARK_STATUS_OPTIONS,
+  remarkStatusLabel,
+  remarkStatusCssClass,
+  normalizeRemarkStatus,
+} from '../lib/remarkStatus'
+import {
+  type ScreenLayerShape,
+  type ScreenLayerTool,
+  type Model3dScreenImage,
+  ensureScreenLayer,
+  newScreenLayerImageId,
+  viewDirectionAngleDeg,
+  SCREEN_LAYER_VIEW_ANGLE_THRESHOLD_DEG,
+} from '../lib/model3dScreenLayer'
+import Model3dScreenLayerOverlay from './Model3dScreenLayerOverlay.vue'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
@@ -38,6 +74,7 @@ const emit = defineEmits<{
   'export-glb': []
   'export-stl': []
   'screenshot-3d': []
+  'remarks-dirty': [dirty: boolean]
 }>()
 
 let scene: THREE.Scene
@@ -85,6 +122,7 @@ let measurementArcPathLine: THREE.Line | null = null
 let measurementFaceGeometries: THREE.BufferGeometry[] = []
 let measurementPlanesGroup: THREE.Group
 let savedMeasurementsGroup: THREE.Group
+let remarkAnchorsGroup: THREE.Group
 /** Подсветка выбранных плоскостей сборки и связей из таблицы (после initScene) */
 let assemblyHighlightGroup: THREE.Group | undefined
 let measurementLabelEl: HTMLDivElement | null = null
@@ -399,6 +437,420 @@ function onMeasureHeaderClick() {
   setLeftSidebarTab('measurements')
   emit('measure')
 }
+
+const remarksDoc = ref<Model3dRemarksDocument | null>(null)
+const selectedRemarkId = ref<string | null>(null)
+const remarksDirty = ref(false)
+let remarksDirtyBaseline = '[]'
+
+const primaryModelFileName = computed(() => {
+  const inScene = loadedModels.value.filter((m) => m.inScene)
+  if (inScene.length > 0) return inScene[inScene.length - 1].name
+  return loadedFileName?.trim() || ''
+})
+
+const remarkStatusFilter = ref<RemarkStatusFilter>('all')
+
+const remarkList = computed(() => remarksDoc.value?.comments ?? [])
+
+const filteredRemarkList = computed(() => {
+  const list = remarkList.value
+  if (remarkStatusFilter.value === 'all') return list
+  return list.filter((c) => normalizeRemarkStatus(c.status) === remarkStatusFilter.value)
+})
+
+const selectedRemark = computed(() => {
+  if (!selectedRemarkId.value || !remarksDoc.value) return null
+  return remarksDoc.value.comments.find((c) => c.id === selectedRemarkId.value) ?? null
+})
+
+const remarkAnchorPickMode = ref(false)
+const remarkScreenTool = ref<ScreenLayerTool>('select')
+const remarkScreenSelectedImageId = ref<string | null>(null)
+const screenLayerOverlayRef = ref<InstanceType<typeof Model3dScreenLayerOverlay> | null>(null)
+const remarkScreenColor = ref('#cc0000')
+const remarkScreenSelectedShapeId = ref<string | null>(null)
+const remarkViewAngleDeg = ref(0)
+
+const remarkScreenLayerVisible = computed(
+  () =>
+    leftSidebarTab.value === 'remarks' &&
+    !!selectedRemark.value &&
+    remarkViewAngleDeg.value <= SCREEN_LAYER_VIEW_ANGLE_THRESHOLD_DEG,
+)
+
+const remarkScreenLayerEditable = computed(
+  () => remarkScreenLayerVisible.value && !remarkAnchorPickMode.value && !!selectedRemark.value,
+)
+
+const selectedRemarkScreenShapes = computed({
+  get: () => selectedRemark.value?.screenLayer?.shapes ?? [],
+  set: (shapes: ScreenLayerShape[]) => {
+    onRemarkScreenShapesUpdate(shapes)
+  },
+})
+
+const selectedRemarkScreenImages = computed({
+  get: () => selectedRemark.value?.images ?? [],
+  set: (images: Model3dScreenImage[]) => {
+    onRemarkScreenImagesUpdate(images)
+  },
+})
+
+function syncRemarksDirtyFlag() {
+  const dirty = JSON.stringify(remarksDoc.value?.comments ?? []) !== remarksDirtyBaseline
+  remarksDirty.value = dirty
+  emit('remarks-dirty', dirty)
+}
+
+function markRemarksChanged() {
+  syncRemarksDirtyFlag()
+  if (remarksDoc.value) {
+    void saveModel3dRemarks(remarksDoc.value).catch((e) => logger.warn('Viewer3D', 'Автосохранение замечаний 3D', e))
+  }
+}
+
+function captureCurrentViewState(): Model3dViewState | null {
+  if (!camera || !controls) return null
+  const hiddenModelIds = loadedModels.value.filter((m) => !m.inScene).map((m) => m.id)
+  return {
+    camera: {
+      position: [camera.position.x, camera.position.y, camera.position.z],
+      target: [controls.target.x, controls.target.y, controls.target.z],
+      up: [camera.up.x, camera.up.y, camera.up.z],
+      fov: camera.fov,
+    },
+    hiddenModelIds,
+  }
+}
+
+function applyViewState(vs: Model3dViewState) {
+  if (!camera || !controls) return
+  camera.position.set(vs.camera.position[0], vs.camera.position[1], vs.camera.position[2])
+  controls.target.set(vs.camera.target[0], vs.camera.target[1], vs.camera.target[2])
+  camera.up.set(vs.camera.up[0], vs.camera.up[1], vs.camera.up[2])
+  camera.fov = vs.camera.fov
+  camera.updateProjectionMatrix()
+  controls.update()
+}
+
+async function initRemarksForCurrentModel() {
+  const name = primaryModelFileName.value
+  if (!name) {
+    remarksDoc.value = null
+    remarksDirtyBaseline = '[]'
+    remarksDirty.value = false
+    emit('remarks-dirty', false)
+    selectedRemarkId.value = null
+    return
+  }
+  const key = modelRemarksDocumentKey(name)
+  const loaded = await loadModel3dRemarks(key)
+  const base = loaded ?? createEmptyModel3dRemarks(name)
+  remarksDoc.value = normalizeModel3dRemarksDocument({ ...base, modelKey: key, modelFileName: name })
+  remarksDirtyBaseline = JSON.stringify(remarksDoc.value.comments)
+  remarksDirty.value = false
+  emit('remarks-dirty', false)
+  selectedRemarkId.value = null
+}
+
+function addRemarkFromCurrentView() {
+  const name = primaryModelFileName.value
+  if (!name) {
+    window.alert('Сначала загрузите 3D-модель в сцену.')
+    return
+  }
+  const vs = captureCurrentViewState()
+  if (!vs) return
+  if (!remarksDoc.value) remarksDoc.value = createEmptyModel3dRemarks(name)
+  const title = window.prompt('Название замечания:', `Замечание ${remarkList.value.length + 1}`)
+  if (title === null) return
+  const comment: Model3dComment = {
+    id: newModel3dCommentId(),
+    parentId: null,
+    title: title.trim() || `Замечание ${remarkList.value.length + 1}`,
+    description: '',
+    status: 'open',
+    createdAt: new Date().toISOString(),
+    viewState: vs,
+    screenLayer: { shapes: [] },
+    images: [],
+  }
+  remarksDoc.value.comments.push(comment)
+  selectedRemarkId.value = comment.id
+  remarkScreenTool.value = 'select'
+  remarkScreenSelectedShapeId.value = null
+  remarkScreenSelectedImageId.value = null
+  markRemarksChanged()
+  setLeftSidebarTab('remarks')
+}
+
+function selectRemark(commentId: string) {
+  selectedRemarkId.value = commentId
+  remarkScreenSelectedShapeId.value = null
+  remarkScreenSelectedImageId.value = null
+  const c = remarksDoc.value?.comments.find((x) => x.id === commentId)
+  if (c?.viewState) applyViewState(c.viewState)
+  ensureSelectedRemarkLayers()
+  rebuildRemarkAnchorMarkers()
+  updateRemarkViewAngle()
+}
+
+function deleteSelectedRemark() {
+  if (!remarksDoc.value || !selectedRemarkId.value) return
+  const idx = remarksDoc.value.comments.findIndex((c) => c.id === selectedRemarkId.value)
+  if (idx < 0) return
+  if (!window.confirm('Удалить это замечание?')) return
+  remarksDoc.value.comments.splice(idx, 1)
+  selectedRemarkId.value = null
+  markRemarksChanged()
+}
+
+function restoreSelectedRemarkView() {
+  const c = remarksDoc.value?.comments.find((x) => x.id === selectedRemarkId.value)
+  if (c?.viewState) {
+    applyViewState(c.viewState)
+    updateRemarkViewAngle()
+  }
+}
+
+function updateSelectedRemarkStatus(status: RemarkStatus) {
+  const c = selectedRemark.value
+  if (!c) return
+  c.status = status
+  markRemarksChanged()
+}
+
+function updateSelectedRemarkDescription(description: string) {
+  const c = selectedRemark.value
+  if (!c) return
+  c.description = description
+  markRemarksChanged()
+}
+
+function ensureSelectedRemarkLayers() {
+  const c = selectedRemark.value
+  if (!c) return
+  if (!c.screenLayer) c.screenLayer = ensureScreenLayer()
+  if (!c.images) c.images = []
+}
+
+function onRemarkScreenShapesUpdate(shapes: ScreenLayerShape[]) {
+  const c = selectedRemark.value
+  if (!c) return
+  ensureSelectedRemarkLayers()
+  c.screenLayer!.shapes = shapes
+  markRemarksChanged()
+}
+
+function onRemarkScreenImagesUpdate(images: Model3dScreenImage[]) {
+  const c = selectedRemark.value
+  if (!c) return
+  c.images = images
+  markRemarksChanged()
+}
+
+function toggleRemarkAnchorPick() {
+  remarkAnchorPickMode.value = !remarkAnchorPickMode.value
+}
+
+function clearSelectedRemarkAnchor() {
+  const c = selectedRemark.value
+  if (!c?.anchor3d) return
+  c.anchor3d = undefined
+  markRemarksChanged()
+  rebuildRemarkAnchorMarkers()
+}
+
+function anchorWorldPoint(anchor: Model3dAnchor3d): THREE.Vector3 | null {
+  const g = modelGroupsById.get(anchor.modelId)
+  if (!g) return null
+  g.updateMatrixWorld(true)
+  return new THREE.Vector3(anchor.pointLocal.x, anchor.pointLocal.y, anchor.pointLocal.z).applyMatrix4(g.matrixWorld)
+}
+
+function remarkMarkerRadius(): number {
+  if (!meshGroup?.children.length) return 3
+  const box = new THREE.Box3().setFromObject(meshGroup)
+  const s = box.getSize(new THREE.Vector3())
+  return Math.max(0.5, Math.max(s.x, s.y, s.z) * 0.006)
+}
+
+function rebuildRemarkAnchorMarkers() {
+  if (!remarkAnchorsGroup) return
+  while (remarkAnchorsGroup.children.length) {
+    const ch = remarkAnchorsGroup.children[0]
+    remarkAnchorsGroup.remove(ch)
+    if (ch instanceof THREE.Mesh) {
+      ch.geometry.dispose()
+      const m = ch.material
+      if (Array.isArray(m)) m.forEach((x) => x.dispose())
+      else m.dispose()
+    }
+  }
+  if (leftSidebarTab.value !== 'remarks') return
+  const anchor = selectedRemark.value?.anchor3d
+  if (!anchor) return
+  const wp = anchorWorldPoint(anchor)
+  if (!wp) return
+  const r = remarkMarkerRadius()
+  const geo = new THREE.SphereGeometry(r, 14, 14)
+  const mat = new THREE.MeshStandardMaterial({ color: 0xf97316, emissive: 0x9a3412, emissiveIntensity: 0.35 })
+  const mesh = new THREE.Mesh(geo, mat)
+  mesh.position.copy(wp)
+  remarkAnchorsGroup.add(mesh)
+}
+
+function pickRemarkAnchorFromHit(hit: THREE.Intersection) {
+  const c = selectedRemark.value
+  if (!c) return
+  const wrap = findWrapperGroup(hit.object)
+  const modelId = String(wrap?.userData?.modelId ?? '')
+  if (!modelId || !wrap) {
+    window.alert('Кликните по детали в сцене.')
+    return
+  }
+  wrap.updateMatrixWorld(true)
+  const inv = wrap.matrixWorld.clone().invert()
+  const local = hit.point.clone().applyMatrix4(inv)
+  const mesh = hit.object as THREE.Mesh
+  const normalLocal = hit
+    .face!.normal.clone()
+    .transformDirection(mesh.matrixWorld)
+    .transformDirection(inv)
+    .normalize()
+  c.anchor3d = {
+    modelId,
+    pointLocal: { x: local.x, y: local.y, z: local.z },
+    normalLocal: { x: normalLocal.x, y: normalLocal.y, z: normalLocal.z },
+  }
+  remarkAnchorPickMode.value = false
+  markRemarksChanged()
+  rebuildRemarkAnchorMarkers()
+}
+
+function updateRemarkViewAngle() {
+  const c = selectedRemark.value
+  if (!c || !camera || !controls) {
+    remarkViewAngleDeg.value = 0
+    return
+  }
+  const vs = c.viewState
+  remarkViewAngleDeg.value = viewDirectionAngleDeg(
+    [camera.position.x, camera.position.y, camera.position.z],
+    [controls.target.x, controls.target.y, controls.target.z],
+    vs.camera.position,
+    vs.camera.target,
+  )
+}
+
+function insertRemarkScreenImage() {
+  const c = selectedRemark.value
+  if (!c) return
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = 'image/*'
+  input.onchange = () => {
+    const file = input.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      ensureSelectedRemarkLayers()
+      const dataUrl = typeof reader.result === 'string' ? reader.result : ''
+      if (!dataUrl) return
+      const newId = newScreenLayerImageId()
+      c.images!.push({
+        id: newId,
+        file: file.name,
+        dataUrl,
+        x: 0.08,
+        y: 0.08,
+        w: 0.35,
+        h: 0.28,
+      })
+      remarkScreenSelectedImageId.value = newId
+      remarkScreenSelectedShapeId.value = null
+      remarkScreenTool.value = 'select'
+      markRemarksChanged()
+    }
+    reader.readAsDataURL(file)
+  }
+  input.click()
+}
+
+function deleteSelectedScreenMarkup() {
+  screenLayerOverlayRef.value?.deleteSelected()
+}
+
+watch(leftSidebarTab, (tab) => {
+  if (tab !== 'remarks') {
+    remarkAnchorPickMode.value = false
+    rebuildRemarkAnchorMarkers()
+  }
+})
+
+watch([selectedRemarkId, () => selectedRemark.value?.anchor3d, leftSidebarTab], () => {
+  rebuildRemarkAnchorMarkers()
+})
+
+async function saveModel3dRemarksToFile(): Promise<{ ok: boolean; fileName?: string }> {
+  if (!remarksDoc.value || !primaryModelFileName.value) return { ok: false }
+  try {
+    const file = buildModel3dRemarksFile(remarksDoc.value)
+    const fileName = formatModel3dRemarksFileName(primaryModelFileName.value)
+    downloadJsonBlob(encodeModel3dRemarksFile(file), fileName)
+    await saveModel3dRemarks(remarksDoc.value)
+    remarksDirtyBaseline = JSON.stringify(remarksDoc.value.comments)
+    remarksDirty.value = false
+    emit('remarks-dirty', false)
+    return { ok: true, fileName }
+  } catch (e) {
+    logger.error('Viewer3D', 'Сохранение замечаний 3D', e)
+    return { ok: false }
+  }
+}
+
+function importModel3dRemarksFile() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.json,application/json'
+  input.onchange = async () => {
+    const file = input.files?.[0]
+    if (!file || !primaryModelFileName.value) return
+    const parsed = parseModel3dRemarksBytes(await file.arrayBuffer())
+    if (!parsed) {
+      window.alert('Не удалось прочитать файл замечаний 3D.')
+      return
+    }
+    const key = modelRemarksDocumentKey(primaryModelFileName.value)
+    remarksDoc.value = normalizeModel3dRemarksDocument({
+      ...cloneModel3dRemarks(parsed.remarks),
+      modelKey: key,
+      modelFileName: primaryModelFileName.value,
+    })
+    markRemarksChanged()
+    logger.info('Viewer3D', `Замечания 3D загружены: ${file.name}`)
+  }
+  input.click()
+}
+
+async function confirmDiscardModel3dRemarksAsync(): Promise<boolean> {
+  if (!remarksDirty.value) return true
+  const saveFirst = window.confirm(
+    'Есть несохранённые замечания 3D.\n\nOK — сохранить JSON на диск\nОтмена — другое действие',
+  )
+  if (saveFirst) {
+    const r = await saveModel3dRemarksToFile()
+    return r.ok
+  }
+  const discard = window.confirm('Продолжить без сохранения JSON на диск? Черновик останется в браузере.')
+  return discard
+}
+
+watch(primaryModelFileName, () => {
+  void initRemarksForCurrentModel()
+})
+
 /** Активная модель для кнопок панели, копирования трансформа и удаления */
 const focusedModelId = ref<string | null>(null)
 /** Закреплённые в сцене модели не перетаскиваются и не вращаются ЛКМ */
@@ -2750,6 +3202,8 @@ function initScene() {
   scene.add(savedMeasurementsGroup)
   assemblyHighlightGroup = new THREE.Group()
   scene.add(assemblyHighlightGroup)
+  remarkAnchorsGroup = new THREE.Group()
+  scene.add(remarkAnchorsGroup)
 
   updateSceneLighting()
 
@@ -2816,6 +3270,7 @@ function initScene() {
     animationId = requestAnimationFrame(animate)
     syncOverlayTransforms()
     controls.update()
+    updateRemarkViewAngle()
     let hits: THREE.Intersection[] = []
     if (measureModeRef.value && meshGroup.children.length && containerRef.value) {
       const now = performance.now()
@@ -5020,6 +5475,14 @@ function onCanvasClick(ev: MouseEvent) {
   mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(mouse, camera)
   const hits = raycaster.intersectObject(meshGroup, true)
+  if (remarkAnchorPickMode.value && selectedRemark.value) {
+    if (hits.length === 0) {
+      window.alert('Кликните по детали в сцене, чтобы поставить якорь.')
+      return
+    }
+    pickRemarkAnchorFromHit(hits[0])
+    return
+  }
   if (assemblyPickTarget.value) {
     if (hits.length === 0) {
       assemblyStatus.value = 'Не попали в модель. Кликните по нужной плоскости.'
@@ -7502,6 +7965,12 @@ defineExpose({
   applyAssemblyProjectJson,
   setLeftSidebarTab,
   cancelActiveTool,
+  undoLastAction: () => undoTransform(),
+  saveModel3dRemarksToFile,
+  confirmDiscardModel3dRemarksAsync,
+  get isRemarksDirty() {
+    return remarksDirty.value
+  },
 })
 </script>
 
@@ -8049,18 +8518,219 @@ defineExpose({
             </div>
           </div>
         </div>
-        <div v-show="leftSidebarTab === 'remarks'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-remarks-stub">
-          <p class="viewer-remarks-hint">Замечания 3D (этап 3d): JSON рядом с GLB, дерево замечаний, живая сцена.</p>
-          <label class="viewer-remarks-label">Путь к файлу замечаний</label>
-          <input class="viewer-remarks-input" type="text" readonly placeholder="model.remarks.json" />
-          <div class="viewer-remarks-actions">
-            <button type="button" class="viewer-remarks-btn" disabled title="Этап 3d">Открыть</button>
-            <button type="button" class="viewer-remarks-btn" disabled title="Этап 3d">Добавить</button>
-          </div>
+        <div v-show="leftSidebarTab === 'remarks'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-remarks-panel">
+          <p class="viewer-remarks-hint">
+            Замечание запоминает ракурс камеры и разметку на экране (screenLayer). Якорь на детали остаётся при орбите.
+            JSON сохраняется рядом с моделью; картинки — в том же файле (dataUrl) или в папке *_assets при экспорте.
+          </p>
+          <p v-if="!primaryModelFileName" class="viewer-remarks-empty">Загрузите модель в сцену.</p>
+          <template v-else>
+            <p class="viewer-remarks-model" :title="primaryModelFileName">{{ primaryModelFileName }}</p>
+            <div class="viewer-remarks-actions">
+              <button type="button" class="viewer-remarks-btn viewer-remarks-btn--primary" @click="addRemarkFromCurrentView">
+                + Замечание
+              </button>
+              <button type="button" class="viewer-remarks-btn" @click="importModel3dRemarksFile">Открыть JSON</button>
+            </div>
+            <div class="viewer-remarks-filter-row">
+              <label class="viewer-remarks-filter-label">Статус</label>
+              <select v-model="remarkStatusFilter" class="viewer-remarks-filter-select">
+                <option value="all">Все</option>
+                <option v-for="opt in REMARK_STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
+            <button
+              v-if="selectedRemarkId"
+              type="button"
+              class="viewer-remarks-btn viewer-remarks-btn--block"
+              @click="restoreSelectedRemarkView"
+            >
+              Вернуть вид замечания
+            </button>
+            <p
+              v-if="selectedRemark && !remarkScreenLayerVisible"
+              class="viewer-remarks-view-hint"
+            >
+              Разметка привязана к ракурсу (отклонение {{ remarkViewAngleDeg.toFixed(0) }}°). «Вернуть вид» — показать screenLayer.
+            </p>
+            <p v-if="selectedRemark && remarkScreenLayerVisible" class="viewer-remarks-nav-hint">
+              ◇ — вращение модели; рисование — другой инструмент. Del — удалить выбранное. Картинка: колёсико — зум.
+            </p>
+            <div v-if="selectedRemark" class="viewer-remarks-markup-bar">
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'select' }"
+                :disabled="!remarkScreenLayerEditable"
+                title="Выделение и вращение модели"
+                @click="remarkScreenTool = 'select'"
+              >
+                ◇
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkAnchorPickMode }"
+                @click="toggleRemarkAnchorPick"
+              >
+                {{ remarkAnchorPickMode ? 'Якорь: клик…' : 'Якорь' }}
+              </button>
+              <button
+                v-if="selectedRemark.anchor3d"
+                type="button"
+                class="viewer-remarks-markup-btn"
+                @click="clearSelectedRemarkAnchor"
+              >
+                Снять якорь
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'arrow' }"
+                :disabled="!remarkScreenLayerEditable"
+                @click="remarkScreenTool = 'arrow'"
+              >
+                →
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'line' }"
+                :disabled="!remarkScreenLayerEditable"
+                @click="remarkScreenTool = 'line'"
+              >
+                —
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'polyline' }"
+                :disabled="!remarkScreenLayerEditable"
+                title="Клики — точки; Enter — завершить"
+                @click="remarkScreenTool = 'polyline'"
+              >
+                ⌇
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'rect' }"
+                :disabled="!remarkScreenLayerEditable"
+                @click="remarkScreenTool = 'rect'"
+              >
+                □
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'ellipse' }"
+                :disabled="!remarkScreenLayerEditable"
+                @click="remarkScreenTool = 'ellipse'"
+              >
+                ○
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :class="{ active: remarkScreenTool === 'text' }"
+                :disabled="!remarkScreenLayerEditable"
+                @click="remarkScreenTool = 'text'"
+              >
+                T
+              </button>
+              <button
+                type="button"
+                class="viewer-remarks-markup-btn"
+                :disabled="!remarkScreenLayerEditable"
+                @click="insertRemarkScreenImage"
+              >
+                Картинка
+              </button>
+              <input v-model="remarkScreenColor" type="color" class="viewer-remarks-color" title="Цвет" />
+              <button
+                v-if="remarkScreenSelectedShapeId || remarkScreenSelectedImageId"
+                type="button"
+                class="viewer-remarks-markup-btn viewer-remarks-markup-btn--danger"
+                @click="deleteSelectedScreenMarkup"
+              >
+                Удалить (Del)
+              </button>
+            </div>
+            <ul v-if="remarkList.length" class="viewer-remarks-list">
+              <li
+                v-for="c in filteredRemarkList"
+                :key="c.id"
+                class="viewer-remarks-item"
+                :class="{ active: selectedRemarkId === c.id }"
+              >
+                <button type="button" class="viewer-remarks-item-btn" @click="selectRemark(c.id)">
+                  <span class="viewer-remarks-item-head">
+                    <span class="remark-status-pill" :class="remarkStatusCssClass(normalizeRemarkStatus(c.status))">
+                      {{ remarkStatusLabel(normalizeRemarkStatus(c.status)) }}
+                    </span>
+                    <span class="viewer-remarks-item-title">{{ c.title }}</span>
+                  </span>
+                  <span class="viewer-remarks-item-meta">{{ new Date(c.createdAt).toLocaleString() }}</span>
+                </button>
+              </li>
+            </ul>
+            <p v-if="remarkList.length && filteredRemarkList.length === 0" class="viewer-remarks-empty">
+              Нет замечаний с выбранным статусом.
+            </p>
+            <p v-else-if="!remarkList.length" class="viewer-remarks-empty">Нет замечаний — «+ Замечание» с нужного ракурса.</p>
+            <div v-if="selectedRemark" class="viewer-remark-detail">
+              <label class="viewer-remark-detail-label">Статус</label>
+              <select
+                class="viewer-remarks-filter-select"
+                :value="normalizeRemarkStatus(selectedRemark.status)"
+                @change="updateSelectedRemarkStatus(($event.target as HTMLSelectElement).value as RemarkStatus)"
+              >
+                <option v-for="opt in REMARK_STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+              <label class="viewer-remark-detail-label">Описание</label>
+              <textarea
+                class="viewer-remark-detail-note"
+                :value="selectedRemark.description"
+                rows="3"
+                placeholder="Текст замечания для согласования…"
+                @input="updateSelectedRemarkDescription(($event.target as HTMLTextAreaElement).value)"
+              />
+            </div>
+            <button
+              v-if="selectedRemarkId"
+              type="button"
+              class="viewer-remarks-btn viewer-remarks-btn--danger"
+              @click="deleteSelectedRemark"
+            >
+              Удалить выбранное
+            </button>
+          </template>
         </div>
       </div>
       <div class="viewer-main">
         <div ref="containerRef" class="viewer-container" />
+        <Model3dScreenLayerOverlay
+          v-if="selectedRemark && leftSidebarTab === 'remarks'"
+          ref="screenLayerOverlayRef"
+          :shapes="selectedRemarkScreenShapes"
+          :images="selectedRemarkScreenImages"
+          :tool="remarkScreenTool"
+          :color="remarkScreenColor"
+          :visible="remarkScreenLayerVisible"
+          :editable="remarkScreenLayerEditable"
+          :selected-shape-id="remarkScreenSelectedShapeId"
+          :selected-image-id="remarkScreenSelectedImageId"
+          @update:shapes="onRemarkScreenShapesUpdate"
+          @update:images="onRemarkScreenImagesUpdate"
+          @update:selected-shape-id="remarkScreenSelectedShapeId = $event"
+          @update:selected-image-id="remarkScreenSelectedImageId = $event"
+          @update:tool="remarkScreenTool = $event"
+          @change="markRemarksChanged"
+        />
         <div
           v-if="partContextMenuOpen"
           class="viewer-part-context-menu"
@@ -8449,44 +9119,185 @@ defineExpose({
 .viewer-measurements-sidebar .viewer-measurements-controls {
   padding: 0 0.1rem;
 }
-.viewer-remarks-stub {
-  font-size: 0.72rem;
-  color: #9eb0c8;
+.viewer-remarks-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
 }
 .viewer-remarks-hint {
-  margin: 0 0 0.5rem;
+  margin: 0;
+  font-size: 0.72rem;
+  color: #9eb0c8;
   line-height: 1.35;
 }
-.viewer-remarks-label {
-  display: block;
-  margin-bottom: 0.25rem;
+.viewer-remarks-view-hint {
+  margin: 0;
   font-size: 0.68rem;
+  color: #d4a574;
+  line-height: 1.3;
 }
-.viewer-remarks-input {
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 0.45rem;
-  padding: 0.3rem 0.4rem;
+.viewer-remarks-nav-hint {
+  margin: 0;
+  font-size: 0.65rem;
+  color: #8ea2c2;
+  line-height: 1.3;
+}
+.viewer-remarks-markup-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  align-items: center;
+}
+.viewer-remarks-markup-btn {
+  padding: 0.22rem 0.4rem;
+  font-size: 0.68rem;
+  border: 1px solid #3a4a6a;
+  border-radius: 3px;
+  background: #2a3548;
+  color: #c7d6ee;
+  cursor: pointer;
+}
+.viewer-remarks-markup-btn.active {
+  background: #395f96;
+  border-color: #6d8fd0;
+}
+.viewer-remarks-markup-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.viewer-remarks-markup-btn--danger {
+  border-color: #6a4040;
+  color: #f0c8c8;
+}
+.viewer-remarks-color {
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.viewer-remarks-model {
+  margin: 0;
+  font-size: 0.7rem;
+  color: #b8c8e8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viewer-remarks-empty {
+  margin: 0;
   font-size: 0.72rem;
+  color: #7a8ea8;
+}
+.viewer-remarks-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.viewer-remarks-filter-label,
+.viewer-remark-detail-label {
+  font-size: 0.68rem;
+  color: #8ea2c2;
+}
+.viewer-remarks-filter-select {
+  flex: 1;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.3rem;
   border: 1px solid #3a4a6a;
   border-radius: 4px;
-  background: #141920;
-  color: #8a9bb5;
+  background: #252d38;
+  color: #c7d6ee;
+}
+.viewer-remark-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid #3a4a6a;
+}
+.viewer-remark-detail-note {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 0.72rem;
+  padding: 0.3rem;
+  border: 1px solid #3a4a6a;
+  border-radius: 4px;
+  background: #1e2838;
+  color: #dce8f8;
+  resize: vertical;
+  min-height: 3.5rem;
+}
+.viewer-remarks-item-head {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
 }
 .viewer-remarks-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.35rem;
 }
 .viewer-remarks-btn {
-  flex: 1;
-  padding: 0.35rem;
+  padding: 0.35rem 0.5rem;
   font-size: 0.72rem;
   border: 1px solid #3a4a6a;
   border-radius: 4px;
   background: #2d3a52;
   color: #b8c8e0;
-  cursor: not-allowed;
-  opacity: 0.65;
+  cursor: pointer;
+}
+.viewer-remarks-btn--primary {
+  border-color: #4a6a4a;
+  background: #2a3d2a;
+  color: #c8e8c8;
+}
+.viewer-remarks-btn--block {
+  width: 100%;
+}
+.viewer-remarks-btn--danger {
+  border-color: #6a4040;
+  color: #f0c8c8;
+}
+.viewer-remarks-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.viewer-remarks-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.viewer-remarks-item {
+  border-radius: 4px;
+  border: 1px solid transparent;
+}
+.viewer-remarks-item.active {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.12);
+}
+.viewer-remarks-item-btn {
+  width: 100%;
+  text-align: left;
+  padding: 0.35rem 0.4rem;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.viewer-remarks-item-title {
+  font-size: 0.78rem;
+  color: #e0e8f4;
+}
+.viewer-remarks-item-meta {
+  font-size: 0.65rem;
+  color: #8ea4c7;
 }
 .viewer-models-header {
   flex-shrink: 0;

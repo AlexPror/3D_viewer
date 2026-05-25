@@ -1361,6 +1361,20 @@ async def project_ws(project_id: str, ws: WebSocket) -> None:
                         {"type": "yjs.awareness", "update": raw},
                         exclude=ws,
                     )
+            elif action == "telemost.join":
+                join_url = str(data.get("joinUrl", "")).strip()
+                title = str(data.get("title", "")).strip() or "Звонок проекта"
+                if join_url:
+                    await _hub.broadcast_except(
+                        project_id,
+                        {
+                            "type": "telemost.join",
+                            "joinUrl": join_url,
+                            "title": title,
+                            "userId": user_id,
+                        },
+                        exclude=ws,
+                    )
             elif action == "chat.read":
                 channel_id = str(data.get("channelId", "")).strip()
                 if channel_id:

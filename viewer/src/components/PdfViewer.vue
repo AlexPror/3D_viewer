@@ -28,8 +28,18 @@ import {
   pageShapes,
   pagesWithMarkup,
   shapeLabel,
+  shapeRemarkStatus,
+  ensureMarkupRemarkMeta,
+  defaultRemarkMeta,
   type PdfMarkupDrawStyle,
 } from '../lib/pdfMarkup'
+import {
+  type RemarkStatus,
+  type RemarkStatusFilter,
+  REMARK_STATUS_OPTIONS,
+  remarkStatusLabel,
+  remarkStatusCssClass,
+} from '../lib/remarkStatus'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
@@ -56,6 +66,7 @@ const markupDirty = ref(false)
 const markupTool = ref<PdfMarkupTool>('arrow')
 const markupColor = ref('#cc0000')
 const selectedShapeId = ref<string | null>(null)
+const remarkStatusFilter = ref<RemarkStatusFilter>('all')
 const markupExporting = ref(false)
 const markupVisible = ref(localStorage.getItem('deskreview.showMarkup') !== '0')
 const markupStrokeRel = ref(DEFAULT_MARKUP_STYLE.strokeRel)
@@ -69,6 +80,9 @@ const markupStyle = computed<PdfMarkupDrawStyle>(() => ({
 let markupDirtyBaseline = '{}'
 let markupAutosaveTimer: ReturnType<typeof setInterval> | null = null
 let markupSaveDebounce: ReturnType<typeof setTimeout> | null = null
+const markupUndoStack = ref<string[]>([])
+const MARKUP_UNDO_MAX = 50
+let markupUndoApplying = false
 
 const isDrawingMarkup = ref(false)
 const markupDrawStart = ref<{ x: number; y: number } | null>(null)
@@ -88,6 +102,17 @@ const currentPageShapes = computed(() => {
 const vectorPageShapes = computed(() =>
   currentPageShapes.value.filter((s) => s.type !== 'text'),
 )
+
+const filteredPageShapes = computed(() => {
+  const shapes = currentPageShapes.value
+  if (remarkStatusFilter.value === 'all') return shapes
+  return shapes.filter((s) => shapeRemarkStatus(s) === remarkStatusFilter.value)
+})
+
+const selectedMarkupShape = computed(() => {
+  if (!selectedShapeId.value) return null
+  return currentPageShapes.value.find((s) => s.id === selectedShapeId.value) ?? null
+})
 
 const textPageShapes = computed(() =>
   currentPageShapes.value.filter((s): s is Extract<PdfMarkupShape, { type: 'text' }> => s.type === 'text'),
@@ -190,6 +215,34 @@ function markMarkupChanged() {
   scheduleMarkupAutosave()
 }
 
+function resetMarkupUndo() {
+  markupUndoStack.value = []
+}
+
+function pushMarkupUndo() {
+  if (markupUndoApplying || !markupDoc.value) return
+  markupUndoStack.value.push(JSON.stringify(markupDoc.value.pages))
+  if (markupUndoStack.value.length > MARKUP_UNDO_MAX) {
+    markupUndoStack.value = markupUndoStack.value.slice(-MARKUP_UNDO_MAX)
+  }
+}
+
+function undoMarkup(): boolean {
+  if (!markupDoc.value || markupUndoStack.value.length === 0) return false
+  markupUndoApplying = true
+  const prev = markupUndoStack.value.pop()!
+  markupDoc.value.pages = JSON.parse(prev) as PdfMarkupDocument['pages']
+  clearMarkupSelection()
+  polylineDraft.value = []
+  polylineHover.value = null
+  isDrawingMarkup.value = false
+  markupDraftShape.value = null
+  cancelTextOverlay()
+  markupUndoApplying = false
+  markMarkupChanged()
+  return true
+}
+
 function scheduleMarkupAutosave() {
   if (markupSaveDebounce) clearTimeout(markupSaveDebounce)
   markupSaveDebounce = setTimeout(() => {
@@ -222,6 +275,7 @@ function mergeMarkupSidecar(sidecar: PdfMarkupSidecarFile, source: string) {
   if (!markupDoc.value) return
   const key = markupDocumentKey(props.pdfUrl, props.pdfName)
   markupDoc.value = pickNewerMarkup(markupDoc.value, sidecar.markup, key)
+  ensureMarkupRemarkMeta(markupDoc.value)
   applyMarkupStyleFromSidecar(sidecar.style)
   markMarkupChanged()
   logger.info('PdfViewer', `Слой замечаний применён (${source})`)
@@ -242,13 +296,17 @@ async function initMarkupForCurrentDocument() {
     markupDoc.value = null
     markupDirty.value = false
     markupDirtyBaseline = '{}'
+    resetMarkupUndo()
     emit('markup-dirty', false)
     return
   }
   const key = markupDocumentKey(props.pdfUrl, props.pdfName)
   const loaded = await loadMarkupDocument(key)
   markupDoc.value = loaded ?? createEmptyMarkupDocument(key)
+  ensureMarkupRemarkMeta(markupDoc.value)
+  resetMarkupUndo()
   await tryAutoLoadMarkupSidecar()
+  if (markupDoc.value) ensureMarkupRemarkMeta(markupDoc.value)
   markupDirtyBaseline = JSON.stringify(markupDoc.value.pages)
   markupDirty.value = false
   emit('markup-dirty', false)
@@ -352,6 +410,7 @@ function finishPolylineDraft() {
   }
   const points = polylineDraft.value.map((p) => ({ ...p }))
   const shape: PdfMarkupShape = {
+    ...defaultRemarkMeta(),
     id: newShapeId(),
     type: 'polyline',
     points,
@@ -363,6 +422,7 @@ function finishPolylineDraft() {
     strokeRel: markupStrokeRel.value,
   }
   syncPolylineBbox(shape)
+  pushMarkupUndo()
   pageShapes(markupDoc.value, screenshotPage.value).push(shape)
   selectedShapeId.value = shape.id
   markMarkupChanged()
@@ -376,6 +436,7 @@ function beginMarkupEdit(
   handleIndex: number | null,
   ev: MouseEvent,
 ) {
+  pushMarkupUndo()
   markupEdit.value = {
     pointerX: ev.clientX,
     pointerY: ev.clientY,
@@ -411,7 +472,9 @@ function commitTextOverlay() {
   const { x, y } = pendingNewText.value
   const x2 = pendingTextEnd.value?.x2 ?? Math.min(1, x + DEFAULT_TEXT_W)
   const y2 = pendingTextEnd.value?.y2 ?? Math.min(1, y + DEFAULT_TEXT_H)
+  pushMarkupUndo()
   const shape: PdfMarkupShape = {
+    ...defaultRemarkMeta(),
     id: newShapeId(),
     type: 'text',
     x1: Math.min(x, x2),
@@ -438,6 +501,7 @@ function onTextResizeDown(ev: MouseEvent, shape: Extract<PdfMarkupShape, { type:
   ev.preventDefault()
   ev.stopPropagation()
   selectedShapeId.value = shape.id
+  pushMarkupUndo()
   isResizingText.value = true
   textResizeStart.value = {
     pointerX: ev.clientX,
@@ -466,6 +530,7 @@ function onTextBoxMouseDown(ev: MouseEvent, shape: Extract<PdfMarkupShape, { typ
   selectedShapeId.value = shape.id
   editingText.value = shape.text
   if (markupTool.value === 'select') {
+    pushMarkupUndo()
     isDraggingText.value = true
     textDragStart.value = {
       pointerX: ev.clientX,
@@ -482,6 +547,7 @@ function onTextBoxMouseDown(ev: MouseEvent, shape: Extract<PdfMarkupShape, { typ
 
 function onTextBoxDblClick(ev: MouseEvent, shape: Extract<PdfMarkupShape, { type: 'text' }>) {
   ev.stopPropagation()
+  pushMarkupUndo()
   selectedShapeId.value = shape.id
   editingText.value = shape.text
 }
@@ -578,6 +644,7 @@ function onMarkupMouseDown(ev: MouseEvent) {
       finishPolylineDraft()
       return
     }
+    if (polylineDraft.value.length === 0) pushMarkupUndo()
     polylineDraft.value.push({ x: pos.x, y: pos.y })
     selectedShapeId.value = null
     return
@@ -597,10 +664,12 @@ function onMarkupMouseDown(ev: MouseEvent) {
 
   if (!isDragDrawTool(markupTool.value)) return
 
+  pushMarkupUndo()
   selectedShapeId.value = null
   isDrawingMarkup.value = true
   markupDrawStart.value = pos
   markupDraftShape.value = {
+    ...defaultRemarkMeta(),
     id: newShapeId(),
     type: markupTool.value as 'arrow' | 'line' | 'rect' | 'ellipse',
     x1: pos.x,
@@ -644,6 +713,7 @@ function onMarkupMouseUp(ev: MouseEvent) {
     return
   }
   pageShapes(markupDoc.value, screenshotPage.value).push({ ...draft, x2: pos?.x ?? draft.x2, y2: pos?.y ?? draft.y2 })
+  /* undo снимок уже сделан в mousedown */
   selectedShapeId.value = draft.id
   markMarkupChanged()
   markupTool.value = 'select'
@@ -651,6 +721,7 @@ function onMarkupMouseUp(ev: MouseEvent) {
 
 function deleteSelectedMarkupShape() {
   if (!markupDoc.value || !selectedShapeId.value) return
+  pushMarkupUndo()
   const shapes = pageShapes(markupDoc.value, screenshotPage.value)
   const idx = shapes.findIndex((s) => s.id === selectedShapeId.value)
   if (idx >= 0) {
@@ -878,10 +949,37 @@ function confirmDiscardMarkup(): boolean {
   return window.confirm('Есть несохранённые пометки на PDF. Продолжить без экспорта? Черновик останется в IndexedDB.')
 }
 
+async function confirmDiscardMarkupAsync(): Promise<boolean> {
+  if (!markupDirty.value) return true
+  const saveFirst = window.confirm(
+    'Есть несохранённые пометки на PDF.\n\nOK — сохранить замечания проекта (PDF + JSON)\nОтмена — другое действие',
+  )
+  if (saveFirst) {
+    const r = await exportPdfWithRemarks('layered')
+    return !!r.ok
+  }
+  const discard = window.confirm('Продолжить без сохранения на диск? Черновик останется в браузере.')
+  return discard
+}
+
 function selectRemarkShape(shapeId: string) {
   selectedShapeId.value = shapeId
   const sh = currentPageShapes.value.find((s) => s.id === shapeId)
   if (sh?.type === 'text') editingText.value = sh.text
+}
+
+function updateSelectedRemarkStatus(status: RemarkStatus) {
+  const sh = selectedMarkupShape.value
+  if (!sh) return
+  sh.remarkStatus = status
+  markMarkupChanged()
+}
+
+function updateSelectedRemarkNote(note: string) {
+  const sh = selectedMarkupShape.value
+  if (!sh) return
+  sh.remarkNote = note
+  markMarkupChanged()
 }
 
 const SELECTION_STROKE = '#3b82f6'
@@ -1608,9 +1706,11 @@ defineExpose({
     return markupDirty.value
   },
   confirmDiscardMarkup,
+  confirmDiscardMarkupAsync,
   persistMarkupDraft,
   exportPdfWithRemarks,
   cancelMarkupAction,
+  undoMarkup,
 })
 </script>
 
@@ -1732,18 +1832,51 @@ defineExpose({
                 </span>
               </button>
             </div>
+            <div class="pdf-remarks-filter-row">
+              <label class="pdf-remarks-filter-label">Статус</label>
+              <select v-model="remarkStatusFilter" class="pdf-remarks-filter-select">
+                <option value="all">Все</option>
+                <option v-for="opt in REMARK_STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+            </div>
             <div class="pdf-remarks-tree-title">Пометки на стр. {{ screenshotPage }}</div>
             <div v-if="currentPageShapes.length === 0" class="pdf-remarks-empty">Нет пометок на этой странице.</div>
+            <div v-else-if="filteredPageShapes.length === 0" class="pdf-remarks-empty">Нет пометок с выбранным статусом.</div>
             <button
-              v-for="(shape, idx) in currentPageShapes"
+              v-for="(shape, idx) in filteredPageShapes"
               :key="shape.id"
               type="button"
               class="pdf-remarks-shape-row"
               :class="{ active: selectedShapeId === shape.id }"
               @click="selectRemarkShape(shape.id)"
             >
-              {{ shapeLabel(shape, idx) }}
+              <span class="pdf-remark-status-pill" :class="remarkStatusCssClass(shapeRemarkStatus(shape))">
+                {{ remarkStatusLabel(shapeRemarkStatus(shape)) }}
+              </span>
+              <span class="pdf-remarks-shape-label">{{ shapeLabel(shape, idx) }}</span>
             </button>
+            <div v-if="selectedMarkupShape" class="pdf-remark-detail">
+              <label class="pdf-remark-detail-label">Статус</label>
+              <select
+                class="pdf-remarks-filter-select"
+                :value="shapeRemarkStatus(selectedMarkupShape)"
+                @change="updateSelectedRemarkStatus(($event.target as HTMLSelectElement).value as RemarkStatus)"
+              >
+                <option v-for="opt in REMARK_STATUS_OPTIONS" :key="opt.value" :value="opt.value">
+                  {{ opt.label }}
+                </option>
+              </select>
+              <label class="pdf-remark-detail-label">Описание</label>
+              <textarea
+                class="pdf-remark-detail-note"
+                :value="selectedMarkupShape.remarkNote ?? ''"
+                rows="3"
+                placeholder="Текст замечания для согласования…"
+                @input="updateSelectedRemarkNote(($event.target as HTMLTextAreaElement).value)"
+              />
+            </div>
             <button
               v-if="selectedShapeId"
               type="button"
@@ -2405,8 +2538,50 @@ defineExpose({
 .pdf-remarks-page-count {
   color: #9eb0c8;
 }
+.pdf-remarks-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.2rem;
+}
+.pdf-remarks-filter-label,
+.pdf-remark-detail-label {
+  font-size: 0.68rem;
+  color: #8ea2c2;
+}
+.pdf-remarks-filter-select {
+  flex: 1;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid #3f4f66;
+  border-radius: 4px;
+  background: #2a323c;
+  color: #c7d6ee;
+}
+.pdf-remark-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-top: 0.35rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid #3f4f66;
+}
+.pdf-remark-detail-note {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 0.72rem;
+  padding: 0.3rem;
+  border: 1px solid #3f4f66;
+  border-radius: 4px;
+  background: #252d38;
+  color: #dce8f8;
+  resize: vertical;
+  min-height: 3.5rem;
+}
 .pdf-remarks-shape-row {
-  display: block;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.3rem;
   width: 100%;
   text-align: left;
   padding: 0.28rem 0.35rem;
@@ -2416,6 +2591,35 @@ defineExpose({
   background: transparent;
   color: #c7d6ee;
   cursor: pointer;
+}
+.pdf-remarks-shape-label {
+  flex: 1;
+  min-width: 0;
+}
+.remark-status-pill,
+.pdf-remark-status-pill {
+  flex-shrink: 0;
+  font-size: 0.58rem;
+  padding: 0.1rem 0.28rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.remark-status--open {
+  background: rgba(59, 130, 246, 0.25);
+  color: #93c5fd;
+}
+.remark-status--answered {
+  background: rgba(234, 179, 8, 0.22);
+  color: #fde68a;
+}
+.remark-status--accepted {
+  background: rgba(34, 197, 94, 0.22);
+  color: #86efac;
+}
+.remark-status--rejected {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fca5a5;
 }
 .pdf-remarks-shape-row:hover,
 .pdf-remarks-shape-row.active {

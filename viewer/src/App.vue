@@ -702,6 +702,7 @@ async function collabLoadTelemost() {
 const telemostCallBanner = ref<{ title: string; joinUrl: string } | null>(null)
 const saveActionToast = ref('')
 const pdfMarkupDirty = ref(false)
+const model3dRemarksDirty = ref(false)
 
 function dismissTelemostBanner() {
   telemostCallBanner.value = null
@@ -728,7 +729,33 @@ async function telemostJoinFromMenu() {
   rightWorkAreaTab.value = 'telemost'
   await collabLoadTelemost()
   if (telemostJoinUrl.value) {
-    window.open(telemostJoinUrl.value, '_blank', 'noopener,noreferrer')
+    const joinUrl = telemostJoinUrl.value
+    const proj = collabProjects.value.find((p: { id: string }) => p.id === collabProjectId.value) as
+      | { name?: string; title?: string }
+      | undefined
+    const title = proj?.name?.trim() || proj?.title?.trim() || 'Звонок проекта'
+    window.open(joinUrl, '_blank', 'noopener,noreferrer')
+    if (collabWs?.readyState === WebSocket.OPEN) {
+      collabWs.send(
+        JSON.stringify({
+          type: 'telemost.join',
+          joinUrl,
+          title,
+        }),
+      )
+    }
+    try {
+      const ch = collabChannelId.value
+      const pid = collabProjectId.value
+      if (ch && pid) {
+        await collabAuthFetch(`/api/projects/${pid}/channels/${ch}/messages`, {
+          method: 'POST',
+          body: JSON.stringify({ body: `Звонок Телемост: ${joinUrl}` }),
+        })
+      }
+    } catch {
+      /* запасной путь — только WS */
+    }
   } else if (telemostHint.value) {
     window.alert(telemostHint.value)
   }
@@ -775,7 +802,14 @@ async function onWorkspaceSave() {
     else showSaveToast('Откройте PDF и добавьте пометки')
     return
   }
-  showSaveToast('3D: сохранение замечаний — этап 3d (Ctrl+S)')
+  if (viewerRef.value) {
+    const r = await viewerRef.value.saveModel3dRemarksToFile?.()
+    if (r?.ok && r.fileName) showSaveToast(`Замечания 3D: ${r.fileName}`)
+    else if (r?.ok === false) showSaveToast('Откройте 3D-модель в сцене')
+    else showSaveToast('Нет замечаний 3D для сохранения')
+    return
+  }
+  showSaveToast('3D: нет активной модели')
 }
 
 async function onWorkspaceSaveAs() {
@@ -786,19 +820,47 @@ function onPdfMarkupDirty(dirty: boolean) {
   pdfMarkupDirty.value = dirty
 }
 
+function onModel3dRemarksDirty(dirty: boolean) {
+  model3dRemarksDirty.value = dirty
+}
+
+async function confirmWorkspaceDiscard(): Promise<boolean> {
+  if (pdfFile.value && pdfMarkupDirty.value) {
+    const ok = (await pdfViewerRef.value?.confirmDiscardMarkupAsync?.()) ?? true
+    if (!ok) return false
+  }
+  if (model3dRemarksDirty.value) {
+    const ok = (await viewerRef.value?.confirmDiscardModel3dRemarksAsync?.()) ?? true
+    if (!ok) return false
+  }
+  return true
+}
+
 function confirmPdfMarkupDiscard(): boolean {
   return pdfViewerRef.value?.confirmDiscardMarkup?.() ?? true
 }
 
 function onBeforeUnload(ev: BeforeUnloadEvent) {
-  if (pdfMarkupDirty.value) {
+  if (pdfMarkupDirty.value || model3dRemarksDirty.value) {
     ev.preventDefault()
     ev.returnValue = ''
   }
 }
 
 function onWorkspaceUndo() {
-  showSaveToast('Отмена (Ctrl+Z) — в разработке для активной панели')
+  if (activeFocusContext.value === 'pdf' && pdfFile.value) {
+    if (pdfViewerRef.value?.undoMarkup?.()) {
+      showSaveToast('Отменено (PDF)')
+      return
+    }
+    showSaveToast('Нечего отменять в PDF')
+    return
+  }
+  if (viewerRef.value?.undoLastAction?.()) {
+    showSaveToast('Отменено (3D)')
+    return
+  }
+  showSaveToast('Нечего отменять')
 }
 
 function onShowLogs() {
@@ -1058,7 +1120,7 @@ const MODEL_EXTENSIONS = ['stl', 'step', 'stp', 'igs', 'iges', 'glb', 'gltf']
 let pdfInput: HTMLInputElement | null = null
 
 async function openLocalPdfFile(file: File, siblings?: Iterable<File>) {
-  if (!confirmPdfMarkupDiscard()) return
+  if (!(await confirmWorkspaceDiscard())) return
   logger.info('App', `PDF открыт: ${file.name}`)
   if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
   let markupSidecarBytes: ArrayBuffer | null = null
@@ -1098,6 +1160,7 @@ async function onDrop(e: DragEvent) {
   if (!first) return
   const ext = (first.name.split('.').pop() || '').toLowerCase()
   if (MODEL_EXTENSIONS.includes(ext)) {
+    if (!(await confirmWorkspaceDiscard())) return
     if (viewMode.value === '2d' || viewMode.value === 'log') viewMode.value = 'split'
     const modelFiles = Array.from(e.dataTransfer.files || [])
       .filter((f) => MODEL_EXTENSIONS.includes((f.name.split('.').pop() || '').toLowerCase()))
@@ -1854,6 +1917,7 @@ async function collabDeleteAssetPair(pairId: string) {
 async function collabOpenAssetPair(p: Record<string, unknown>) {
   const pid = collabProjectId.value
   if (!pid) return
+  if (!(await confirmWorkspaceDiscard())) return
   const pdfAid = String(p.pdfAttachmentId ?? p.pdf_attachment_id ?? '').trim()
   const modelAid = String(p.modelAttachmentId ?? p.model_attachment_id ?? '').trim()
   collabBusy.value = true
@@ -2208,6 +2272,11 @@ function collabConnectWs() {
       }
       if (msg.type === 'yjs.awareness' && collabNotesAwareness.value && typeof msg.update === 'string') {
         applyAwarenessUpdate(collabNotesAwareness.value, base64ToUint8(msg.update), 'remote')
+        return
+      }
+      if (msg.type === 'telemost.join' && typeof msg.joinUrl === 'string' && msg.joinUrl) {
+        const title = typeof msg.title === 'string' && msg.title.trim() ? msg.title.trim() : 'Звонок проекта'
+        telemostCallBanner.value = { title, joinUrl: msg.joinUrl }
         return
       }
       if (msg.type === 'chat.message.created' && msg.channelId === collabChannelId.value) {
@@ -2835,7 +2904,15 @@ onUnmounted(() => {
         </div>
         <p class="ide-sidebar-hint">В режиме PDF и 3D деревья независимые: выбор чертежа не переключает модель автоматически.</p>
         </template>
-        <div v-else class="ide-sidebar-collapsed-label" title="Яндекс.Диск">Диск</div>
+        <button
+          v-else
+          type="button"
+          class="ide-sidebar-collapsed-label"
+          title="Развернуть Яндекс.Диск"
+          @click="toggleDiskPanel"
+        >
+          Диск
+        </button>
       </aside>
       <div
         class="workspace-splitter"
@@ -2912,6 +2989,7 @@ onUnmounted(() => {
           @export-glb="onExportGlb"
           @export-stl="onExportStl"
           @screenshot-3d="onScreenshot3D"
+          @remarks-dirty="onModel3dRemarksDirty"
         />
         </div>
         <div v-show="showLogPanel()" class="panel log-panel-wrap">
@@ -2972,7 +3050,15 @@ onUnmounted(() => {
           </div>
           <button v-if="collabToken && !chatPanelCollapsed" type="button" class="collab-btn collab-btn--compact" @click="collabLogout">Выйти</button>
         </div>
-        <div v-if="chatPanelCollapsed" class="ide-sidebar-collapsed-label ide-sidebar-collapsed-label--chat" title="Чат">Чат</div>
+        <button
+          v-if="chatPanelCollapsed"
+          type="button"
+          class="ide-sidebar-collapsed-label ide-sidebar-collapsed-label--chat"
+          title="Развернуть чат"
+          @click="toggleChatPanel"
+        >
+          Чат
+        </button>
         <template v-else>
         <div v-show="rightWorkAreaTab === 'telemost'" class="collab-telemost">
           <p class="collab-hint collab-hint--tight">
@@ -3601,6 +3687,14 @@ onUnmounted(() => {
   color: #8ea4c7;
   padding: 0.5rem 0;
   user-select: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  width: 100%;
+}
+.ide-sidebar-collapsed-label:hover {
+  color: #c5d8f5;
+  background: rgba(255, 255, 255, 0.04);
 }
 .ide-sidebar-collapsed-label--chat {
   transform: rotate(180deg);
