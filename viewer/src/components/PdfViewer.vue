@@ -69,6 +69,7 @@ const selectedShapeId = ref<string | null>(null)
 const remarkStatusFilter = ref<RemarkStatusFilter>('all')
 const markupExporting = ref(false)
 const markupVisible = ref(localStorage.getItem('deskreview.showMarkup') !== '0')
+const markupHairline = ref(localStorage.getItem('deskreview.pdfHairline') === '1')
 const markupStrokeRel = ref(DEFAULT_MARKUP_STYLE.strokeRel)
 const markupArrowRel = ref(DEFAULT_MARKUP_STYLE.arrowRel)
 const markupFontRel = ref(DEFAULT_MARKUP_STYLE.fontRel)
@@ -995,41 +996,58 @@ function pxToNormY(px: number): number {
   return px / Math.max(pageCssHeight.value, 1)
 }
 
+/** Масштаб страницы (оверлей внутри слоя с transform: scale(zoom)). */
+function markupZoomScale(): number {
+  return Math.max(zoom.value, 0.15)
+}
+
+/** Делитель толщины: при «тонких линиях» дополнительно ~1/zoom на экране. */
+function markupStrokeZoomDivisor(): number {
+  const z = markupZoomScale()
+  return markupHairline.value ? z * z : z
+}
+
+function onMarkupHairlineChange() {
+  localStorage.setItem('deskreview.pdfHairline', markupHairline.value ? '1' : '0')
+}
+
 /** ~1.25px на экране — контур выделения */
 function svgSelectionStrokeWidth(): number {
-  return pxToNormX(1.25)
+  return pxToNormX(1.25) / markupStrokeZoomDivisor()
 }
 
 /** Штрихи фиксированной длины на экране */
 function svgSelectionDashArray(): string {
-  const dash = pxToNormX(6)
-  const gap = pxToNormX(4)
+  const z = markupStrokeZoomDivisor()
+  const dash = pxToNormX(6) / z
+  const gap = pxToNormX(4) / z
   return `${dash} ${gap}`
 }
 
 /** Круглые узлы на экране (ellipse в норм. координатах) */
 function svgHandleRadii(): { rx: number; ry: number } {
+  const z = markupStrokeZoomDivisor()
   const rPx = 4.5
-  return { rx: pxToNormX(rPx), ry: pxToNormY(rPx) }
+  return { rx: pxToNormX(rPx) / z, ry: pxToNormY(rPx) / z }
 }
 
 function svgHandleStrokeWidth(): number {
-  return pxToNormX(1.5)
+  return pxToNormX(1.5) / markupStrokeZoomDivisor()
 }
 
-/** Толщина в viewBox 0…1: делим на zoom, чтобы на экране размер не рос с приближением */
+/** Толщина в viewBox 0…1: компенсация scale(zoom) на слое страницы */
 function svgStrokeWidth(shape?: PdfMarkupShape): number {
   const rel =
     shape && shape.type !== 'text' && shape.strokeRel != null ? shape.strokeRel : markupStrokeRel.value
-  const z = Math.max(zoom.value, 0.15)
-  return Math.max(0.00012, rel / z)
+  const div = markupStrokeZoomDivisor()
+  return Math.max(0.00012 / div, rel / div)
 }
 
 function svgArrowHeadRel(shape?: PdfMarkupShape): number {
   const rel =
     shape && shape.type !== 'text' && shape.arrowRel != null ? shape.arrowRel : markupArrowRel.value
-  const z = Math.max(zoom.value, 0.15)
-  return Math.max(0.004, rel / z)
+  const div = markupStrokeZoomDivisor()
+  return Math.max(0.004 / div, rel / div)
 }
 
 /** Точки наконечника стрелки в нормализованных координатах (viewBox 0…1) */
@@ -1062,8 +1080,12 @@ interface TileCacheEntry {
   lastUsedAt: number
 }
 
-const SCREENSHOT_SCALE = 2
 const MAX_CANVAS_DIM = 8192
+/** Масштаб рендера страницы для скриншота/отчёта (выше = чётче, до 4×). */
+function pdfScreenshotScale(): number {
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+  return Math.min(4, Math.max(2.5, dpr * 2))
+}
 const MIN_ZOOM = 0.1
 const MAX_ZOOM = 64
 const TILE_CSS_SIZE_MAX = 1024
@@ -1584,7 +1606,7 @@ async function getCurrentPageImageUrlAsync(pageNum?: number): Promise<string> {
   }
   try {
     const p = await pdfDoc.getPage(page)
-    const viewport = p.getViewport({ scale: SCREENSHOT_SCALE })
+    const viewport = p.getViewport({ scale: pdfScreenshotScale() })
     let w = Math.ceil(viewport.width)
     let h = Math.ceil(viewport.height)
     if (w > MAX_CANVAS_DIM || h > MAX_CANVAS_DIM) {
@@ -1736,6 +1758,13 @@ defineExpose({
           <button type="button" class="pdf-zoom-btn" title="Увеличить" @click="setZoomPreset(zoom * 1.2)">+</button>
           <button type="button" class="pdf-zoom-btn" title="100%" @click="setZoomPreset(1)">100%</button>
           <button type="button" class="pdf-zoom-btn" title="6400%" @click="setZoomPreset(64)">6400%</button>
+          <label
+            class="pdf-hairline-toggle"
+            title="При увеличении масштаба линии разметки остаются тонкими (≈1/zoom²)"
+          >
+            <input v-model="markupHairline" type="checkbox" @change="onMarkupHairlineChange" />
+            Тонкие линии
+          </label>
           <span class="pdf-zoom-hint" title="Прокрутка — сдвиг чертежа; Ctrl+колёсико — масштаб; СКМ или ПКМ — перетаскивание">Ctrl+колёсико</span>
         </div>
         <button
@@ -2215,6 +2244,21 @@ defineExpose({
   text-align: center;
   color: #aab9d8;
   font-size: 0.82rem;
+}
+.pdf-hairline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-left: 0.25rem;
+  font-size: 0.72rem;
+  color: #aab9d8;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.pdf-hairline-toggle input {
+  margin: 0;
+  cursor: pointer;
 }
 .pdf-zoom-hint {
   margin-left: 0.35rem;

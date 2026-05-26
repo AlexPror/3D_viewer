@@ -279,3 +279,73 @@ async def private_list(
     items = [_normalize_embedded_item(x) for x in (items_raw or []) if isinstance(x, dict)]
     total = emb.get("total") if isinstance(emb, dict) else None
     return {"items": items, "total": total, "path": p, "limit": limit, "offset": offset}
+
+
+DOWNLOAD_MAX_BYTES = int(os.getenv("YADISK_DOWNLOAD_MAX_BYTES", str(120 * 1024 * 1024)))
+
+
+class PublicDownloadBody(BaseModel):
+    public_url: str = Field(..., min_length=8)
+    path: str = ""
+
+
+async def _stream_yandex_href(href: str) -> tuple[bytes, str | None]:
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        r = await client.get(href)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"yandex_download: {r.status_code}")
+    data = r.content
+    if len(data) > DOWNLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Файл больше {DOWNLOAD_MAX_BYTES // (1024 * 1024)} МБ",
+        )
+    ctype = r.headers.get("content-type")
+    return data, ctype
+
+
+@router.post("/public/download")
+async def public_download(body: PublicDownloadBody) -> Response:
+    """Скачать файл из публичной папки (прокси, обход CORS)."""
+    public_url = body.public_url.strip()
+    sub_path = body.path.strip()
+    params: dict[str, Any] = {"public_key": public_url}
+    if sub_path:
+        params["path"] = sub_path
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(f"{DISK_API}/public/resources/download", params=params)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"yandex_disk: {r.status_code} {r.text[:500]}")
+    href = str((r.json() or {}).get("href") or "")
+    if not href:
+        raise HTTPException(status_code=502, detail="Нет ссылки на скачивание")
+    data, ctype = await _stream_yandex_href(href)
+    return Response(content=data, media_type=ctype or "application/octet-stream")
+
+
+@router.get("/private/download")
+async def private_download(request: Request, path: str = "") -> Response:
+    """Скачать файл по OAuth (прокси)."""
+    sid = _get_sid(request)
+    if not sid:
+        raise HTTPException(status_code=401, detail="Нет сессии OAuth")
+    token = await _ensure_valid_access_token(sid)
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужна повторная авторизация Яндекс")
+    p = path.strip()
+    if not p:
+        raise HTTPException(status_code=400, detail="path обязателен")
+    headers = {"Authorization": f"OAuth {token}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(
+            f"{DISK_API}/resources/download",
+            params={"path": p},
+            headers=headers,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"yandex_disk: {r.status_code} {r.text[:500]}")
+    href = str((r.json() or {}).get("href") or "")
+    if not href:
+        raise HTTPException(status_code=502, detail="Нет ссылки на скачивание")
+    data, ctype = await _stream_yandex_href(href)
+    return Response(content=data, media_type=ctype or "application/octet-stream")

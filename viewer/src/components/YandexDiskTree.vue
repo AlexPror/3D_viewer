@@ -22,6 +22,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   toggleDir: [node: DiskNode]
+  openFile: [node: DiskNode]
 }>()
 
 function visibleNodes(list: DiskNode[]): DiskNode[] {
@@ -51,6 +52,7 @@ function visibleNodes(list: DiskNode[]): DiskNode[] {
             :tab="tab"
             :show-file="showFile"
             @toggle-dir="emit('toggleDir', $event)"
+            @open-file="emit('openFile', $event)"
           />
           <div v-else-if="node.loaded && !node.children?.length" class="ide-tree-empty-branch">пусто</div>
         </div>
@@ -58,16 +60,20 @@ function visibleNodes(list: DiskNode[]): DiskNode[] {
       <div v-else class="ide-tree-row ide-tree-row--file">
         <span class="ide-tree-chevron ide-tree-chevron--spacer" aria-hidden="true" />
         <span class="ide-tree-icon" aria-hidden="true">📄</span>
+        <button type="button" class="ide-tree-label ide-tree-file-btn" @click="emit('openFile', node)">
+          {{ node.name }}
+        </button>
         <a
           v-if="node.href"
-          class="ide-tree-label ide-tree-file-link"
+          class="ide-tree-file-ext"
           :href="node.href"
           target="_blank"
           rel="noopener noreferrer"
+          title="Открыть на Яндекс.Диске"
+          @click.stop
         >
-          {{ node.name }}
+          ↗
         </a>
-        <span v-else class="ide-tree-label">{{ node.name }}</span>
       </div>
     </template>
   </div>
@@ -89,12 +95,35 @@ function visibleNodes(list: DiskNode[]): DiskNode[] {
   font-size: 0.75rem;
   opacity: 0.55;
 }
-.ide-tree-file-link {
+.ide-tree-file-btn {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: none;
+  background: transparent;
   color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.ide-tree-file-link:hover {
+.ide-tree-file-btn:hover {
   opacity: 0.92;
+}
+.ide-tree-file-ext {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  opacity: 0.65;
+  text-decoration: none;
+  padding: 0 0.15rem;
+}
+.ide-tree-file-ext:hover {
+  opacity: 1;
+}
+.ide-tree-row--file {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
 }
 </style>

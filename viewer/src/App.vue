@@ -480,6 +480,153 @@ function isModelTreeFile(file: { name: string }): boolean {
   return ext === 'glb' || ext === 'gltf' || ext === 'stl' || ext === 'step' || ext === 'stp' || ext === 'iges' || ext === 'igs' || ext === 'm3d' || ext === 'a3d'
 }
 
+const MODEL_SOURCE_EXTS = new Set(['step', 'stp', 'igs', 'iges', 'stl'])
+
+function fileStem(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return (dot > 0 ? name.slice(0, dot) : name).toLowerCase()
+}
+
+function findDiskNodeContext(
+  nodes: DiskNode[],
+  targetPath: string,
+): { siblings: DiskNode[] } | null {
+  for (const n of nodes) {
+    if (n.path === targetPath) return { siblings: nodes }
+    if (n.children?.length) {
+      const inner = findDiskNodeContext(n.children, targetPath)
+      if (inner) return inner
+    }
+  }
+  return null
+}
+
+async function listDiskFolderFiles(folderPath: string): Promise<DiskNode[]> {
+  if (!folderPath.trim() || !yandexDiskConnected.value) return []
+  let res: Response
+  if (yandexDiskMode.value === 'public') {
+    const publicUrl = yandexDiskUrlInput.value.trim()
+    if (!publicUrl) return []
+    res = await yadiskFetch('/api/yadisk/public/list', {
+      method: 'POST',
+      body: JSON.stringify({
+        public_url: publicUrl,
+        path: folderPath.trim(),
+        limit: 500,
+        offset: 0,
+      }),
+    })
+  } else if (yandexDiskMode.value === 'oauth') {
+    res = await yadiskFetch(
+      `/api/yadisk/private/list?path=${encodeURIComponent(folderPath.trim())}&limit=500&offset=0`,
+    )
+  } else {
+    return []
+  }
+  if (!res.ok) return []
+  const data = (await res.json()) as { items?: Record<string, unknown>[] }
+  return (data.items || []).map((x) => diskNodeFromApi(x))
+}
+
+function diskParentPath(filePath: string): string {
+  const p = filePath.trim()
+  const slash = p.lastIndexOf('/')
+  if (slash <= 0) return ''
+  return p.slice(0, slash)
+}
+
+async function diskSiblingsForFile(node: DiskNode): Promise<DiskNode[]> {
+  const ctx = findDiskNodeContext(yandexDiskRootNodes.value, node.path)
+  const fromTree = ctx?.siblings ?? []
+  if (fromTree.some((s) => s.path !== node.path && s.type === 'file')) return fromTree
+  const parentPath = diskParentPath(node.path)
+  if (!parentPath) return fromTree
+  const listed = await listDiskFolderFiles(parentPath)
+  return listed.length ? listed : fromTree
+}
+
+/** Этап 6: при наличии готового GLB с тем же именем не конвертируем STEP в браузере. */
+async function resolveModelDiskNode(
+  node: DiskNode,
+): Promise<{ node: DiskNode; viaGlbSibling: boolean }> {
+  const ext = getFileExt(node.name)
+  if (!MODEL_SOURCE_EXTS.has(ext)) return { node, viaGlbSibling: false }
+  const siblings = await diskSiblingsForFile(node)
+  const stem = fileStem(node.name)
+  const glb = siblings.find(
+    (s) =>
+      s.type === 'file' &&
+      (getFileExt(s.name) === 'glb' || getFileExt(s.name) === 'gltf') &&
+      fileStem(s.name) === stem,
+  )
+  if (glb) return { node: glb, viaGlbSibling: true }
+  return { node, viaGlbSibling: false }
+}
+
+async function fetchDiskFileBlob(node: DiskNode): Promise<Blob> {
+  if (!yandexDiskConnected.value) throw new Error('Диск не подключён')
+  if (!node.path?.trim()) throw new Error('Нет пути к файлу на Диске')
+  let res: Response
+  if (yandexDiskMode.value === 'public') {
+    const publicUrl = yandexDiskUrlInput.value.trim()
+    if (!publicUrl) throw new Error('Нет URL публичной папки')
+    res = await yadiskFetch('/api/yadisk/public/download', {
+      method: 'POST',
+      body: JSON.stringify({ public_url: publicUrl, path: node.path.trim() }),
+    })
+  } else if (yandexDiskMode.value === 'oauth') {
+    res = await yadiskFetch(
+      `/api/yadisk/private/download?path=${encodeURIComponent(node.path.trim())}`,
+    )
+  } else {
+    throw new Error('Нет активного режима Диска')
+  }
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(`${res.status} ${t.slice(0, 200)}`)
+  }
+  return res.blob()
+}
+
+async function openDiskTreeFile(node: DiskNode) {
+  if (node.type !== 'file' || !node.name) return
+  if (!(await confirmWorkspaceDiscard())) return
+  yandexDiskStatus.value = `Загрузка ${node.name}…`
+  try {
+    if (diskTreeTab.value === 'pdf' && isPdfTreeFile(node)) {
+      const blob = await fetchDiskFileBlob(node)
+      const ext = getFileExt(node.name)
+      const mime =
+        ext === 'pdf' ? 'application/pdf' : blob.type || 'application/octet-stream'
+      const file = new File([blob], node.name, { type: mime })
+      if (pdfFile.value?.url) URL.revokeObjectURL(pdfFile.value.url)
+      pdfFile.value = { url: URL.createObjectURL(file), name: file.name }
+      if (viewMode.value === '3d' || viewMode.value === 'log') viewMode.value = 'split'
+      logger.info('App', `PDF с Диска: ${node.name}`)
+      yandexDiskStatus.value = `Открыт PDF: ${node.name}`
+      return
+    }
+    if (diskTreeTab.value === '3d' && isModelTreeFile(node)) {
+      const { node: target, viaGlbSibling } = await resolveModelDiskNode(node)
+      const blob = await fetchDiskFileBlob(target)
+      const file = new File([blob], target.name, {
+        type: blob.type || 'application/octet-stream',
+      })
+      if (viewMode.value === '2d' || viewMode.value === 'log') viewMode.value = 'split'
+      await viewerRef.value?.loadModelFile?.(file)
+      const note = viaGlbSibling ? ` (GLB вместо ${node.name})` : ''
+      logger.info('App', `3D с Диска: ${target.name}${note}`)
+      yandexDiskStatus.value = `Открыта модель: ${target.name}${note}`
+      return
+    }
+    yandexDiskStatus.value = 'Формат файла не поддерживается для этой вкладки'
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Ошибка загрузки'
+    yandexDiskStatus.value = msg
+    logger.error('App', `Диск: ${node.name}`, e)
+  }
+}
+
 function collectPdfProductionLinks(
   nodes: DiskNode[],
   parentFolder: string
@@ -514,6 +661,8 @@ const WORKSPACE_LS_CENTER_PDF = 'workspace.centerPdfWidthPx'
 const WORKSPACE_LS_DISK_COLLAPSED = 'workspace.diskPanelCollapsed'
 const WORKSPACE_LS_CHAT_COLLAPSED = 'workspace.chatPanelCollapsed'
 const COLLAPSED_PANEL_PX = 36
+const WORKSPACE_SPLITTER_PX = 5
+const PANEL_NUDGE_STEP_PX = 28
 
 const sidebarWidth = ref(248)
 const rightPanelWidth = ref(380)
@@ -522,11 +671,17 @@ const chatPanelCollapsed = ref(false)
 let sidebarWidthBeforeCollapse = 248
 let rightPanelWidthBeforeCollapse = 380
 
-const effectiveSidebarWidth = computed(() =>
-  diskPanelCollapsed.value ? COLLAPSED_PANEL_PX : sidebarWidth.value,
+/** Ширина левой колонки (диск + сплиттер) в flex workspace */
+const effectiveLeftRailWidth = computed(() =>
+  diskPanelCollapsed.value
+    ? COLLAPSED_PANEL_PX
+    : sidebarWidth.value + WORKSPACE_SPLITTER_PX,
 )
-const effectiveRightPanelWidth = computed(() =>
-  chatPanelCollapsed.value ? COLLAPSED_PANEL_PX : rightPanelWidth.value,
+/** Ширина правой колонки (сплиттер + чат) в flex workspace */
+const effectiveRightRailWidth = computed(() =>
+  chatPanelCollapsed.value
+    ? COLLAPSED_PANEL_PX
+    : rightPanelWidth.value + WORKSPACE_SPLITTER_PX,
 )
 
 function persistWorkspaceLayout() {
@@ -559,6 +714,24 @@ function toggleChatPanel() {
     rightPanelWidthBeforeCollapse = rightPanelWidth.value
     chatPanelCollapsed.value = true
   }
+  persistWorkspaceLayout()
+}
+
+function nudgeDiskPanelWidth(delta: number) {
+  if (diskPanelCollapsed.value) {
+    if (delta > 0) toggleDiskPanel()
+    return
+  }
+  sidebarWidth.value = clampWorkspaceWidth(sidebarWidth.value + delta, 160, 480)
+  persistWorkspaceLayout()
+}
+
+function nudgeChatPanelWidth(delta: number) {
+  if (chatPanelCollapsed.value) {
+    if (delta > 0) toggleChatPanel()
+    return
+  }
+  rightPanelWidth.value = clampWorkspaceWidth(rightPanelWidth.value + delta, 260, 720)
   persistWorkspaceLayout()
 }
 /** Ширина панели PDF в режиме «Разделение» (2D | 3D), px */
@@ -700,6 +873,52 @@ async function collabLoadTelemost() {
 }
 
 const telemostCallBanner = ref<{ title: string; joinUrl: string } | null>(null)
+
+type TelemostExtraRoom = { id: string; title: string; joinUrl: string; createdAt: string }
+const telemostExtraRooms = ref<TelemostExtraRoom[]>([])
+
+function telemostRoomsStorageKey(): string | null {
+  return collabProjectId.value ? `deskreview.telemostRooms.${collabProjectId.value}` : null
+}
+
+function loadTelemostExtraRooms() {
+  const key = telemostRoomsStorageKey()
+  if (!key) {
+    telemostExtraRooms.value = []
+    return
+  }
+  try {
+    const raw = localStorage.getItem(key)
+    telemostExtraRooms.value = raw ? (JSON.parse(raw) as TelemostExtraRoom[]) : []
+  } catch {
+    telemostExtraRooms.value = []
+  }
+}
+
+async function postTelemostLinkToChat(link: string, label: string) {
+  const ch = collabChannelId.value
+  const pid = collabProjectId.value
+  if (!ch || !pid) return
+  try {
+    await collabAuthFetch(`/api/projects/${pid}/channels/${ch}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ body: `${label}: ${link}` }),
+    })
+  } catch {
+    /* WS / баннер — запасной путь */
+  }
+}
+
+function openTelemostUrl(joinUrl: string) {
+  if (!joinUrl) return
+  window.open(joinUrl, '_blank', 'noopener,noreferrer')
+}
+
+function broadcastTelemostJoin(joinUrl: string, title: string) {
+  if (collabWs?.readyState === WebSocket.OPEN) {
+    collabWs.send(JSON.stringify({ type: 'telemost.join', joinUrl, title }))
+  }
+}
 const saveActionToast = ref('')
 const pdfMarkupDirty = ref(false)
 const model3dRemarksDirty = ref(false)
@@ -734,28 +953,9 @@ async function telemostJoinFromMenu() {
       | { name?: string; title?: string }
       | undefined
     const title = proj?.name?.trim() || proj?.title?.trim() || 'Звонок проекта'
-    window.open(joinUrl, '_blank', 'noopener,noreferrer')
-    if (collabWs?.readyState === WebSocket.OPEN) {
-      collabWs.send(
-        JSON.stringify({
-          type: 'telemost.join',
-          joinUrl,
-          title,
-        }),
-      )
-    }
-    try {
-      const ch = collabChannelId.value
-      const pid = collabProjectId.value
-      if (ch && pid) {
-        await collabAuthFetch(`/api/projects/${pid}/channels/${ch}/messages`, {
-          method: 'POST',
-          body: JSON.stringify({ body: `Звонок Телемост: ${joinUrl}` }),
-        })
-      }
-    } catch {
-      /* запасной путь — только WS */
-    }
+    openTelemostUrl(joinUrl)
+    broadcastTelemostJoin(joinUrl, title)
+    await postTelemostLinkToChat(joinUrl, 'Звонок Телемост')
   } else if (telemostHint.value) {
     window.alert(telemostHint.value)
   }
@@ -770,21 +970,27 @@ async function telemostCreateMeetingFromMenu() {
   }
   await collabLoadTelemost()
   const joinUrl = telemostJoinUrl.value || ''
-  try {
-    const key = `deskreview.telemostRooms.${collabProjectId.value}`
-    const raw = localStorage.getItem(key)
-    const rooms: { id: string; title: string; joinUrl: string; createdAt: string }[] = raw ? JSON.parse(raw) : []
-    rooms.unshift({
-      id: `room_${Date.now()}`,
-      title: title.trim(),
-      joinUrl,
-      createdAt: new Date().toISOString(),
-    })
-    localStorage.setItem(key, JSON.stringify(rooms.slice(0, 20)))
-  } catch {
-    /* noop */
+  const key = telemostRoomsStorageKey()
+  if (key) {
+    try {
+      const rooms = [...telemostExtraRooms.value]
+      rooms.unshift({
+        id: `room_${Date.now()}`,
+        title: title.trim(),
+        joinUrl,
+        createdAt: new Date().toISOString(),
+      })
+      localStorage.setItem(key, JSON.stringify(rooms.slice(0, 20)))
+      loadTelemostExtraRooms()
+    } catch {
+      /* noop */
+    }
   }
-  telemostCallBanner.value = { title: title.trim(), joinUrl }
+  if (joinUrl) {
+    broadcastTelemostJoin(joinUrl, title.trim())
+    await postTelemostLinkToChat(joinUrl, title.trim())
+  }
+  telemostCallBanner.value = joinUrl ? { title: title.trim(), joinUrl } : null
   rightWorkAreaTab.value = 'telemost'
 }
 
@@ -2450,6 +2656,7 @@ async function onCollabProjectChange() {
   await collabLoadMembers()
   collabConnectWs()
   await collabLoadTelemost()
+  loadTelemostExtraRooms()
   await collabLoadAssetPairs()
   await collabLoadSuggestions()
 }
@@ -2824,25 +3031,53 @@ onUnmounted(() => {
       </div>
     </div>
     <div v-if="workspaceMode === 'engineering'" class="workspace">
+      <div
+        class="workspace-side-rail workspace-side-rail--left"
+        :style="{
+          flex: `0 0 ${effectiveLeftRailWidth}px`,
+          width: `${effectiveLeftRailWidth}px`,
+          minWidth: `${effectiveLeftRailWidth}px`,
+          maxWidth: `${effectiveLeftRailWidth}px`,
+        }"
+      >
       <aside
         class="ide-sidebar ide-sidebar--disk"
         :class="{ 'ide-sidebar--collapsed': diskPanelCollapsed }"
         aria-label="Файлы проекта на Яндекс.Диске"
-        :style="{ flex: `0 0 ${effectiveSidebarWidth}px`, width: `${effectiveSidebarWidth}px` }"
       >
         <div class="ide-sidebar-header">
           <template v-if="!diskPanelCollapsed">
             <span class="ide-sidebar-title">Яндекс.Диск</span>
             <span class="ide-sidebar-pill">API</span>
           </template>
-          <button
-            type="button"
-            class="ide-panel-collapse-btn"
-            :title="diskPanelCollapsed ? 'Развернуть панель диска' : 'Свернуть панель диска'"
-            @click="toggleDiskPanel"
-          >
-            {{ diskPanelCollapsed ? '⟩' : '⟨' }}
-          </button>
+          <div class="ide-panel-head-actions">
+            <div v-if="!diskPanelCollapsed" class="ide-panel-width-controls" title="Ширина панели">
+              <button
+                type="button"
+                class="ide-panel-width-btn"
+                title="Уже"
+                @click="nudgeDiskPanelWidth(-PANEL_NUDGE_STEP_PX)"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                class="ide-panel-width-btn"
+                title="Шире"
+                @click="nudgeDiskPanelWidth(PANEL_NUDGE_STEP_PX)"
+              >
+                ›
+              </button>
+            </div>
+            <button
+              type="button"
+              class="ide-panel-collapse-btn"
+              :title="diskPanelCollapsed ? 'Развернуть панель диска' : 'Свернуть панель диска'"
+              @click="toggleDiskPanel"
+            >
+              {{ diskPanelCollapsed ? '⟩' : '⟨' }}
+            </button>
+          </div>
         </div>
         <template v-if="!diskPanelCollapsed">
         <div class="ide-disk-actions">
@@ -2900,9 +3135,12 @@ onUnmounted(() => {
             :tab="diskTreeTab"
             :show-file="diskTreeTab === 'pdf' ? isPdfTreeFile : isModelTreeFile"
             @toggle-dir="onYandexDiskToggleDir($event)"
+            @open-file="openDiskTreeFile"
           />
         </div>
-        <p class="ide-sidebar-hint">В режиме PDF и 3D деревья независимые: выбор чертежа не переключает модель автоматически.</p>
+        <p class="ide-sidebar-hint">
+          Клик по файлу открывает его во вьювере. Для STEP/IGES в той же папке ищется готовый GLB с тем же именем.
+        </p>
         </template>
         <button
           v-else
@@ -2915,11 +3153,12 @@ onUnmounted(() => {
         </button>
       </aside>
       <div
-        class="workspace-splitter"
-        :class="{ 'workspace-splitter--disabled': diskPanelCollapsed }"
-        title="Изменить ширину панели"
+        v-show="!diskPanelCollapsed"
+        class="workspace-splitter workspace-splitter--in-rail"
+        title="Перетащите для изменения ширины"
         @mousedown.prevent="onWorkspaceSplitterDown('left', $event)"
       />
+      </div>
       <div ref="workspaceContentRef" class="content" :class="'mode-' + viewMode">
         <div
           v-show="showPdfPanel()"
@@ -2997,25 +3236,53 @@ onUnmounted(() => {
         </div>
       </div>
       <div
-        class="workspace-splitter"
-        :class="{ 'workspace-splitter--disabled': chatPanelCollapsed }"
-        title="Изменить ширину чата"
+        class="workspace-side-rail workspace-side-rail--right"
+        :style="{
+          flex: `0 0 ${effectiveRightRailWidth}px`,
+          width: `${effectiveRightRailWidth}px`,
+          minWidth: `${effectiveRightRailWidth}px`,
+          maxWidth: `${effectiveRightRailWidth}px`,
+        }"
+      >
+      <div
+        v-show="!chatPanelCollapsed"
+        class="workspace-splitter workspace-splitter--in-rail"
+        title="Перетащите для изменения ширины"
         @mousedown.prevent="onWorkspaceSplitterDown('right', $event)"
       />
       <aside
         class="collab-panel"
         :class="{ 'collab-panel--collapsed': chatPanelCollapsed }"
-        :style="{ flex: `0 0 ${effectiveRightPanelWidth}px`, width: `${effectiveRightPanelWidth}px` }"
       >
         <div class="collab-panel-head">
-          <button
-            type="button"
-            class="ide-panel-collapse-btn ide-panel-collapse-btn--chat"
-            :title="chatPanelCollapsed ? 'Развернуть чат' : 'Свернуть чат'"
-            @click="toggleChatPanel"
-          >
-            {{ chatPanelCollapsed ? '⟨' : '⟩' }}
-          </button>
+          <div class="ide-panel-head-actions ide-panel-head-actions--chat">
+            <button
+              type="button"
+              class="ide-panel-collapse-btn ide-panel-collapse-btn--chat"
+              :title="chatPanelCollapsed ? 'Развернуть чат' : 'Свернуть чат'"
+              @click="toggleChatPanel"
+            >
+              {{ chatPanelCollapsed ? '⟨' : '⟩' }}
+            </button>
+            <div v-if="!chatPanelCollapsed" class="ide-panel-width-controls" title="Ширина панели">
+              <button
+                type="button"
+                class="ide-panel-width-btn"
+                title="Уже"
+                @click="nudgeChatPanelWidth(-PANEL_NUDGE_STEP_PX)"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                class="ide-panel-width-btn"
+                title="Шире"
+                @click="nudgeChatPanelWidth(PANEL_NUDGE_STEP_PX)"
+              >
+                ›
+              </button>
+            </div>
+          </div>
           <div v-if="!chatPanelCollapsed" class="collab-work-tabs" role="tablist">
             <button
               type="button"
@@ -3062,7 +3329,7 @@ onUnmounted(() => {
         <template v-else>
         <div v-show="rightWorkAreaTab === 'telemost'" class="collab-telemost">
           <p class="collab-hint collab-hint--tight">
-            Один звонок на проект: сервер создаёт комнату Телемоста при первом открытии вкладки (нужен OAuth API у администратора). Участникам достаточно нажать «Подключиться».
+            Главный звонок проекта — одна комната на проект (меню «Телемост» → «Присоединиться»). Отдельные встречи — для подгрупп. Нужен OAuth Телемоста на сервере.
           </p>
           <div v-if="telemostLoading" class="collab-telemost-placeholder">Получение ссылки…</div>
           <div v-else-if="telemostNeedsOAuth" class="collab-telemost-oauth">{{ telemostHint }}</div>
@@ -3081,6 +3348,25 @@ onUnmounted(() => {
             </button>
           </template>
           <div v-else class="collab-telemost-placeholder">Войдите в чат и выберите проект.</div>
+          <div v-if="telemostExtraRooms.length" class="collab-telemost-rooms">
+            <div class="collab-telemost-rooms-title">Дополнительные встречи</div>
+            <div v-for="room in telemostExtraRooms" :key="room.id" class="collab-telemost-room-row">
+              <span class="collab-telemost-room-title">{{ room.title }}</span>
+              <div class="collab-telemost-room-actions">
+                <button type="button" class="collab-btn collab-btn--compact" :disabled="!room.joinUrl" @click="openTelemostUrl(room.joinUrl)">
+                  Войти
+                </button>
+                <button
+                  type="button"
+                  class="collab-btn collab-btn--compact"
+                  :disabled="!room.joinUrl"
+                  @click="postTelemostLinkToChat(room.joinUrl, room.title)"
+                >
+                  В чат
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
         <div v-show="rightWorkAreaTab === 'notes'" class="collab-notes-wrap">
           <p class="collab-hint collab-hint--tight">
@@ -3414,6 +3700,7 @@ onUnmounted(() => {
         <div v-if="collabStatus" class="collab-status">{{ collabStatus }}</div>
         </template>
       </aside>
+      </div>
     </div>
     <div v-else class="production-mode">
       <div class="production-card">
@@ -3699,18 +3986,63 @@ onUnmounted(() => {
 .ide-sidebar-collapsed-label--chat {
   transform: rotate(180deg);
 }
-.workspace-splitter--disabled {
-  pointer-events: none;
-  opacity: 0.35;
-  cursor: default;
+.workspace-side-rail {
+  display: flex;
+  flex-direction: row;
+  flex-shrink: 0;
+  min-height: 0;
+  align-self: stretch;
+  overflow: hidden;
 }
-.collab-panel--collapsed {
+.workspace-side-rail--left .ide-sidebar {
+  flex: 1 1 0;
   min-width: 0;
+  width: auto;
+  max-width: none;
 }
-.collab-panel--collapsed .collab-panel-head {
-  flex-direction: column;
+.workspace-side-rail--right .collab-panel {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  max-width: none;
+}
+.workspace-splitter--in-rail {
+  flex: 0 0 5px;
+  width: 5px;
+  min-width: 5px;
+  margin: 0;
+}
+.ide-panel-head-actions {
+  display: flex;
   align-items: center;
-  padding: 0.35rem 0.2rem;
+  gap: 0.25rem;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.ide-panel-head-actions--chat {
+  margin-left: 0;
+  margin-right: auto;
+}
+.ide-panel-width-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.12rem;
+}
+.ide-panel-width-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 0.9rem;
+  line-height: 1;
+  border: 1px solid #3d4d68;
+  border-radius: 4px;
+  background: #252f42;
+  color: #c8d6ee;
+  cursor: pointer;
+}
+.ide-panel-width-btn:hover {
+  background: #395f96;
+  border-color: #5d83c7;
 }
 .telemost-call-banner {
   display: flex;
@@ -4014,6 +4346,7 @@ onUnmounted(() => {
 .collab-panel {
   min-width: 260px;
   max-width: 720px;
+  flex-shrink: 0;
   min-height: 0;
   align-self: stretch;
   border-left: 1px solid #3a4a6a;
@@ -4023,6 +4356,29 @@ onUnmounted(() => {
   padding: 0.5rem;
   gap: 0.4rem;
   overflow: hidden;
+}
+.collab-panel.collab-panel--collapsed {
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+  padding: 0.15rem 0.05rem;
+  gap: 0.15rem;
+}
+.collab-panel.collab-panel--collapsed .collab-panel-head {
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0.2rem 0.1rem;
+  gap: 0.25rem;
+  width: 100%;
+}
+.collab-panel.collab-panel--collapsed .ide-panel-collapse-btn--chat {
+  margin-right: 0;
+}
+.collab-panel.collab-panel--collapsed .ide-sidebar-collapsed-label--chat {
+  flex: 1;
+  min-height: 0;
+  padding: 0.35rem 0;
 }
 .workspace-splitter {
   flex: 0 0 5px;
@@ -4140,6 +4496,36 @@ onUnmounted(() => {
 .collab-telemost-secondary {
   margin-top: 0.35rem;
   width: 100%;
+}
+.collab-telemost-rooms {
+  margin-top: 0.65rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #3d4f66;
+}
+.collab-telemost-rooms-title {
+  font-size: 0.78rem;
+  color: #9eb0c8;
+  margin-bottom: 0.35rem;
+}
+.collab-telemost-room-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  margin-bottom: 0.3rem;
+  font-size: 0.82rem;
+}
+.collab-telemost-room-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collab-telemost-room-actions {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
 }
 .collab-auth,
 .collab-body {

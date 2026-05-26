@@ -48,7 +48,6 @@ import Model3dScreenLayerOverlay from './Model3dScreenLayerOverlay.vue'
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
 const headerToolsTab = ref<'viewTools' | 'display' | 'export'>('viewTools')
-const stepMeta = ref<any | null>(null)
 
 const props = defineProps<{
   sectionMode?: boolean
@@ -105,7 +104,17 @@ let hoverDirty = true
 let lastHoverUpdateAt = 0
 let isCameraInteracting = false
 const INTERACTION_PIXEL_RATIO = 0.75
+const SCREENSHOT_PIXEL_RATIO_MIN = 2
+const SCREENSHOT_PIXEL_RATIO_MAX = 3
 let idlePixelRatio = 1
+
+function screenshotPixelRatio(): number {
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+  return Math.min(
+    SCREENSHOT_PIXEL_RATIO_MAX,
+    Math.max(SCREENSHOT_PIXEL_RATIO_MIN, dpr * 1.5),
+  )
+}
 const showGroundGrid = ref(true)
 let measurementPoints: THREE.Vector3[] = []
 let measurementPointNormals: (THREE.Vector3 | null)[] = []
@@ -377,7 +386,7 @@ const selectedMeasurementId = ref<string | null>(null)
 const originalMaterials = new WeakMap<THREE.Mesh, THREE.Material | THREE.Material[]>()
 const preservePartColors = ref(true)
 const autoColorizeSegments = ref(true)
-const overlayEnabled = ref(true)
+const overlayEnabled = ref(false)
 const overlayOpacity = ref(0.7)
 const OVERLAY_OPACITY_MIN = 0.05
 const OVERLAY_OPACITY_MAX = 1
@@ -415,7 +424,6 @@ interface ComponentTreeRow {
   depth: number
 }
 const componentTreeByModel = ref<Record<string, ComponentTreeNode[]>>({})
-const assemblyMapByModel = ref<Record<string, any>>({})
 const selectedComponentRowId = ref<string | null>(null)
 const highlightedComponentMeshes = new Set<THREE.Mesh>()
 let hiddenOutlineGroup: THREE.Group
@@ -587,6 +595,7 @@ function addRemarkFromCurrentView() {
 
 function selectRemark(commentId: string) {
   selectedRemarkId.value = commentId
+  selectedMeasurementId.value = null
   remarkScreenSelectedShapeId.value = null
   remarkScreenSelectedImageId.value = null
   const c = remarksDoc.value?.comments.find((x) => x.id === commentId)
@@ -596,14 +605,24 @@ function selectRemark(commentId: string) {
   updateRemarkViewAngle()
 }
 
-function deleteSelectedRemark() {
-  if (!remarksDoc.value || !selectedRemarkId.value) return
-  const idx = remarksDoc.value.comments.findIndex((c) => c.id === selectedRemarkId.value)
+function deleteRemarkById(id: string, confirmDelete = true) {
+  if (!remarksDoc.value) return
+  const idx = remarksDoc.value.comments.findIndex((c) => c.id === id)
   if (idx < 0) return
-  if (!window.confirm('Удалить это замечание?')) return
+  if (confirmDelete && !window.confirm('Удалить это замечание?')) return
   remarksDoc.value.comments.splice(idx, 1)
-  selectedRemarkId.value = null
+  if (selectedRemarkId.value === id) {
+    selectedRemarkId.value = null
+    remarkScreenSelectedShapeId.value = null
+    remarkScreenSelectedImageId.value = null
+  }
   markRemarksChanged()
+  rebuildRemarkAnchorMarkers()
+}
+
+function deleteSelectedRemark() {
+  if (!selectedRemarkId.value) return
+  deleteRemarkById(selectedRemarkId.value, true)
 }
 
 function restoreSelectedRemarkView() {
@@ -876,20 +895,6 @@ const assemblySymPart2 = ref<AssemblyPlaneSelection | null>(null)
 const assemblyMates = ref<StoredAssemblyMate[]>([])
 /** Выбранная строка в таблице связей — подсветка зафиксированных плоскостей. */
 const selectedAssemblyMateId = ref<string | null>(null)
-const measurementsPanelPos = ref({ x: 14, y: 14 })
-let measurementsPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
-const assemblyPanelPos = ref({ x: 330, y: 14 })
-let assemblyPanelDragStart: { x: number; y: number; startX: number; startY: number } | null = null
-const FLOAT_PANEL_MARGIN = 14
-const FLOAT_PANEL_HEADER_GAP = 0
-const ASSEMBLY_PANEL_DEFAULT_WIDTH = 300
-const FLOAT_PANEL_STACK_GAP = 10
-const FLOAT_PANEL_SCENE_GAP = 10
-let floatingPanelsResizeObserver: ResizeObserver | null = null
-
-function minFloatingPanelY() {
-  return 0
-}
 const modelGroupsById = new Map<string, THREE.Group>()
 const visibleAssemblyModels = computed(() => loadedModels.value.filter((m) => m.inScene))
 const assemblySourcePlaneText = computed(() =>
@@ -1211,42 +1216,6 @@ async function tryLoadKompasMetaAuto(fileName: string): Promise<PartColorMeta | 
   }
 }
 
-async function tryLoadKompasAssemblyMapAuto(fileName: string): Promise<any | null> {
-  const rootDir = String((import.meta as any).env?.VITE_KOMPAS_ROOT_DIR ?? '').trim()
-  if (!rootDir) return null
-  try {
-    const url = `/api/kompas/assembly-map/auto?root_dir=${encodeURIComponent(rootDir)}`
-    const res = await fetchWithTimeout(url, { method: 'GET' }, STEP_METADATA_TIMEOUT_MS)
-    if (!res.ok) return null
-    const payload = await res.json()
-    if (payload?.mode === 'select' && Array.isArray(payload?.assemblies) && payload.assemblies.length > 0) {
-      const options = payload.assemblies
-        .slice(0, 12)
-        .map((a: any, i: number) => `${i + 1}. ${String(a?.name ?? a?.path ?? '')}`)
-        .join('\n')
-      const answer = window.prompt(`Найдено несколько сборок КОМПАС (assembly-map).\nВыберите номер:\n${options}`, '1')
-      const idx = Math.max(1, Number.parseInt(String(answer ?? '1'), 10) || 1) - 1
-      const selected = payload.assemblies[Math.min(idx, payload.assemblies.length - 1)]
-      const selectedPath = String(selected?.path ?? '').trim()
-      if (selectedPath) {
-        const one = await fetchWithTimeout(
-          `/api/kompas/assembly-map?assembly_path=${encodeURIComponent(selectedPath)}`,
-          { method: 'GET' },
-          STEP_METADATA_TIMEOUT_MS
-        )
-        if (one.ok) {
-          const onePayload = await one.json()
-          return onePayload?.assemblyMap ?? null
-        }
-      }
-    }
-    return payload?.assemblyMap ?? null
-  } catch (e) {
-    console.warn(`${LOG_PREFIX} kompas assembly-map auto недоступен:`, e)
-    return null
-  }
-}
-
 async function tryLoadPartMetaByBaseName(baseName: string): Promise<PartColorMeta | null> {
   if (!baseName) return null
   const encoded = encodeURIComponent(baseName)
@@ -1403,7 +1372,7 @@ function applySceneLightingForShadingMode() {
   if (rimLightA) rimLightA.intensity = base.rimA * (lit ? 1 : 0.9) * toneSafe
   if (rimLightB) rimLightB.intensity = base.rimB * (lit ? 1 : 0.9) * toneSafe
   if (renderer) renderer.toneMappingExposure = base.exposure * (0.88 + toneSafe * 0.3)
-  if (renderer) renderer.shadowMap.enabled = lit
+  if (renderer) renderer.shadowMap.enabled = false
 }
 
 function setMeshGroupShadowState(enabled: boolean) {
@@ -1433,9 +1402,7 @@ function applyShadingMode() {
   })
   applyModelTint()
   applySceneLightingForShadingMode()
-  const lit = shadingMode.value === 'lit'
-  setMeshGroupShadowState(lit)
-  if (renderer) renderer.shadowMap.needsUpdate = true
+  setMeshGroupShadowState(false)
 }
 
 function onShadingModeChange(ev: Event) {
@@ -1661,16 +1628,8 @@ function syncHiddenOutlinesForModel(modelId: string) {
   })
 }
 
-function ensureOverlayForModel(modelId: string, sourceWrapper: THREE.Group) {
-  const existing = overlayGroupByModelId.get(modelId)
-  if (existing) {
-    if (!overlayGroup.children.includes(existing)) overlayGroup.add(existing)
-    return
-  }
-  const overlayWrapper = buildOverlayForModel(modelId, sourceWrapper)
-  overlayGroupByModelId.set(modelId, overlayWrapper)
-  overlaySourceByModelId.set(modelId, sourceWrapper)
-  overlayGroup.add(overlayWrapper)
+function ensureOverlayForModel(_modelId: string, _sourceWrapper: THREE.Group) {
+  /* оверлей отключён — меньше геометрии в GPU */
 }
 
 function removeOverlayForModel(modelId: string, dispose = false) {
@@ -1865,7 +1824,8 @@ function startAssemblyPlanePick(target: Exclude<AssemblyPickTarget, null>) {
 }
 
 function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
-  clearMeasurements()
+  measureType = 'cad-linear'
+  measureModeRef.value = true
   cadLinearPickTarget.value = target
   const hints: Record<Exclude<CadLinearPickTarget, null>, string> = {
     plane1: 'Линейный размер: выберите 1-ю измеряемую плоскость.',
@@ -1873,6 +1833,14 @@ function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
     display: 'Линейный размер: выберите плоскость отображения размера.',
   }
   cadLinearStatus.value = hints[target]
+}
+
+function beginNextCadLinearDimension() {
+  clearCadLinearPicks()
+  measureType = 'cad-linear'
+  measureModeRef.value = true
+  cadLinearPickTarget.value = 'plane1'
+  cadLinearStatus.value = 'Линейный размер: выберите 1-ю измеряемую плоскость (клик по грани).'
 }
 
 function clearCadLinearPicks() {
@@ -1886,9 +1854,7 @@ function clearCadLinearPicks() {
 }
 
 function startNewCadLinearMeasurement() {
-  clearCadLinearPicks()
-  cadLinearStatus.value = 'Новый линейный размер: выберите 1-ю измеряемую плоскость.'
-  startCadLinearPlanePick('plane1')
+  beginNextCadLinearDimension()
 }
 
 function toggleLinearMeasurementRow(id: string) {
@@ -1904,8 +1870,10 @@ function saveCadLinearFromPickedPlanes() {
   if (!p1 || !p2 || !pd) return
   const n1 = p1.normal.clone().normalize()
   const n2 = p2.normal.clone().normalize()
-  if (Math.abs(n1.dot(n2)) < 0.92) {
-    cadLinearStatus.value = 'Измеряемые плоскости должны быть параллельны.'
+  if (Math.abs(n1.dot(n2)) < 0.85) {
+    cadLinearStatus.value =
+      'Плоскости 1 и 2 должны быть параллельны (кликните по другим граням или «Новый размер»).'
+    cadLinearPickTarget.value = 'plane2'
     return
   }
   saveCadLinearMeasurement(
@@ -1921,25 +1889,47 @@ function saveCadLinearFromPickedPlanes() {
     vecToSaved(pd.localPoint),
     vecToSaved(pd.normal),
   )
-  cadLinearStatus.value = 'Линейный размер сохранён. Плоскости сохранены, можно ставить следующий размер.'
+  beginNextCadLinearDimension()
+  cadLinearStatus.value = 'Линейный размер сохранён. Выберите 1-ю плоскость для следующего.'
+}
+
+function inferCadLinearPickTarget(): Exclude<CadLinearPickTarget, null> | null {
+  if (cadLinearPickTarget.value) return cadLinearPickTarget.value
+  if (!cadLinearPlane1.value) return 'plane1'
+  if (!cadLinearPlane2.value) return 'plane2'
+  if (!cadLinearDisplayPlane.value) return 'display'
+  return null
+}
+
+function firstMeshFaceHit(hits: THREE.Intersection[]): THREE.Intersection | null {
+  for (const h of hits) {
+    if (!(h.object instanceof THREE.Mesh)) continue
+    if (!findWrapperGroup(h.object)) continue
+    if (!h.face) continue
+    return h
+  }
+  return null
 }
 
 function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
   const wrapper = findWrapperGroup(hit.object)
   const modelId = String(wrapper?.userData?.modelId ?? '')
-  if (!modelId || !hit.face) {
-    cadLinearStatus.value = 'Не удалось определить грань для линейного размера.'
+  const mesh = hit.object as THREE.Mesh
+  const face = hit.face
+  if (!wrapper || !modelId || !face) {
+    cadLinearStatus.value = 'Не удалось определить грань. Кликните по плоской грани модели.'
     return
   }
-  const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
+  const normal = face.normal.clone().transformDirection(mesh.matrixWorld).normalize()
   const localPoint = wrapper.worldToLocal(hit.point.clone())
   const tri = buildWorldFaceTriangleFromHit(hit)
   const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
   if (tri) pick.previewGeometry = tri
-  const t = cadLinearPickTarget.value
-  const target =
-    t
-    ?? (!cadLinearPlane1.value ? 'plane1' : !cadLinearPlane2.value ? 'plane2' : 'display')
+  const target = inferCadLinearPickTarget()
+  if (!target) {
+    cadLinearStatus.value = 'Нажмите «Новый размер» или кнопку плоскости 1 / 2 / вывода.'
+    return
+  }
   if (target === 'plane1') {
     disposePlanePreviewGeometry(cadLinearPlane1.value ?? undefined)
     cadLinearPlane1.value = pick
@@ -2518,6 +2508,7 @@ function saveCadLinearMeasurement(
 }
 
 function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
+  selectedRemarkId.value = null
   measureModeRef.value = true
   clearMeasurements()
   if (row.type === 'radius') {
@@ -2597,7 +2588,14 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
     const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
     const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
     measurementPoints = [a, b]
-    measurementPointNormals = [null, null]
+    measurementPointNormals = [
+      row.modelId1 && row.n1Local
+        ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local)
+        : (row.n1 ? savedToVec(row.n1) : null),
+      row.modelId2 && row.n2Local
+        ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local)
+        : (row.n2 ? savedToVec(row.n2) : null),
+    ]
     if (row.outputPlaneModelId && row.outputPlaneLocalPoint && row.outputPlaneLocalNormal) {
       const g = modelGroupsById.get(row.outputPlaneModelId)
       if (g) {
@@ -2899,148 +2897,6 @@ function measurementValueText(m: SavedMeasurement): string {
   return m.displayValue ?? m.lengthMm.toFixed(2)
 }
 
-function onMeasurementsPanelMouseDown(ev: MouseEvent) {
-  measurementsPanelDragStart = {
-    x: ev.clientX,
-    y: ev.clientY,
-    startX: measurementsPanelPos.value.x,
-    startY: measurementsPanelPos.value.y,
-  }
-  window.addEventListener('mousemove', onMeasurementsPanelMouseMove)
-  window.addEventListener('mouseup', onMeasurementsPanelMouseUp)
-}
-
-function onMeasurementsPanelMouseMove(ev: MouseEvent) {
-  if (!measurementsPanelDragStart) return
-  const dx = ev.clientX - measurementsPanelDragStart.x
-  const dy = ev.clientY - measurementsPanelDragStart.y
-  measurementsPanelPos.value = {
-    x: Math.max(0, measurementsPanelDragStart.startX + dx),
-    y: Math.max(0, measurementsPanelDragStart.startY + dy),
-  }
-  clampFloatingPanelsToViewport()
-}
-
-function onMeasurementsPanelMouseUp() {
-  measurementsPanelDragStart = null
-  window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
-  window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
-}
-
-function onAssemblyPanelMouseDown(ev: MouseEvent) {
-  assemblyPanelDragStart = {
-    x: ev.clientX,
-    y: ev.clientY,
-    startX: assemblyPanelPos.value.x,
-    startY: assemblyPanelPos.value.y,
-  }
-  window.addEventListener('mousemove', onAssemblyPanelMouseMove)
-  window.addEventListener('mouseup', onAssemblyPanelMouseUp)
-}
-
-function onAssemblyPanelMouseMove(ev: MouseEvent) {
-  if (!assemblyPanelDragStart) return
-  const dx = ev.clientX - assemblyPanelDragStart.x
-  const dy = ev.clientY - assemblyPanelDragStart.y
-  assemblyPanelPos.value = {
-    x: Math.max(0, assemblyPanelDragStart.startX + dx),
-    y: Math.max(0, assemblyPanelDragStart.startY + dy),
-  }
-  clampFloatingPanelsToViewport()
-}
-
-function syncAssemblyPanelBelowMeasurements() {
-  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
-  const mH = measureEl?.offsetHeight ?? 260
-  assemblyPanelPos.value = {
-    x: measurementsPanelPos.value.x,
-    y: measurementsPanelPos.value.y + mH + FLOAT_PANEL_STACK_GAP,
-  }
-}
-
-function avoidOverlapWithScenePanel(stackW: number, stackH: number) {
-  const sceneEl = document.querySelector('.viewer-scene-panel') as HTMLElement | null
-  if (!sceneEl) return
-  const sceneLeft = sceneEl.offsetLeft
-  const sceneTop = sceneEl.offsetTop
-  const sceneRight = sceneLeft + sceneEl.offsetWidth
-  const sceneBottom = sceneTop + sceneEl.offsetHeight
-  const stackLeft = measurementsPanelPos.value.x
-  const stackTop = measurementsPanelPos.value.y
-  const stackRight = stackLeft + stackW
-  const stackBottom = stackTop + stackH
-  const overlapX = stackLeft < sceneRight && stackRight > sceneLeft
-  const overlapY = stackTop < sceneBottom && stackBottom > sceneTop
-  if (!overlapX || !overlapY) return
-
-  const vw = window.innerWidth
-  const moveBelowY = sceneBottom + FLOAT_PANEL_SCENE_GAP
-  const canMoveBelow = moveBelowY + stackH + FLOAT_PANEL_MARGIN <= window.innerHeight
-  if (canMoveBelow) {
-    measurementsPanelPos.value.y = moveBelowY
-    return
-  }
-  const rightX = sceneRight + FLOAT_PANEL_SCENE_GAP
-  if (rightX + stackW + FLOAT_PANEL_MARGIN <= vw) {
-    measurementsPanelPos.value.x = rightX
-    return
-  }
-  measurementsPanelPos.value.x = FLOAT_PANEL_MARGIN
-}
-
-function onAssemblyPanelMouseUp() {
-  assemblyPanelDragStart = null
-  window.removeEventListener('mousemove', onAssemblyPanelMouseMove)
-  window.removeEventListener('mouseup', onAssemblyPanelMouseUp)
-}
-
-function applyDefaultFloatingPanelPositions() {
-  const minY = minFloatingPanelY()
-  measurementsPanelPos.value = { x: FLOAT_PANEL_MARGIN, y: minY }
-  syncAssemblyPanelBelowMeasurements()
-}
-
-function clampFloatingPanelsToViewport() {
-  const vw = window.innerWidth
-  const vh = window.innerHeight
-  const minY = minFloatingPanelY()
-  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
-  const assemblyEl = document.querySelector('.viewer-assembly-panel') as HTMLElement | null
-  const mW = measureEl?.offsetWidth ?? 320
-  const mH = measureEl?.offsetHeight ?? 260
-  const aW = assemblyEl?.offsetWidth ?? ASSEMBLY_PANEL_DEFAULT_WIDTH
-  const aH = assemblyEl?.offsetHeight ?? 220
-  const clampX = (x: number, w: number) => Math.max(FLOAT_PANEL_MARGIN, Math.min(x, vw - w - FLOAT_PANEL_MARGIN))
-  const clampY = (y: number, h: number) => Math.max(minY, Math.min(y, vh - h - FLOAT_PANEL_MARGIN))
-  measurementsPanelPos.value = {
-    x: clampX(measurementsPanelPos.value.x, mW),
-    y: clampY(measurementsPanelPos.value.y, mH),
-  }
-  avoidOverlapWithScenePanel(mW, mH)
-  measurementsPanelPos.value = {
-    x: clampX(measurementsPanelPos.value.x, mW),
-    y: clampY(measurementsPanelPos.value.y, mH),
-  }
-  assemblyPanelPos.value = {
-    x: clampX(assemblyPanelPos.value.x, aW),
-    y: clampY(assemblyPanelPos.value.y, aH),
-  }
-}
-
-function setupFloatingPanelsAutoLayout() {
-  if (typeof ResizeObserver === 'undefined') return
-  floatingPanelsResizeObserver?.disconnect()
-  floatingPanelsResizeObserver = new ResizeObserver(() => {
-    clampFloatingPanelsToViewport()
-  })
-  const measureEl = document.querySelector('.viewer-measurements-float') as HTMLElement | null
-  const assemblyEl = document.querySelector('.viewer-assembly-panel') as HTMLElement | null
-  const sceneEl = document.querySelector('.viewer-scene-panel') as HTMLElement | null
-  if (measureEl) floatingPanelsResizeObserver.observe(measureEl)
-  if (assemblyEl) floatingPanelsResizeObserver.observe(assemblyEl)
-  if (sceneEl) floatingPanelsResizeObserver.observe(sceneEl)
-}
-
 const SNAP_SCREEN_THRESHOLD = 0.08
 const snapProj = new THREE.Vector3()
 
@@ -3139,8 +2995,7 @@ function initScene() {
   renderer.toneMapping = THREE.ACESFilmicToneMapping
   renderer.toneMappingExposure = 1
   renderer.localClippingEnabled = true
-  renderer.shadowMap.enabled = true
-  renderer.shadowMap.type = THREE.PCFShadowMap
+  renderer.shadowMap.enabled = false
   containerRef.value.appendChild(renderer.domElement)
 
   controls = new TrackballControls(camera, renderer.domElement)
@@ -3165,11 +3020,7 @@ function initScene() {
   hemiLight = new THREE.HemisphereLight(0xffffff, 0xe9edf7, 0.45)
   scene.add(hemiLight)
   keyLight = new THREE.DirectionalLight(0xffffff, 0.42)
-  keyLight.castShadow = true
-  keyLight.shadow.mapSize.set(2048, 2048)
-  keyLight.shadow.bias = -0.00025
-  keyLight.shadow.normalBias = 0.04
-  keyLight.shadow.radius = 3.5
+  keyLight.castShadow = false
   fillLightA = new THREE.DirectionalLight(0xffffff, 0.3)
   fillLightB = new THREE.DirectionalLight(0xffffff, 0.24)
   fillLightC = new THREE.DirectionalLight(0xffffff, 0.2)
@@ -3268,7 +3119,6 @@ function initScene() {
 
   function animate() {
     animationId = requestAnimationFrame(animate)
-    syncOverlayTransforms()
     controls.update()
     updateRemarkViewAngle()
     let hits: THREE.Intersection[] = []
@@ -3712,6 +3562,34 @@ function resetView() {
   controls.update()
 }
 
+/** Delete / Backspace: разметка замечания → измерение → замечание → модель (на вкладке «Модели»). */
+function handleViewerDeleteKey(): boolean {
+  if (
+    leftSidebarTab.value === 'remarks' &&
+    remarkScreenLayerEditable.value &&
+    (remarkScreenSelectedShapeId.value || remarkScreenSelectedImageId.value)
+  ) {
+    deleteSelectedScreenMarkup()
+    return true
+  }
+  if (selectedMeasurementId.value) {
+    const id = selectedMeasurementId.value
+    if (measurementHistory.value.some((m) => m.id === id)) {
+      removeMeasurement(id)
+      return true
+    }
+  }
+  if (selectedRemarkId.value) {
+    deleteRemarkById(selectedRemarkId.value, true)
+    return true
+  }
+  if (leftSidebarTab.value === 'models' && focusedModelId.value && modelGroupsById.has(focusedModelId.value)) {
+    deleteFocusedModel()
+    return true
+  }
+  return false
+}
+
 function focusModelInView() {
   if (!camera || !controls || !meshGroup || meshGroup.children.length === 0) return
   const box = new THREE.Box3().setFromObject(meshGroup)
@@ -3755,9 +3633,10 @@ function onWindowKeyDown(ev: KeyboardEvent) {
     pasteTransformToFocused()
     return
   }
-  if (ev.code === 'Delete') {
-    ev.preventDefault()
-    deleteFocusedModel()
+  if (ev.code === 'Delete' || ev.code === 'Backspace') {
+    if (handleViewerDeleteKey()) {
+      ev.preventDefault()
+    }
     return
   }
   if (ev.code === 'Escape') {
@@ -4697,70 +4576,7 @@ function splitMergedMeshesUsingSpec(root: THREE.Object3D, stepMetaPayload?: any)
   return changed
 }
 
-function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group, stepMetaPayload?: any) {
-  const mapPayload = assemblyMapByModel.value[modelId] ?? stepMetaPayload?.assemblyMap ?? null
-  const bomRows = Array.isArray(mapPayload?.bom) ? mapPayload.bom : []
-  if (bomRows.length > 0) {
-    const meshes: THREE.Mesh[] = []
-    wrapper.traverse((o: THREE.Object3D) => { if (o instanceof THREE.Mesh) meshes.push(o) })
-    const byPart = new Map<string, THREE.Mesh[]>()
-    bomRows.forEach((b: any) => byPart.set(String(b?.partId ?? ''), []))
-    const unassigned: THREE.Mesh[] = []
-    meshes.forEach((m) => {
-      const pid = String(m.userData?.partId ?? '').trim()
-      if (pid && byPart.has(pid)) byPart.get(pid)!.push(m)
-      else unassigned.push(m)
-    })
-    // Жесткая фиксация: чтобы плоскости/оболочки не жили отдельными строками,
-    // неразмеченные меши принудительно относим к ближайшей уже размеченной детали.
-    if (unassigned.length) {
-      const centers = new Map<string, THREE.Vector3>()
-      byPart.forEach((arr, pid) => {
-        if (!arr.length) return
-        const c = new THREE.Vector3()
-        arr.forEach((m) => c.add(new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3())))
-        c.multiplyScalar(1 / arr.length)
-        centers.set(pid, c)
-      })
-      const fallbackPid = centers.keys().next().value as string | undefined
-      unassigned.forEach((m) => {
-        let bestPid = fallbackPid
-        if (bestPid) {
-          const cm = new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3())
-          let bestD = Number.POSITIVE_INFINITY
-          centers.forEach((cp, pid) => {
-            const d = cm.distanceTo(cp)
-            if (d < bestD) { bestD = d; bestPid = pid }
-          })
-        }
-        if (bestPid) byPart.get(bestPid)?.push(m)
-      })
-    }
-    const roots: ComponentTreeNode[] = bomRows
-      .map((b: any, idx: number) => {
-        const pid = String(b?.partId ?? '')
-        const name = String(b?.name ?? '').trim()
-        const des = String(b?.designation ?? '').trim()
-        const label = des ? `${name} [${des}]` : (name || `Деталь ${idx + 1}`)
-        const targetIds = (byPart.get(pid) || []).map((m) => m.uuid)
-        return {
-          id: `${modelId}:bom:${idx}`,
-          label,
-          visible: targetIds.some((id) => {
-            const found = meshes.find((m) => m.uuid === id)
-            return found ? found.visible : true
-          }),
-          targetIds,
-          children: [],
-        } as ComponentTreeNode
-      })
-      .filter((n) => n.targetIds.length > 0)
-    if (roots.length > 0) {
-      componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
-      return
-    }
-  }
-
+function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group) {
   const buckets = new Map<string, { label: string; ids: string[]; visibleCount: number }>()
   wrapper.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh)) return
@@ -4775,27 +4591,15 @@ function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group, stepM
     }
     buckets.set(key, { label, ids: [obj.uuid], visibleCount: obj.visible ? 1 : 0 })
   })
-  const fromSpec = extractLabelsFromStepSpecMeta(stepMetaPayload)
-  const useSpecVirtualTree = buckets.size <= 2 && fromSpec.length >= 3
-  const roots: ComponentTreeNode[] = useSpecVirtualTree
-    ? fromSpec
-      .sort((a, b) => a.localeCompare(b, 'ru'))
-      .map((label, idx) => ({
-        id: `${modelId}:spec:${idx}`,
-        label,
-        visible: true,
-        targetIds: [],
-        children: [],
-      }))
-    : [...buckets.values()]
-      .sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-      .map((x, idx) => ({
-        id: `${modelId}:part:${idx}`,
-        label: x.label,
-        visible: x.visibleCount > 0,
-        targetIds: x.ids,
-        children: [],
-      }))
+  const roots: ComponentTreeNode[] = [...buckets.values()]
+    .sort((a, b) => a.label.localeCompare(b.label, 'ru'))
+    .map((x, idx) => ({
+      id: `${modelId}:part:${idx}`,
+      label: x.label,
+      visible: x.visibleCount > 0,
+      targetIds: x.ids,
+      children: [],
+    }))
   componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
 }
 
@@ -5491,6 +5295,15 @@ function onCanvasClick(ev: MouseEvent) {
     pickAssemblyPlaneFromHit(hits[0])
     return
   }
+  if (measureModeRef.value && measureType === 'cad-linear') {
+    const faceHit = firstMeshFaceHit(hits)
+    if (!faceHit) {
+      cadLinearStatus.value = 'Линейный размер: кликните по плоской грани модели.'
+      return
+    }
+    pickCadLinearPlaneFromHit(faceHit)
+    return
+  }
   if ((assemblyPanelOpen.value || (assemblySourceModelId.value && assemblyTargetModelId.value)) && hits.length > 0) {
     const wrapper = findWrapperGroup(hits[0].object)
     const modelId = String(wrapper?.userData?.modelId ?? '')
@@ -5697,14 +5510,6 @@ function onCanvasClick(ev: MouseEvent) {
     } else {
       logger.warn('Viewer3D', `MeasureClick#${clickId} arc: path not found`)
     }
-    return
-  }
-  if (measureType === 'cad-linear') {
-    if (hits.length === 0) {
-      cadLinearStatus.value = 'Линейный размер: кликните по плоскости модели.'
-      return
-    }
-    pickCadLinearPlaneFromHit(hits[0])
     return
   }
   if (measureType === 'hole-center-distance') {
@@ -6561,10 +6366,6 @@ function setMeasureType(type: MeasureType) {
     for (const g of measurementFaceGeometries) g.dispose()
     measurementFaceGeometries = []
   }
-  if (type !== 'cad-linear') {
-    clearCadLinearPicks()
-    cadLinearStatus.value = ''
-  }
   radiusOrDiameterResult = null
   arcResult = null
   arcFirstPoint = null
@@ -6580,8 +6381,12 @@ function setMeasureType(type: MeasureType) {
   cadLinearPlaneModelId = null
   cadLinearPlaneLocalPoint = null
   cadLinearPlaneLocalNormal = null
-  clearCadLinearPicks()
-  cadLinearStatus.value = ''
+  if (type === 'cad-linear') {
+    beginNextCadLinearDimension()
+  } else {
+    clearCadLinearPicks()
+    cadLinearStatus.value = ''
+  }
   updateMeasurementGraphics()
 }
 
@@ -6858,7 +6663,6 @@ function loadGlbUrl(
   loadStartedAt?: number,
   opts?: { modelId: string; modelName: string },
   partMeta?: PartColorMeta | null,
-  stepMetaPayload?: any
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const loader = new GLTFLoader()
@@ -6870,21 +6674,12 @@ function loadGlbUrl(
         if (opts) {
           wrapper.userData = { modelId: opts.modelId }
           modelGroupsById.set(opts.modelId, wrapper)
-          if (stepMetaPayload?.assemblyMap) {
-            assemblyMapByModel.value = { ...assemblyMapByModel.value, [opts.modelId]: stepMetaPayload.assemblyMap }
-          }
         } else {
           clearMeshGroup()
           modelGroupsById.clear()
           loadedModels.value = []
         }
         wrapper.add(gltf.scene)
-        const splitCount = splitMergedMeshesUsingSpec(gltf.scene, stepMetaPayload)
-        if (splitCount > 0) logger.info('Viewer3D', `Геометрия разбита на компоненты: +${splitCount} мешей`)
-        if (stepMetaPayload?.assemblyMap) {
-          const mm = applyAssemblyMapMatching(gltf.scene, stepMetaPayload.assemblyMap)
-          logger.info('Viewer3D', `assembly-map matching: ${mm.matched}/${mm.total}`)
-        }
         ensureExplodeCacheForModel(wrapper)
         markImportedMeshColors(gltf.scene)
         if (partMeta) {
@@ -6902,10 +6697,7 @@ function loadGlbUrl(
           if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
         }
         meshGroup.add(wrapper)
-        if (opts) ensureOverlayForModel(opts.modelId, wrapper)
-        if (opts) buildComponentTreeForModel(opts.modelId, wrapper, stepMetaPayload)
-        // applyExplodeForModel(wrapper, explodeAmount.value)
-        updateOverlayVisuals()
+        if (opts) buildComponentTreeForModel(opts.modelId, wrapper)
         applyShadingMode()
         if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
@@ -7018,10 +6810,7 @@ async function loadSTL(
   }
   meshGroup.add(wrapper)
   // ensureExplodeCacheForModel(wrapper)
-  if (opts) ensureOverlayForModel(opts.modelId, wrapper)
   if (opts) buildComponentTreeForModel(opts.modelId, wrapper)
-  // applyExplodeForModel(wrapper, explodeAmount.value)
-  updateOverlayVisuals()
   if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
   if (currentSectionAxis) setSectionAxis(currentSectionAxis)
   else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
@@ -7119,15 +6908,11 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
     const reader = new FileReader()
     reader.onload = async () => {
       const buf = reader.result as ArrayBuffer
-      let assemblyMap: any | null = null
       if (!partMeta) {
         partMeta = await tryLoadPartMetaByBaseName(baseName)
       }
       if (!partMeta && ['step', 'stp', 'igs', 'iges'].includes(ext)) {
         partMeta = await tryLoadKompasMetaAuto(file.name)
-      }
-      if (['step', 'stp', 'igs', 'iges'].includes(ext)) {
-        assemblyMap = await tryLoadKompasAssemblyMapAuto(file.name)
       }
       if (!partMeta) logger.info('Viewer3D', `meta.json не найден для "${baseName}" (используем цвета из GLB/конвертера)`)
     console.log('ArrayBuffer (байт):', buf?.byteLength ?? 0)
@@ -7148,20 +6933,8 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
         return
       }
       isLoading.value = true
-      stepMeta.value = null
       const t0 = performance.now()
       try {
-        let metaPromise: Promise<any> | null = null
-        if (ext === 'step' || ext === 'stp') {
-          const fd = new FormData()
-          fd.append('file', file, file.name)
-          metaPromise = fetchWithTimeout('/api/step/metadata', { method: 'POST', body: fd }, STEP_METADATA_TIMEOUT_MS)
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`metadata ${r.status} ${r.statusText}`))))
-            .catch((e) => {
-              console.warn(`${LOG_PREFIX} metadata server недоступен:`, e)
-              return null
-            })
-        }
         let glbUrl: string
         if (ext === 'step' || ext === 'stp') {
           try {
@@ -7199,9 +6972,7 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
             'Превышено время браузерной конвертации STEP/IGES'
           )
         }
-        const meta = metaPromise ? await metaPromise : null
-        stepMeta.value = meta
-        await loadGlbUrl(glbUrl, performance.now(), opts, partMeta, { ...(meta || {}), assemblyMap })
+        await loadGlbUrl(glbUrl, performance.now(), opts, partMeta)
         const totalMs = performance.now() - t0
         logger.info('Viewer3D', `Модель загружена: ${file.name} за ${(totalMs / 1000).toFixed(2)} с`)
         console.log(`${LOG_PREFIX} Модель загружена. Всего: ${(totalMs / 1000).toFixed(2)} с`)
@@ -7222,7 +6993,7 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
       console.groupEnd()
       const url = URL.createObjectURL(file)
       try {
-        await loadGlbUrl(url, performance.now(), opts, partMeta, { ...(stepMeta.value || {}), assemblyMap })
+        await loadGlbUrl(url, performance.now(), opts, partMeta)
       } finally {
         URL.revokeObjectURL(url)
       }
@@ -7277,7 +7048,7 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
         .then((blob) => {
           console.log(`${LOG_PREFIX} JT blob size:`, blob.size, blob.type)
           const url = URL.createObjectURL(blob)
-          return loadGlbUrl(url, performance.now(), undefined, null, stepMeta.value)
+          return loadGlbUrl(url, performance.now(), undefined, null)
         })
         .then(() => {
           console.log(`${LOG_PREFIX} JT loadGlbUrl done`)
@@ -7353,60 +7124,88 @@ function openFileDialog() {
 
 function takeScreenshot(): Promise<string> {
   return new Promise((resolve) => {
-    if (!renderer || !scene || !camera) {
+    if (!renderer || !scene || !camera || !containerRef.value) {
       resolve('')
       return
     }
-    renderer.render(scene, camera)
     const container = containerRef.value
-    const labelEls = [
-      measurementLabelEl,
-      measurementLabelEl0,
-      measurementLabelEl1,
-      measurementLabelEl2,
-      measurementPerpLabelEl,
-      measurementExtraLabelEl,
-      diameterSecondLabelEl,
-    ].filter(Boolean) as HTMLDivElement[]
-    const hasVisibleLabels = labelEls.some((el) => el.style.display !== 'none' && (el.textContent || '').trim())
-    if (!container || !hasVisibleLabels) {
-      resolve(renderer.domElement.toDataURL('image/png'))
-      return
-    }
-    const canvas = document.createElement('canvas')
-    canvas.width = renderer.domElement.width
-    canvas.height = renderer.domElement.height
-    const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      resolve(renderer.domElement.toDataURL('image/png'))
-      return
-    }
-    ctx.drawImage(renderer.domElement, 0, 0)
-    const canvasRect = renderer.domElement.getBoundingClientRect()
-    const scaleX = canvas.width / canvasRect.width
-    const scaleY = canvas.height / canvasRect.height
-    for (const el of labelEls) {
-      if (el.style.display === 'none') continue
-      const text = (el.textContent || '').trim()
-      if (!text) continue
-      const r = el.getBoundingClientRect()
-      const x = (r.left - canvasRect.left) * scaleX
-      const y = (r.top - canvasRect.top) * scaleY
-      const style = getComputedStyle(el)
-      ctx.font = style.font
-      ctx.fillStyle = style.color
-      ctx.textBaseline = 'top'
-      const padding = 2
-      const bg = style.backgroundColor
-      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
-        const m = ctx.measureText(text)
-        ctx.fillStyle = bg
-        ctx.fillRect(x - padding, y - padding, m.width + padding * 2, parseFloat(style.fontSize) || 14 + padding * 2)
-        ctx.fillStyle = style.color
+    const width = Math.max(1, container.clientWidth)
+    const height = Math.max(1, container.clientHeight)
+    const prevPixelRatio = renderer.getPixelRatio()
+    const prevSize = new THREE.Vector2()
+    renderer.getSize(prevSize)
+    const prevAspect = camera.aspect
+
+    const shotRatio = screenshotPixelRatio()
+    try {
+      renderer.setPixelRatio(shotRatio)
+      renderer.setSize(width, height, false)
+      camera.aspect = width / height
+      camera.updateProjectionMatrix()
+      renderer.render(scene, camera)
+
+      const labelEls = [
+        measurementLabelEl,
+        measurementLabelEl0,
+        measurementLabelEl1,
+        measurementLabelEl2,
+        measurementPerpLabelEl,
+        measurementExtraLabelEl,
+        diameterSecondLabelEl,
+      ].filter(Boolean) as HTMLDivElement[]
+      const hasVisibleLabels = labelEls.some(
+        (el) => el.style.display !== 'none' && (el.textContent || '').trim(),
+      )
+      if (!hasVisibleLabels) {
+        resolve(renderer.domElement.toDataURL('image/png'))
+        return
       }
-      ctx.fillText(text, x, y)
+      const canvas = document.createElement('canvas')
+      canvas.width = renderer.domElement.width
+      canvas.height = renderer.domElement.height
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        resolve(renderer.domElement.toDataURL('image/png'))
+        return
+      }
+      ctx.drawImage(renderer.domElement, 0, 0)
+      const canvasRect = renderer.domElement.getBoundingClientRect()
+      const scaleX = canvas.width / Math.max(canvasRect.width, 1)
+      const scaleY = canvas.height / Math.max(canvasRect.height, 1)
+      for (const el of labelEls) {
+        if (el.style.display === 'none') continue
+        const text = (el.textContent || '').trim()
+        if (!text) continue
+        const r = el.getBoundingClientRect()
+        const x = (r.left - canvasRect.left) * scaleX
+        const y = (r.top - canvasRect.top) * scaleY
+        const style = getComputedStyle(el)
+        const fontSize = parseFloat(style.fontSize) || 14
+        ctx.font = style.font.replace(
+          /(\d+(?:\.\d+)?)px/,
+          `${Math.round(fontSize * scaleY)}px`,
+        )
+        ctx.fillStyle = style.color
+        ctx.textBaseline = 'top'
+        const padding = 2 * scaleY
+        const bg = style.backgroundColor
+        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+          const m = ctx.measureText(text)
+          ctx.fillStyle = bg
+          ctx.fillRect(x - padding, y - padding, m.width + padding * 2, fontSize * scaleY + padding * 2)
+          ctx.fillStyle = style.color
+        }
+        ctx.fillText(text, x, y)
+      }
+      resolve(canvas.toDataURL('image/png'))
+    } finally {
+      renderer.setPixelRatio(prevPixelRatio)
+      renderer.setSize(prevSize.x, prevSize.y, false)
+      camera.aspect = prevAspect
+      camera.updateProjectionMatrix()
+      renderer.render(scene, camera)
+      controls?.handleResize()
     }
-    resolve(canvas.toDataURL('image/png'))
   })
 }
 
@@ -7457,11 +7256,6 @@ function exportStl(): void {
 
 onMounted(() => {
   initScene()
-  applyDefaultFloatingPanelPositions()
-  setTimeout(() => {
-    clampFloatingPanelsToViewport()
-    setupFloatingPanelsAutoLayout()
-  }, 0)
   document.addEventListener('mousedown', onOrientationClickOutside)
   document.addEventListener('mousedown', onMouseSettingsClickOutside)
   document.addEventListener('mousedown', onGlobalMouseDown)
@@ -7472,12 +7266,6 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  floatingPanelsResizeObserver?.disconnect()
-  floatingPanelsResizeObserver = null
-  window.removeEventListener('mousemove', onMeasurementsPanelMouseMove)
-  window.removeEventListener('mouseup', onMeasurementsPanelMouseUp)
-  window.removeEventListener('mousemove', onAssemblyPanelMouseMove)
-  window.removeEventListener('mouseup', onAssemblyPanelMouseUp)
   document.removeEventListener('mousedown', onOrientationClickOutside)
   document.removeEventListener('mousedown', onMouseSettingsClickOutside)
   document.removeEventListener('mousedown', onGlobalMouseDown)
@@ -7630,7 +7418,6 @@ function setModelInScene(id: string, inScene: boolean) {
         if (maxX > -Infinity) group.position.x = maxX + size.x / 2 + 30
       }
       meshGroup.add(group)
-      ensureOverlayForModel(id, group)
       if (!componentTreeByModel.value[id]) buildComponentTreeForModel(id, group)
     }
     if (wireframeModeRef.value) applyWireframeToObject(group, true)
@@ -7641,7 +7428,6 @@ function setModelInScene(id: string, inScene: boolean) {
     removeOverlayForModel(id)
     group.visible = false
   }
-  updateOverlayVisuals()
   refreshComponentTreeVisibility(id)
   loadedModels.value = loadedModels.value.map((m) => (m.id === id ? { ...m, inScene } : m))
   if (meshGroup.children.length > 0) {
@@ -7670,8 +7456,6 @@ function removeModel(id: string) {
   removeOverlayForModel(id, true)
   const { [id]: _removed, ...restTrees } = componentTreeByModel.value
   componentTreeByModel.value = restTrees
-  const { [id]: _removedMap, ...restMaps } = assemblyMapByModel.value
-  assemblyMapByModel.value = restMaps
   for (const [key, helper] of hiddenOutlineByComponentId.entries()) {
     if (!key.startsWith(`${id}:`)) continue
     hiddenOutlineGroup.remove(helper)
@@ -8223,20 +8007,6 @@ defineExpose({
             :value="frameOpacityRef"
             @input="onFrameOpacityInput"
           />
-          <label class="viewer-part-colors-toggle" title="Полупрозрачная цветовая маска поверх модели">
-            <input v-model="overlayEnabled" type="checkbox" @change="onOverlayEnabledChange" />
-            Оверлей
-          </label>
-          <input
-            type="number"
-            class="viewer-frame-opacity-input"
-            :min="OVERLAY_OPACITY_MIN"
-            :max="OVERLAY_OPACITY_MAX"
-            :step="OVERLAY_OPACITY_STEP"
-            :value="overlayOpacity"
-            title="Прозрачность оверлея"
-            @input="onOverlayOpacityInput"
-          />
           <label class="viewer-scene-shading" title="Режим шейдинга модели">
             <span>Свет</span>
             <select class="viewer-scene-select" :value="shadingMode" @change="onShadingModeChange">
@@ -8464,12 +8234,16 @@ defineExpose({
           </div>
           <div class="viewer-measurements-controls">
             <select class="viewer-measurements-select" :value="measureType" @change="setMeasureType(($event.target as HTMLSelectElement).value as MeasureType)">
-              <option value="distance">Расстояние</option>
-              <option value="cad-linear">Размер (с выносом)</option>
-              <option value="radius">Радиус</option>
-              <option value="diameter">Диаметр</option>
-              <option value="hole-center-distance">Межцентровое</option>
-              <option value="arc">Длина дуги</option>
+              <optgroup label="Основные">
+                <option value="distance">Расстояние (треугольник Δ)</option>
+                <option value="cad-linear">Линейный размер (вынос, ГОСТ)</option>
+              </optgroup>
+              <optgroup label="Дополнительно">
+                <option value="radius">Радиус</option>
+                <option value="diameter">Диаметр</option>
+                <option value="hole-center-distance">Межцентровое</option>
+                <option value="arc">Длина дуги</option>
+              </optgroup>
             </select>
             <div class="viewer-measurements-dim-row">
               <span>Стрелка</span>
@@ -8514,7 +8288,15 @@ defineExpose({
             >
               <span class="viewer-measurements-cell-id">#{{ measurementHistory.length - idx }}</span>
               <span>{{ measurementTypeLabel(m) }}</span>
-              <span>{{ measurementValueText(m) }}</span>
+              <span class="viewer-measurements-cell-value">{{ measurementValueText(m) }}</span>
+              <button
+                type="button"
+                class="viewer-measurements-row-del"
+                title="Удалить измерение"
+                @click.stop="removeMeasurement(m.id)"
+              >
+                ×
+              </button>
             </div>
           </div>
         </div>
@@ -8673,6 +8455,14 @@ defineExpose({
                     <span class="viewer-remarks-item-title">{{ c.title }}</span>
                   </span>
                   <span class="viewer-remarks-item-meta">{{ new Date(c.createdAt).toLocaleString() }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="viewer-remarks-item-del"
+                  title="Удалить замечание"
+                  @click.stop="deleteRemarkById(c.id)"
+                >
+                  ×
                 </button>
               </li>
             </ul>
@@ -9272,6 +9062,9 @@ defineExpose({
   gap: 0.25rem;
 }
 .viewer-remarks-item {
+  display: flex;
+  align-items: stretch;
+  gap: 0.2rem;
   border-radius: 4px;
   border: 1px solid transparent;
 }
@@ -9280,7 +9073,8 @@ defineExpose({
   background: rgba(59, 130, 246, 0.12);
 }
 .viewer-remarks-item-btn {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   text-align: left;
   padding: 0.35rem 0.4rem;
   border: none;
@@ -9298,6 +9092,25 @@ defineExpose({
 .viewer-remarks-item-meta {
   font-size: 0.65rem;
   color: #8ea4c7;
+}
+.viewer-remarks-item-del {
+  flex-shrink: 0;
+  align-self: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 0.15rem;
+  border: 1px solid #5b6f90;
+  border-radius: 4px;
+  background: rgba(70, 80, 110, 0.9);
+  color: #dce8f8;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0;
+  font-size: 0.95rem;
+}
+.viewer-remarks-item-del:hover {
+  background: rgba(173, 66, 66, 0.95);
+  border-color: #b35f5f;
 }
 .viewer-models-header {
   flex-shrink: 0;
@@ -9548,7 +9361,7 @@ defineExpose({
 }
 .viewer-measurements-row {
   display: grid;
-  grid-template-columns: 34px 40px 64px 64px 1fr 24px;
+  grid-template-columns: 34px 44px 1fr 24px;
   gap: 6px;
   align-items: center;
   border: 1px solid #3a4a6a;
@@ -9569,6 +9382,14 @@ defineExpose({
 .viewer-measurements-cell-id {
   color: #9db2cf;
   font-size: 0.68rem;
+}
+.viewer-measurements-cell-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .viewer-measurements-row-perp {
   font-size: 0.78rem;
