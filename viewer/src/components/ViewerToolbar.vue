@@ -27,6 +27,7 @@ const emit = defineEmits<{
   'export-report-chat': []
   'telemost-join-project': []
   'telemost-create-meeting': []
+  'open-settings': []
 }>()
 
 type MenuId = 'file' | 'mode' | 'logs' | 'report' | 'telemost' | null
@@ -101,6 +102,10 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
             </button>
             <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('open-assembly-project'))">
               Открыть проект сборки…
+            </button>
+            <div class="toolbar-menu-divider" />
+            <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('open-settings'))">
+              Настройки…
             </button>
           </div>
         </div>

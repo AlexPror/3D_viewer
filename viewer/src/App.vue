@@ -1427,6 +1427,10 @@ function onOpenFile() {
   viewerRef.value?.openFileDialog()
 }
 
+function onOpenSettings() {
+  viewerRef.value?.openSettingsModal?.()
+}
+
 function onResetView() {
   logger.info('App', 'Вид 3D сброшен')
   viewerRef.value?.resetView?.()
@@ -2974,6 +2978,7 @@ onUnmounted(() => {
       @show-logs="onShowLogs"
       @telemost-join-project="telemostJoinFromMenu"
       @telemost-create-meeting="telemostCreateMeetingFromMenu"
+      @open-settings="onOpenSettings"
     />
     <div v-if="telemostCallBanner" class="telemost-call-banner" role="status">
       <span>Звонок: {{ telemostCallBanner.title }}</span>

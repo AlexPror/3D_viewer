@@ -44,6 +44,12 @@ import {
   SCREEN_LAYER_VIEW_ANGLE_THRESHOLD_DEG,
 } from '../lib/model3dScreenLayer'
 import Model3dScreenLayerOverlay from './Model3dScreenLayerOverlay.vue'
+import ViewerSidebarIcons from './ViewerSidebarIcons.vue'
+import {
+  type PartCategoryId,
+  inferPartCategory,
+} from '../lib/partTree'
+import { meshPartGroupKey, pickGeometryGroupLabel } from '../lib/meshGeometrySignature'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const isLoading = ref(false)
@@ -84,6 +90,8 @@ let camera: THREE.PerspectiveCamera
 let renderer: THREE.WebGLRenderer
 let controls: InstanceType<typeof TrackballControls>
 let meshGroup: THREE.Group
+/** Характерный размер загруженной сцены (мм) — для масштаба подписей измерений. */
+let loadedSceneCharDim = 1000
 let overlayGroup: THREE.Group
 let measureGroup: THREE.Group
 let highlightGroup: THREE.Group
@@ -103,10 +111,13 @@ const HOVER_UPDATE_INTERVAL_MS = 80
 let hoverDirty = true
 let lastHoverUpdateAt = 0
 let isCameraInteracting = false
-const INTERACTION_PIXEL_RATIO = 0.75
+const INTERACTION_PIXEL_RATIO = 1
 const SCREENSHOT_PIXEL_RATIO_MIN = 2
 const SCREENSHOT_PIXEL_RATIO_MAX = 3
 let idlePixelRatio = 1
+let lastClipPlaneDist = -1
+/** Характерный размер активной (фокусной) модели — для зума и min distance. */
+let focusedSceneCharDim = 1000
 
 function screenshotPixelRatio(): number {
   const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
@@ -134,6 +145,7 @@ let savedMeasurementsGroup: THREE.Group
 let remarkAnchorsGroup: THREE.Group
 /** Подсветка выбранных плоскостей сборки и связей из таблицы (после initScene) */
 let assemblyHighlightGroup: THREE.Group | undefined
+let worldCoordSystemGroup: THREE.Group | null = null
 let measurementLabelEl: HTMLDivElement | null = null
 let measurementPerpLabelEl: HTMLDivElement | null = null
 let measurementExtraLabelEl: HTMLDivElement | null = null
@@ -145,12 +157,32 @@ let lastHoverNormal: THREE.Vector3 | null = null
 let lastHoverPoint: THREE.Vector3 | null = null
 const measureModeRef = ref(false)
 const sectionModeRef = ref(false)
+/** Каркас всей сцены (кнопка «Каркас» в отображении). */
 const wireframeModeRef = ref(false)
-/** Прозрачность граней в режиме «Каркас» (0.25 — видно углы и рёбра). Регулируется с панели. */
-const frameOpacityRef = ref(0.25)
-const FRAME_OPACITY_MIN = 0.05
-const FRAME_OPACITY_MAX = 0.95
+type PartTreeIsolateState = {
+  modelId: string
+  rowId: string
+  meshVisible: Map<string, boolean>
+  keepIds: Set<string>
+}
+const partTreeIsolateState = ref<PartTreeIsolateState | null>(null)
+/** Непрозрачность линий каркаса (EdgesGeometry), не граней модели. */
+const frameOpacityRef = ref(0.9)
+const FRAME_OPACITY_MIN = 0.1
+const FRAME_OPACITY_MAX = 1
 const FRAME_OPACITY_STEP = 0.05
+const WIREFRAME_EDGE_THRESHOLD_DEG = 25
+const WIREFRAME_MAX_EDGE_MESHES = 6000
+/** Грани невидимы — видны только линии каркаса. */
+const WIREFRAME_GHOST_FACE_OPACITY = 0
+/** Прозрачность отдельных деталей (ПКМ), по uuid меша. */
+const meshUserOpacityByUuid = ref<Record<string, number>>({})
+const wireframeFaceMatBackup = new Map<
+  THREE.Mesh,
+  Array<{ transparent: boolean; opacity: number; depthWrite: boolean }>
+>()
+const meshRaycastBackup = new Map<THREE.Mesh, THREE.Mesh['raycast']>()
+const noopRaycast: THREE.Mesh['raycast'] = () => {}
 
 function clampFrameOpacity(v: number): number {
   return Math.max(FRAME_OPACITY_MIN, Math.min(FRAME_OPACITY_MAX, v))
@@ -161,7 +193,7 @@ function onFrameOpacityInput(ev: Event) {
   if (Number.isFinite(val)) {
     const next = clampFrameOpacity(val)
     frameOpacityRef.value = next
-    if (wireframeModeRef.value) applyWireframeToObject(meshGroup, true, next)
+    if (wireframeModeRef.value) updateWireframeEdgeLineOpacity()
   }
 }
 
@@ -169,7 +201,7 @@ function onFrameOpacityWheel(ev: WheelEvent) {
   const delta = ev.deltaY > 0 ? -FRAME_OPACITY_STEP : FRAME_OPACITY_STEP
   const next = clampFrameOpacity(frameOpacityRef.value + delta)
   frameOpacityRef.value = next
-  if (wireframeModeRef.value) applyWireframeToObject(meshGroup, true, next)
+  if (wireframeModeRef.value) updateWireframeEdgeLineOpacity()
 }
 
 /** Выбранная грань для кнопки «Перпендикулярно» (центр и нормаль в мировой СК). */
@@ -201,9 +233,20 @@ export interface LoadedModelItem {
 
 type SavedMeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'cad-linear'
 type SavedVec3 = { x: number; y: number; z: number }
-type AssemblyMateType = 'plane' | 'distance' | 'symmetric'
+type AssemblyMateType = 'plane' | 'distance' | 'symmetric' | 'coord'
 type AssemblyAxis = 'x' | 'y' | 'z'
 type AssemblyPlaneSide = 'min' | 'max'
+/** Мировые координатные плоскости (пересечение осей X/Y/Z в начале координат). */
+type WorldCoordPlaneId = 'xy_pos' | 'xy_neg' | 'xz_pos' | 'xz_neg' | 'yz_pos' | 'yz_neg'
+
+const WORLD_COORD_PLANE_OPTIONS: { id: WorldCoordPlaneId; label: string; hint: string }[] = [
+  { id: 'xy_pos', label: 'XY — горизонт (нормаль +Z)', hint: 'Плоскость пола, ось Z вверх' },
+  { id: 'xy_neg', label: 'XY — горизонт (нормаль −Z)', hint: 'Плоскость потолка' },
+  { id: 'xz_pos', label: 'XZ — фасад (нормаль +Y)', hint: 'Вертикальная плоскость, ось Y вперёд' },
+  { id: 'xz_neg', label: 'XZ — фасад (нормаль −Y)', hint: 'Вертикальная плоскость, ось Y назад' },
+  { id: 'yz_pos', label: 'YZ — бок (нормаль +X)', hint: 'Вертикальная плоскость, ось X вправо' },
+  { id: 'yz_neg', label: 'YZ — бок (нормаль −X)', hint: 'Вертикальная плоскость, ось X влево' },
+]
 type AssemblyPickTarget =
   | 'source'
   | 'target'
@@ -213,11 +256,17 @@ type AssemblyPickTarget =
   | 'symPart2'
   | null
 
+type MeshFaceSurfaceKind = 'plane' | 'cylinder' | 'unknown'
+
 interface AssemblyPlaneSelection {
   modelId: string
   localPoint: THREE.Vector3
   point: THREE.Vector3
+  /** Нормаль в локальной СК модели (wrapper). */
   normal: THREE.Vector3
+  surfaceKind?: MeshFaceSurfaceKind
+  /** Ось цилиндра в локальной СК (для будущего сопряжения осей). */
+  cylinderAxisLocal?: THREE.Vector3
   /** Треугольник выбранной грани в мировых координатах (для подсветки). */
   previewGeometry?: THREE.BufferGeometry
 }
@@ -258,6 +307,15 @@ type StoredAssemblyMate =
       part1: StoredAssemblyPlane
       part2: StoredAssemblyPlane
     }
+  | {
+      id: string
+      type: 'coord'
+      sourceId: string
+      sourcePlane: StoredAssemblyPlane
+      worldPlane: WorldCoordPlaneId
+      distanceMm: number
+      flipNormal: boolean
+    }
 
 /** Файл проекта сборки: модели по имени файла (как в списке «Модели»). */
 interface ExportedAssemblyPlane {
@@ -294,6 +352,23 @@ type ExportedAssemblyMate =
       part1: ExportedAssemblyPlane
       part2: ExportedAssemblyPlane
     }
+  | {
+      id: string
+      type: 'coord'
+      sourceModelName: string
+      sourcePlane: ExportedAssemblyPlane
+      worldPlane: WorldCoordPlaneId
+      distanceMm: number
+      flipNormal: boolean
+    }
+
+interface AssemblyProjectPartLayerV1 {
+  modelName: string
+  /** Ключ из meshGeometryGroupKey (geo:… или pid:…). */
+  geomKey: string
+  layerId: string
+  colorOverride?: string
+}
 
 interface AssemblyProjectFileV1 {
   format: '3d-viewer-assembly-project'
@@ -310,6 +385,9 @@ interface AssemblyProjectFileV1 {
     rz: number
   }>
   assemblyMates: ExportedAssemblyMate[]
+  /** Слои документа (опционально, с версии с поддержкой слоёв). */
+  sceneLayers?: Array<{ id: string; name: string; color: string; visible: boolean }>
+  partLayers?: AssemblyProjectPartLayerV1[]
 }
 
 interface SavedMeasurement {
@@ -415,6 +493,8 @@ interface ComponentTreeNode {
   visible: boolean
   targetIds: string[]
   children: ComponentTreeNode[]
+  nodeKind?: 'category' | 'group'
+  categoryId?: PartCategoryId
 }
 interface ComponentTreeRow {
   id: string
@@ -422,19 +502,60 @@ interface ComponentTreeRow {
   visible: boolean
   targetIds: string[]
   depth: number
+  nodeKind?: 'category' | 'group'
 }
 const componentTreeByModel = ref<Record<string, ComponentTreeNode[]>>({})
 const selectedComponentRowId = ref<string | null>(null)
+/** Мультивыбор деталей: ключ `${modelId}:${rowId}`. */
+const selectedPartRowKeys = ref<Set<string>>(new Set())
 const highlightedComponentMeshes = new Set<THREE.Mesh>()
+const expandedCategoryIds = ref<Record<string, boolean>>({})
 let hiddenOutlineGroup: THREE.Group
 const hiddenOutlineByComponentId = new Map<string, THREE.Box3Helper>()
 const assemblyPanelOpen = ref(false)
-type LeftSidebarTab = 'models' | 'assembly' | 'measurements' | 'remarks'
-const leftSidebarTab = ref<LeftSidebarTab>('models')
 
-function setLeftSidebarTab(tab: LeftSidebarTab) {
-  leftSidebarTab.value = tab
-  if (tab === 'assembly') assemblyPanelOpen.value = true
+/** Панель как в КОМПАС: дерево | параметры | слои | библиотека. */
+type LeftSidebarTab = 'tree' | 'params' | 'layers' | 'library'
+type ParamsSubTab = 'assembly' | 'measurements' | 'selection' | 'remarks'
+type LegacyLeftTab = 'models' | 'assembly' | 'measurements' | 'remarks'
+const leftSidebarTab = ref<LeftSidebarTab>('tree')
+const paramsSubTab = ref<ParamsSubTab>('assembly')
+
+const isRemarksPanelActive = computed(
+  () => leftSidebarTab.value === 'params' && paramsSubTab.value === 'remarks',
+)
+
+const libraryModels = computed(() => loadedModels.value.filter((m) => !m.inScene))
+
+function setLeftSidebarTab(tab: LeftSidebarTab | LegacyLeftTab) {
+  switch (tab) {
+    case 'models':
+    case 'tree':
+      leftSidebarTab.value = 'tree'
+      break
+    case 'assembly':
+      leftSidebarTab.value = 'params'
+      paramsSubTab.value = 'assembly'
+      assemblyPanelOpen.value = true
+      break
+    case 'measurements':
+      leftSidebarTab.value = 'params'
+      paramsSubTab.value = 'measurements'
+      break
+    case 'remarks':
+      leftSidebarTab.value = 'params'
+      paramsSubTab.value = 'remarks'
+      break
+    default:
+      leftSidebarTab.value = tab
+      break
+  }
+}
+
+function setParamsSubTab(sub: ParamsSubTab) {
+  paramsSubTab.value = sub
+  leftSidebarTab.value = 'params'
+  if (sub === 'assembly') assemblyPanelOpen.value = true
 }
 
 function onAssemblyHeaderClick() {
@@ -445,6 +566,45 @@ function onMeasureHeaderClick() {
   setLeftSidebarTab('measurements')
   emit('measure')
 }
+
+/** Слои 3D-сцены (аналог слоёв документа). */
+interface SceneLayer3d {
+  id: string
+  name: string
+  color: string
+  visible: boolean
+}
+const sceneLayers3d = ref<SceneLayer3d[]>([
+  { id: 'layer-0', name: '0 — Основной', color: '#e8eef8', visible: true },
+])
+const meshLayerByUuid = ref<Record<string, string>>({})
+const layerColorOverrideByUuid = ref<Record<string, string>>({})
+const selectedLayerAssignId = ref('layer-0')
+const partBoxSelectMode = ref(false)
+const partFocusActive = ref(false)
+/** Затемнять остальные детали при выделении (выкл. по умолчанию — иначе тормозит на больших сборках). */
+const partIsolateDimOthers = ref(false)
+
+const boxSelectRect = ref<{
+  left: number
+  top: number
+  width: number
+  height: number
+  mode: 'window' | 'crossing'
+} | null>(null)
+let boxSelectDrag: { startX: number; startY: number; additive: boolean } | null = null
+
+const dimmedMeshBackups = new Map<
+  THREE.Mesh,
+  { material: THREE.Material | THREE.Material[]; visible: boolean }
+>()
+let partFocusEdgeGroup: THREE.Group
+const sharedGhostMaterial = new THREE.MeshLambertMaterial({
+  color: 0x8a929e,
+  transparent: true,
+  opacity: 0.2,
+  depthWrite: false,
+})
 
 const remarksDoc = ref<Model3dRemarksDocument | null>(null)
 const selectedRemarkId = ref<string | null>(null)
@@ -482,7 +642,7 @@ const remarkViewAngleDeg = ref(0)
 
 const remarkScreenLayerVisible = computed(
   () =>
-    leftSidebarTab.value === 'remarks' &&
+    isRemarksPanelActive.value &&
     !!selectedRemark.value &&
     remarkViewAngleDeg.value <= SCREEN_LAYER_VIEW_ANGLE_THRESHOLD_DEG,
 )
@@ -802,7 +962,7 @@ function deleteSelectedScreenMarkup() {
 }
 
 watch(leftSidebarTab, (tab) => {
-  if (tab !== 'remarks') {
+  if (tab !== 'params' || paramsSubTab.value !== 'remarks') {
     remarkAnchorPickMode.value = false
     rebuildRemarkAnchorMarkers()
   }
@@ -872,10 +1032,21 @@ watch(primaryModelFileName, () => {
 
 /** Активная модель для кнопок панели, копирования трансформа и удаления */
 const focusedModelId = ref<string | null>(null)
+/** Развёрнутые узлы дерева моделей (аккордеон). */
+const expandedModelIds = ref<Record<string, boolean>>({})
 /** Закреплённые в сцене модели не перетаскиваются и не вращаются ЛКМ */
 const pinnedByModelId = ref<Record<string, boolean>>({})
 /** Режим ЛКМ: вращение выбранной модели вокруг центра габарита (оси X и Y мира). */
 const modelRotateMode = ref(false)
+/** Размещение модели в сборке: следует за курсором, фиксация кликом или по координатам. */
+const placementActive = ref(false)
+const placementModelId = ref<string | null>(null)
+const placementPosMm = ref({ x: 0, y: 0, z: 0 })
+const placementStatusHint = ref('')
+let placementAnchorLocal = new THREE.Vector3()
+let placementCancelRemovesFromScene = false
+const placementPickPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)
+const placementPickPoint = new THREE.Vector3()
 const assemblyMateType = ref<AssemblyMateType>('plane')
 const assemblySourceModelId = ref('')
 const assemblyTargetModelId = ref('')
@@ -883,6 +1054,10 @@ const assemblyAxis = ref<AssemblyAxis>('x')
 const assemblySourceSide = ref<AssemblyPlaneSide>('max')
 const assemblyTargetSide = ref<AssemblyPlaneSide>('min')
 const assemblyDistanceMm = ref(0)
+const assemblyCoordWorldPlane = ref<WorldCoordPlaneId>('xy_pos')
+const assemblyCoordFlipNormal = ref(false)
+const showWorldCoordSystem = ref(true)
+const worldCoordSystemExpanded = ref(true)
 const assemblyStatus = ref('')
 const assemblyPickTarget = ref<AssemblyPickTarget>(null)
 const assemblySourcePlane = ref<AssemblyPlaneSelection | null>(null)
@@ -932,9 +1107,20 @@ const MODEL_COLOR_SINGLE = 0xf9f9fa
 const TINT_BRIGHTNESS_MIN = 0.65
 const TINT_BRIGHTNESS_MAX = 2.03
 const TINT_BRIGHTNESS_STEP = 0.05
-const tintBrightness = ref(1)
-const shadingMode = ref<'lit' | 'unlit'>('lit')
+const COLOR_VIVIDNESS_MIN = 0.45
+const COLOR_VIVIDNESS_MAX = 1
+const COLOR_VIVIDNESS_STEP = 0.05
+const tintBrightness = ref(TINT_BRIGHTNESS_MAX)
+const colorVividness = ref(COLOR_VIVIDNESS_MAX)
+const sceneBackgroundHex = ref('#ffffff')
+const extraFillLightsEnabled = ref(true)
+const extraRimLightsEnabled = ref(true)
+const settingsModalOpen = ref(false)
+const shadingMode = ref<'lit' | 'unlit'>('unlit')
 const lightPreset = ref<'engineering' | 'soft'>('engineering')
+/** STEP/GLB из WASM часто в метрах; если max < порога — масштабируем в мм. */
+const METERS_TO_MM_SCALE = 1000
+const METERS_LIKELY_MAX_AXIS = 500
 const sceneSurfaceAreaMm2 = ref<number | null>(null)
 const sceneVolumeMm3 = ref<number | null>(null)
 const sceneTriangles = ref<number>(0)
@@ -1001,31 +1187,88 @@ function normalizeMouseSettings() {
   )
 }
 
-function applyAutoNavigationLimits(box: THREE.Box3) {
-  if (!autoNavLimitsEnabled.value) return
+function boxCharDim(box: THREE.Box3): number {
   const size = box.getSize(new THREE.Vector3())
   const sx = size.x
   const sy = size.y
   const sz = size.z
   const maxDim = Math.max(sx, sy, sz, 1e-9)
   const minDim = Math.min(sx, sy, sz)
-  /** Для плоского чертежа лимиты зума считаем по размаху в плоскости, не по «нулевой» толщине. */
   const isFlat = maxDim > 1e-6 && minDim / maxDim < 0.03
-  let charDim = maxDim
-  if (isFlat) {
-    const thinAxis = sx <= sy && sx <= sz ? 0 : sy <= sx && sy <= sz ? 1 : 2
-    charDim =
-      thinAxis === 0 ? Math.max(sy, sz) : thinAxis === 1 ? Math.max(sx, sz) : Math.max(sx, sy)
+  if (!isFlat) return maxDim
+  const thinAxis = sx <= sy && sx <= sz ? 0 : sy <= sx && sy <= sz ? 1 : 2
+  return thinAxis === 0 ? Math.max(sy, sz) : thinAxis === 1 ? Math.max(sx, sz) : Math.max(sx, sy)
+}
+
+function getFullSceneBox(): THREE.Box3 | null {
+  if (!meshGroup || meshGroup.children.length === 0) return null
+  const b = new THREE.Box3().setFromObject(meshGroup)
+  return b.isEmpty() ? null : b
+}
+
+function getFocusedModelBox(): THREE.Box3 | null {
+  const id = focusedModelId.value
+  if (!id) return null
+  return getAssemblyModelBox(id)
+}
+
+function updateCameraClipPlanes(force = false) {
+  if (!(camera instanceof THREE.PerspectiveCamera) || !controls) return
+  const dist = camera.position.distanceTo(controls.target)
+  if (!force && lastClipPlaneDist > 0 && Math.abs(dist - lastClipPlaneDist) / lastClipPlaneDist < 0.04) return
+  lastClipPlaneDist = dist
+  const sceneBox = getFullSceneBox()
+  const focusBox = getFocusedModelBox()
+  let sceneSpan = loadedSceneCharDim || 1000
+  let focusSpan = focusedSceneCharDim || sceneSpan
+  if (sceneBox) {
+    const s = sceneBox.getSize(new THREE.Vector3())
+    sceneSpan = Math.max(s.x, s.y, s.z, 1)
   }
-  /** Раньше min зум упирался в 250 на больших сценах — колёсико не давало приблизиться; доля от размаха, с верхней крышкой. */
-  const autoMin = Math.max(1, Math.min(160, charDim * 0.0002))
-  const autoMax = Math.max(
-    autoMin + CAD_MOUSE_LIMITS.minZoomGap + 120,
-    Math.min(CAD_MOUSE_LIMITS.maxDistanceMax, charDim * 14),
+  if (focusBox) {
+    const fs = focusBox.getSize(new THREE.Vector3())
+    focusSpan = Math.max(fs.x, fs.y, fs.z, 1)
+  }
+  const span = Math.max(focusSpan, sceneSpan * 0.35)
+  camera.near = Math.max(0.5, Math.min(span * 0.002, dist / 800))
+  camera.far = Math.max(500_000, sceneSpan * 50, dist * 12)
+  camera.updateProjectionMatrix()
+}
+
+function clampCameraToNavigationLimits() {
+  if (!camera || !controls) return
+  const dist = camera.position.distanceTo(controls.target)
+  const minD = mouseMinDistance.value
+  const maxD = mouseMaxDistance.value
+  if (dist > maxD * 1.02) {
+    const dir = camera.position.clone().sub(controls.target).normalize()
+    camera.position.copy(controls.target).add(dir.multiplyScalar(maxD * 0.98))
+    lastClipPlaneDist = -1
+  } else if (dist < minD * 0.98) {
+    const dir = camera.position.clone().sub(controls.target).normalize()
+    camera.position.copy(controls.target).add(dir.multiplyScalar(minD))
+    lastClipPlaneDist = -1
+  }
+}
+
+function applyAutoNavigationLimits() {
+  if (!autoNavLimitsEnabled.value) return
+  const sceneBox = getFullSceneBox()
+  const focusBox = getFocusedModelBox() ?? getReferenceSceneBox() ?? sceneBox
+  if (!focusBox && !sceneBox) return
+  const focusChar = boxCharDim(focusBox ?? sceneBox!)
+  const sceneChar = sceneBox ? boxCharDim(sceneBox) : focusChar
+  focusedSceneCharDim = focusChar
+  const autoMin = Math.max(focusChar * 1e-4, Math.min(focusChar * 0.002, 120))
+  const autoMax = Math.min(
+    CAD_MOUSE_LIMITS.maxDistanceMax,
+    Math.max(autoMin + CAD_MOUSE_LIMITS.minZoomGap + 80, focusChar * 14, sceneChar * 32),
   )
   mouseMinDistance.value = Number(autoMin.toFixed(1))
   mouseMaxDistance.value = Number(autoMax.toFixed(1))
   applyMouseSettings()
+  clampCameraToNavigationLimits()
+  updateCameraClipPlanes(true)
 }
 
 function applyMouseSettings() {
@@ -1057,14 +1300,116 @@ function applyModelTint() {
   })
 }
 
+/** Светло-серые дефолты GLB/вьюера — не считаем «цветом из файла». */
+function isNeutralImportedHex(hex: string): boolean {
+  const h = hex.replace(/^#/, '').toLowerCase()
+  if (
+    h === 'ffffff' ||
+    h === 'f9f9fa' ||
+    h === 'f2f4f6' ||
+    h === 'cccccc' ||
+    h === 'c0c0c0' ||
+    h === '808080' ||
+    h === 'b0b0b0'
+  ) {
+    return true
+  }
+  const c = new THREE.Color(`#${h}`)
+  const hsl = { h: 0, s: 0, l: 0 }
+  c.getHSL(hsl)
+  return hsl.s < 0.12 && hsl.l > 0.72
+}
+
+function meshPrimaryHex(obj: THREE.Mesh): string | null {
+  const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+  for (const m of mats) {
+    if ('color' in m) {
+      const c = (m as THREE.Material & { color: THREE.Color }).color
+      return `#${c.getHexString()}`
+    }
+  }
+  return null
+}
+
+function adjustPartColorForDisplay(hex: string): string {
+  const v = colorVividness.value
+  const c = new THREE.Color(hex)
+  const hsl = { h: 0, s: 0, l: 0 }
+  c.getHSL(hsl)
+  c.setHSL(hsl.h, hsl.s * (0.55 + 0.45 * v), hsl.l * (0.68 + 0.32 * v))
+  return `#${c.getHexString()}`
+}
+
+function applyHexToMesh(obj: THREE.Mesh, hex: string): void {
+  const col = new THREE.Color(adjustPartColorForDisplay(hex))
+  const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+  mats.forEach((m: THREE.Material) => {
+    if ('color' in m) {
+      const mm = m as THREE.Material & { color: THREE.Color; needsUpdate?: boolean }
+      mm.color.copy(col)
+      mm.needsUpdate = true
+    }
+  })
+}
+
 function markImportedMeshColors(root: THREE.Object3D) {
   root.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const hex = meshPrimaryHex(obj)
+    if (!hex || isNeutralImportedHex(hex)) return
+    obj.userData = { ...obj.userData, hasImportedColor: true, partColorHex: hex }
+  })
+}
+
+/** Применить partColorHex из userData (meta.json / bindPartMeta). */
+function applyUserDataPartColors(root: THREE.Object3D): number {
+  let painted = 0
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
+    const hex = normalizeHexColor(String(obj.userData?.partColorHex ?? ''))
+    if (!hex) return
+    applyHexToMesh(obj, hex)
+    obj.userData = { ...obj.userData, lockPartColor: true, hasImportedColor: true, partColorHex: hex }
+    painted += 1
+  })
+  return painted
+}
+
+/** После загрузки GLB/GLTF: meta, цвета из файла, авто-палитра по сегментам. */
+function finalizeModelPartColors(root: THREE.Object3D, partMeta?: PartColorMeta | null): void {
+  if (partMeta) {
+    const bound = bindPartMetaToMeshes(root, partMeta)
+    const painted = applyPartColorsFromMeta(root, partMeta)
+    const fromUserData = applyUserDataPartColors(root)
+    logger.info(
+      'Viewer3D',
+      `Цвета meta: привязано ${bound.mapped}/${bound.totalMeshes}, окрашено ${painted}, userData ${fromUserData}`,
+    )
+  }
+  markImportedMeshColors(root)
+  const auto = maybeAutoColorizeSegments(root)
+  if (auto.enabled) {
+    logger.info('Viewer3D', `Авто-раскраска сегментов: ${auto.painted} мешей`)
+  }
+  applyLargeAssemblyMaterialHints(root)
+}
+
+function applyLargeAssemblyMaterialHints(root: THREE.Object3D): void {
+  root.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.material) return
     const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
-    const hasAnyColor = mats.some((m: THREE.Material) => 'color' in m)
-    if (hasAnyColor) {
-      obj.userData = { ...obj.userData, hasImportedColor: true }
-    }
+    mats.forEach((m: THREE.Material) => {
+      const mm = m as THREE.MeshPhongMaterial & {
+        polygonOffset?: boolean
+        polygonOffsetFactor?: number
+        polygonOffsetUnits?: number
+      }
+      if ('polygonOffset' in mm) {
+        mm.polygonOffset = true
+        mm.polygonOffsetFactor = 1
+        mm.polygonOffsetUnits = 1
+      }
+    })
   })
 }
 
@@ -1244,13 +1589,15 @@ async function tryLoadPartMetaByBaseName(baseName: string): Promise<PartColorMet
 function applyPartColorsFromMeta(root: THREE.Object3D, meta: PartColorMeta): { painted: number; skipped: number } {
   const partById = new Map(meta.parts.map((p) => [p.partId, p]))
   const instanceById = new Map(meta.instances.map((i) => [i.instanceId, i]))
-  const bindingByNode = new Map(meta.meshBindings.map((b) => [b.meshNode, b]))
+  const bindingByNode = new Map(
+    meta.meshBindings.map((b) => [String(b.meshNode).toLowerCase(), b]),
+  )
   let painted = 0
   let skipped = 0
 
   root.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
-    const nodeName = String(obj.name || obj.parent?.name || '')
+    const nodeName = String(obj.name || obj.parent?.name || '').trim().toLowerCase()
     if (!nodeName) {
       skipped += 1
       return
@@ -1268,15 +1615,7 @@ function applyPartColorsFromMeta(root: THREE.Object3D, meta: PartColorMeta): { p
       skipped += 1
       return
     }
-    const col = new THREE.Color(hex)
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
-    mats.forEach((m: THREE.Material) => {
-      if ('color' in m) {
-        const mm = m as THREE.Material & { color: THREE.Color; needsUpdate?: boolean }
-        mm.color.copy(col)
-        mm.needsUpdate = true
-      }
-    })
+    applyHexToMesh(obj, hex)
     obj.userData = { ...obj.userData, lockPartColor: true, partColorHex: hex, partId: partId ?? null, instanceId: instance?.instanceId ?? null }
     painted += 1
   })
@@ -1288,6 +1627,28 @@ const SEGMENT_FALLBACK_PALETTE = [
   '#8d6ac7', '#6ab9c7', '#c76a9d', '#83c76a',
   '#c78f6a', '#6a72c7', '#c76a6a', '#6ac7c0',
 ]
+
+/** Свыше — не красим каждый треугольник (типичный fallback STEP без XCAF). */
+const AUTO_COLORIZE_MAX_MESHES = 250
+
+const AUTO_COLORIZE_SKIP_NODE_NAMES = new Set(['', 'scene', 'root', 'nodes', 'meshes', 'object3d', 'group'])
+
+function meshSegmentColorKey(obj: THREE.Mesh): string {
+  const parts: string[] = []
+  let cur: THREE.Object3D | null = obj
+  while (cur) {
+    const n = String(cur.name || '').trim()
+    if (n && !AUTO_COLORIZE_SKIP_NODE_NAMES.has(n.toLowerCase())) parts.unshift(n)
+    cur = cur.parent
+  }
+  if (parts.length) return parts.join('/')
+  const parent = obj.parent
+  if (parent) {
+    const idx = parent.children.indexOf(obj)
+    return `mesh:${parent.uuid.slice(0, 8)}:${idx}`
+  }
+  return obj.uuid
+}
 
 function hashStringToIndex(text: string, modulo: number): number {
   let h = 0
@@ -1312,31 +1673,33 @@ function collectMeshHexColors(root: THREE.Object3D): string[] {
 
 function maybeAutoColorizeSegments(root: THREE.Object3D): { painted: number; skipped: number; enabled: boolean } {
   if (!autoColorizeSegments.value || !preservePartColors.value) return { painted: 0, skipped: 0, enabled: false }
-  const existing = collectMeshHexColors(root)
+  const existing = collectMeshHexColors(root).filter((c) => !isNeutralImportedHex(c))
   const unique = new Set(existing.map((c) => c.toLowerCase()))
   if (unique.size > 3) return { painted: 0, skipped: 0, enabled: false }
+
+  let meshCount = 0
+  root.traverse((obj: THREE.Object3D) => {
+    if (obj instanceof THREE.Mesh) meshCount += 1
+  })
+  if (meshCount > AUTO_COLORIZE_MAX_MESHES) {
+    logger.info(
+      'Viewer3D',
+      `Авто-раскраска пропущена: ${meshCount} мешей (лимит ${AUTO_COLORIZE_MAX_MESHES}). Для цветов нужен XCAF STEP или meta.json`,
+    )
+    return { painted: 0, skipped: meshCount, enabled: false }
+  }
+
   let painted = 0
   let skipped = 0
   root.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
-    const key = String(obj.parent?.name || obj.name || `mesh_${painted + skipped}`)
-    const idx = hashStringToIndex(key, SEGMENT_FALLBACK_PALETTE.length)
-    const colorHex = SEGMENT_FALLBACK_PALETTE[idx]
-    const col = new THREE.Color(colorHex)
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
-    let hasColor = false
-    mats.forEach((m: THREE.Material) => {
-      if ('color' in m) {
-        hasColor = true
-        const mm = m as THREE.Material & { color: THREE.Color; needsUpdate?: boolean }
-        mm.color.copy(col)
-        mm.needsUpdate = true
-      }
-    })
-    if (!hasColor) {
+    if (obj.userData?.lockPartColor || obj.userData?.hasImportedColor) {
       skipped += 1
       return
     }
+    const key = meshSegmentColorKey(obj)
+    const colorHex = SEGMENT_FALLBACK_PALETTE[hashStringToIndex(key, SEGMENT_FALLBACK_PALETTE.length)]
+    applyHexToMesh(obj, colorHex)
     obj.userData = { ...obj.userData, lockPartColor: true, partColorHex: colorHex, autoSegmentColor: true }
     painted += 1
   })
@@ -1353,24 +1716,41 @@ function cloneAsUnlitMaterial(mat: THREE.Material): THREE.Material {
   })
 }
 
+function disposeThreeMaterial(m: THREE.Material | THREE.Material[] | undefined | null) {
+  if (!m) return
+  if (Array.isArray(m)) m.forEach((mat) => mat.dispose())
+  else m.dispose()
+}
+
+function disposeObject3DResources(root: THREE.Object3D) {
+  root.traverse((obj) => {
+    if (obj instanceof THREE.Mesh || obj instanceof THREE.Line || obj instanceof THREE.LineSegments) {
+      obj.geometry?.dispose()
+      disposeThreeMaterial(obj.material as THREE.Material | THREE.Material[] | undefined)
+    }
+  })
+}
+
 function applySceneLightingForShadingMode() {
   const lit = shadingMode.value === 'lit'
   const preset = lightPreset.value
   const base =
     preset === 'engineering'
-      ? { ambient: 0.2, hemi: 0.32, key: 1.28, fillA: 0.16, fillB: 0.12, fillC: 0.09, rimA: 0.42, rimB: 0.34, exposure: 1.24 }
+      ? { ambient: 0.18, hemi: 0.28, key: 0.92, fillA: 0.11, fillB: 0.08, fillC: 0.06, rimA: 0.2, rimB: 0.14, exposure: 0.96 }
       : { ambient: 0.25, hemi: 0.38, key: 0.82, fillA: 0.24, fillB: 0.18, fillC: 0.13, rimA: 0.16, rimB: 0.12, exposure: 1.12 }
   const tone = 0.78 + (tintBrightness.value - TINT_BRIGHTNESS_MIN) / (TINT_BRIGHTNESS_MAX - TINT_BRIGHTNESS_MIN) * 0.62
   const toneSafe = Math.min(1.55, Math.max(0.7, tone))
   const unl = lit ? 1 : 1.22
+  const fillMul = extraFillLightsEnabled.value ? 1 : 0
+  const rimMul = extraRimLightsEnabled.value ? 1 : 0
   if (ambientLight) ambientLight.intensity = base.ambient * unl * toneSafe
   if (hemiLight) hemiLight.intensity = base.hemi * unl * toneSafe
   if (keyLight) keyLight.intensity = base.key * (lit ? 1 : 0.9) * toneSafe
-  if (fillLightA) fillLightA.intensity = base.fillA * unl * toneSafe
-  if (fillLightB) fillLightB.intensity = base.fillB * unl * toneSafe
-  if (fillLightC) fillLightC.intensity = base.fillC * unl * toneSafe
-  if (rimLightA) rimLightA.intensity = base.rimA * (lit ? 1 : 0.9) * toneSafe
-  if (rimLightB) rimLightB.intensity = base.rimB * (lit ? 1 : 0.9) * toneSafe
+  if (fillLightA) fillLightA.intensity = base.fillA * unl * toneSafe * fillMul
+  if (fillLightB) fillLightB.intensity = base.fillB * unl * toneSafe * fillMul
+  if (fillLightC) fillLightC.intensity = base.fillC * unl * toneSafe * fillMul
+  if (rimLightA) rimLightA.intensity = base.rimA * (lit ? 1 : 0.9) * toneSafe * rimMul
+  if (rimLightB) rimLightB.intensity = base.rimB * (lit ? 1 : 0.9) * toneSafe * rimMul
   if (renderer) renderer.toneMappingExposure = base.exposure * (0.88 + toneSafe * 0.3)
   if (renderer) renderer.shadowMap.enabled = false
 }
@@ -1387,22 +1767,32 @@ function setMeshGroupShadowState(enabled: boolean) {
 
 function applyShadingMode() {
   if (!meshGroup) return
+  restoreWireframeFaceGhost()
   meshGroup.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh) || !obj.material) return
     if (shadingMode.value === 'unlit') {
       if (!originalMaterials.has(obj)) originalMaterials.set(obj, obj.material)
       const source = originalMaterials.get(obj) ?? obj.material
+      const prev = obj.material
       obj.material = Array.isArray(source)
         ? source.map((m) => cloneAsUnlitMaterial(m))
         : cloneAsUnlitMaterial(source)
+      if (prev !== source) disposeThreeMaterial(prev)
       return
     }
     const original = originalMaterials.get(obj)
-    if (original) obj.material = original
+    if (original) {
+      const prev = obj.material
+      if (prev !== original) disposeThreeMaterial(prev)
+      obj.material = original
+      originalMaterials.delete(obj)
+    }
   })
   applyModelTint()
   applySceneLightingForShadingMode()
   setMeshGroupShadowState(false)
+  syncWireframeEdges()
+  applyUserOpacityToMeshGroup()
 }
 
 function onShadingModeChange(ev: Event) {
@@ -1619,12 +2009,13 @@ function setHiddenOutlineForObject(modelId: string, obj: THREE.Object3D, hidden:
   hiddenOutlineGroup.add(helper)
 }
 
-function syncHiddenOutlinesForModel(modelId: string) {
+/** Убирает контуры скрытых деталей (глаз в дереве — полное скрытие без bbox). */
+function clearHiddenOutlinesForModel(modelId: string) {
   const group = modelGroupsById.get(modelId)
   if (!group) return
   group.traverse((obj: THREE.Object3D) => {
     if (obj === group || !(obj instanceof THREE.Mesh)) return
-    setHiddenOutlineForObject(modelId, obj, !obj.visible)
+    setHiddenOutlineForObject(modelId, obj, false)
   })
 }
 
@@ -1650,7 +2041,7 @@ function removeOverlayForModel(modelId: string, dispose = false) {
 
 function onAutoNavLimitsChange() {
   if (!autoNavLimitsEnabled.value || !meshGroup || meshGroup.children.length === 0) return
-  applyAutoNavigationLimits(new THREE.Box3().setFromObject(meshGroup))
+  applyAutoNavigationLimits()
 }
 
 function getAssemblyModelBox(modelId: string): THREE.Box3 | null {
@@ -1714,6 +2105,122 @@ function matePlaneDeltaVector(
   return nd.clone().multiplyScalar(distanceMm - sep)
 }
 
+function worldCoordPlaneDefinition(id: WorldCoordPlaneId): { normal: THREE.Vector3; label: string } {
+  switch (id) {
+    case 'xy_neg':
+      return { normal: new THREE.Vector3(0, 0, -1), label: 'XY (−Z)' }
+    case 'xz_pos':
+      return { normal: new THREE.Vector3(0, 1, 0), label: 'XZ (+Y)' }
+    case 'xz_neg':
+      return { normal: new THREE.Vector3(0, -1, 0), label: 'XZ (−Y)' }
+    case 'yz_pos':
+      return { normal: new THREE.Vector3(1, 0, 0), label: 'YZ (+X)' }
+    case 'yz_neg':
+      return { normal: new THREE.Vector3(-1, 0, 0), label: 'YZ (−X)' }
+    default:
+      return { normal: new THREE.Vector3(0, 0, 1), label: 'XY (+Z)' }
+  }
+}
+
+const WORLD_COORD_PLANE_ORIGIN = new THREE.Vector3(0, 0, 0)
+
+function rotateGroupAroundLocalPivot(group: THREE.Group, pivotLocal: THREE.Vector3, q: THREE.Quaternion) {
+  group.position.sub(pivotLocal)
+  group.position.applyQuaternion(q)
+  group.position.add(pivotLocal)
+  group.quaternion.premultiply(q)
+  group.updateMatrixWorld(true)
+}
+
+function worldNormalToModelLocal(group: THREE.Group, normalWorld: THREE.Vector3): THREE.Vector3 {
+  const inv = new THREE.Matrix3().getNormalMatrix(group.matrixWorld)
+  return normalWorld.clone().applyMatrix3(inv).normalize()
+}
+
+function updatePlaneSelectionNormalToWorld(
+  pick: AssemblyPlaneSelection,
+  group: THREE.Group,
+  normalWorld: THREE.Vector3,
+) {
+  pick.normal.copy(worldNormalToModelLocal(group, normalWorld))
+}
+
+/** Повернуть модель: нормаль грани → целевая (кратчайший поворот, не только при уже параллельных). */
+function alignSourcePlaneNormalToWorld(
+  sourceGroup: THREE.Group,
+  src: AssemblyPlaneSelection,
+  targetNormalWorld: THREE.Vector3,
+  preferFlip = false,
+): void {
+  const ns = src.normal.clone().transformDirection(sourceGroup.matrixWorld).normalize()
+  let nt = targetNormalWorld.clone().normalize()
+  if (preferFlip) nt.negate()
+  else if (ns.dot(nt) < 0) nt.negate()
+  const q = new THREE.Quaternion()
+  const d = ns.dot(nt)
+  if (d < -0.999) {
+    const aux = Math.abs(ns.x) < 0.85 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)
+    const ax = new THREE.Vector3().crossVectors(ns, aux).normalize()
+    q.setFromAxisAngle(ax, Math.PI)
+  } else {
+    q.setFromUnitVectors(ns, nt)
+  }
+  rotateGroupAroundLocalPivot(sourceGroup, src.localPoint, q)
+  updatePlaneSelectionNormalToWorld(src, sourceGroup, nt)
+}
+
+function matePlaneToWorldDeltaVector(
+  sourceGroup: THREE.Group,
+  src: AssemblyPlaneSelection,
+  worldNormal: THREE.Vector3,
+  distanceMm: number,
+): THREE.Vector3 | null {
+  const nd = worldNormal.clone().normalize()
+  const ns = src.normal.clone().transformDirection(sourceGroup.matrixWorld).normalize()
+  if (Math.abs(nd.dot(ns)) < 0.5) return null
+  const pwSrc = sourceGroup.localToWorld(src.localPoint.clone())
+  const sep = pwSrc.clone().sub(WORLD_COORD_PLANE_ORIGIN).dot(nd)
+  return nd.clone().multiplyScalar(distanceMm - sep)
+}
+
+function applyCoordPlaneMateToGroup(
+  sourceGroup: THREE.Group,
+  src: AssemblyPlaneSelection,
+  worldPlaneId: WorldCoordPlaneId,
+  distanceMm: number,
+  flipNormal: boolean,
+): { ok: boolean; message: string; deltaLen: number } {
+  if (src.surfaceKind === 'cylinder') {
+    return {
+      ok: false,
+      message:
+        'Выбрана цилиндрическая поверхность. Для координат используйте плоскую грань; сопряжение осей цилиндров — отдельный режим (скоро).',
+      deltaLen: 0,
+    }
+  }
+  if (src.surfaceKind && src.surfaceKind !== 'plane') {
+    return { ok: false, message: 'Нужна плоская грань модели (не кривая поверхность).', deltaLen: 0 }
+  }
+  let { normal: worldN, label } = worldCoordPlaneDefinition(worldPlaneId)
+  if (flipNormal) worldN = worldN.clone().multiplyScalar(-1)
+  alignSourcePlaneNormalToWorld(sourceGroup, src, worldN, flipNormal)
+  const dv = matePlaneToWorldDeltaVector(sourceGroup, src, worldN, distanceMm)
+  if (!dv) {
+    return { ok: false, message: 'Не удалось совместить плоскости после поворота.', deltaLen: 0 }
+  }
+  sourceGroup.position.add(dv)
+  return {
+    ok: true,
+    message: `Совмещено с ${label}: поворот + сдвиг ${dv.length().toFixed(2)} мм`,
+    deltaLen: dv.length(),
+  }
+}
+
+function solveCoordStoredMate(sourceGroup: THREE.Group, m: Extract<StoredAssemblyMate, { type: 'coord' }>) {
+  const src = storedToAssemblyPlane(m.sourcePlane)
+  applyCoordPlaneMateToGroup(sourceGroup, src, m.worldPlane, m.distanceMm, m.flipNormal)
+}
+
 /** Симметрия по ширине: середина между двумя плоскостями детали совпадает с серединой между двумя плоскостями базы. */
 function mateSymmetricDeltaVector(
   sourceGroup: THREE.Group,
@@ -1754,6 +2261,12 @@ function refreshAfterAssemblyMove() {
 }
 
 function solveStoredMate(m: StoredAssemblyMate): void {
+  if (m.type === 'coord') {
+    const sourceGroup = modelGroupsById.get(m.sourceId)
+    if (!sourceGroup || !sourceGroup.visible) return
+    solveCoordStoredMate(sourceGroup, m)
+    return
+  }
   const sourceGroup = modelGroupsById.get(m.sourceId)
   const targetGroup = modelGroupsById.get(m.targetId)
   if (!sourceGroup || !targetGroup || !sourceGroup.visible || !targetGroup.visible) return
@@ -1791,7 +2304,12 @@ function reapplyAllAssemblyMates(): void {
 function assemblyMateTypeLabel(m: StoredAssemblyMate): string {
   if (m.type === 'plane') return 'Плоскость'
   if (m.type === 'distance') return 'Расстояние'
+  if (m.type === 'coord') return 'Координаты'
   return 'Симметрия'
+}
+
+function worldCoordPlaneOptionLabel(id: WorldCoordPlaneId): string {
+  return WORLD_COORD_PLANE_OPTIONS.find((o) => o.id === id)?.label ?? id
 }
 
 function removeAssemblyMate(id: string) {
@@ -1901,14 +2419,119 @@ function inferCadLinearPickTarget(): Exclude<CadLinearPickTarget, null> | null {
   return null
 }
 
-function firstMeshFaceHit(hits: THREE.Intersection[]): THREE.Intersection | null {
-  for (const h of hits) {
-    if (!(h.object instanceof THREE.Mesh)) continue
-    if (!findWrapperGroup(h.object)) continue
-    if (!h.face) continue
-    return h
+function meshFromIntersectObject(obj: THREE.Object3D): THREE.Mesh | null {
+  let o: THREE.Object3D | null = obj
+  while (o) {
+    if (o instanceof THREE.Mesh) return o
+    o = o.parent
   }
   return null
+}
+
+function isObjectWorldVisible(obj: THREE.Object3D): boolean {
+  let o: THREE.Object3D | null = obj
+  while (o) {
+    if (!o.visible) return false
+    o = o.parent
+  }
+  return true
+}
+
+function isMeshRayPickable(mesh: THREE.Mesh): boolean {
+  if (!isObjectWorldVisible(mesh)) return false
+  if (mesh.userData?.wireframeEdge) return false
+  if (!findWrapperGroup(mesh)) return false
+  const iso = partTreeIsolateState.value
+  if (iso) {
+    const wrapper = findWrapperGroup(mesh)
+    const mid = String(wrapper?.userData?.modelId ?? '')
+    if (mid !== iso.modelId) return false
+    if (!iso.keepIds.has(mesh.uuid)) return false
+  }
+  return true
+}
+
+function filterPickableHits(hits: THREE.Intersection[]): THREE.Intersection[] {
+  return hits.filter((h) => {
+    if (h.object.userData?.wireframeEdge) return false
+    const mesh = meshFromIntersectObject(h.object)
+    if (!mesh || !h.face) return false
+    return isMeshRayPickable(mesh)
+  })
+}
+
+function intersectPickableMeshes(raycaster: THREE.Raycaster): THREE.Intersection[] {
+  if (!meshGroup) return []
+  return filterPickableHits(raycaster.intersectObject(meshGroup, true))
+}
+
+function blockMeshRaycast(mesh: THREE.Mesh) {
+  if (!meshRaycastBackup.has(mesh)) meshRaycastBackup.set(mesh, mesh.raycast.bind(mesh))
+  mesh.raycast = noopRaycast
+}
+
+function restoreMeshRaycast(mesh: THREE.Mesh) {
+  const saved = meshRaycastBackup.get(mesh)
+  if (saved) {
+    mesh.raycast = saved
+    meshRaycastBackup.delete(mesh)
+  }
+}
+
+function applyIsolateRaycastBlocks(modelId: string, keepIds: Set<string>) {
+  const g = modelGroupsById.get(modelId)
+  if (!g) return
+  g.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    if (keepIds.has(obj.uuid)) restoreMeshRaycast(obj)
+    else blockMeshRaycast(obj)
+  })
+}
+
+/** Каркас, ghost-материалы и raycast-блокировки для одной модели. */
+function purgeModelAuxiliaryState(group: THREE.Group) {
+  removeWireframeEdgesFromObject(group)
+  group.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    restoreMeshRaycast(obj)
+    if (wireframeFaceMatBackup.has(obj)) setMeshWireframeFaceGhost(obj, false)
+    if (dimmedMeshBackups.has(obj)) {
+      const backup = dimmedMeshBackups.get(obj)!
+      obj.material = backup.material
+      obj.visible = backup.visible
+      dimmedMeshBackups.delete(obj)
+    }
+  })
+}
+
+function disposeAllLoadedModels() {
+  restorePartTreeIsolate()
+  clearPartFocusVisuals()
+  wireframeFaceMatBackup.clear()
+  meshRaycastBackup.clear()
+  const ids = [...modelGroupsById.keys()]
+  for (const id of ids) removeModel(id)
+}
+
+/** Первое попадание в грань детали (игнорируя линии каркаса и скрытые меши). */
+function pickSolidSurfaceHit(hits: THREE.Intersection[]): THREE.Intersection | null {
+  for (const h of filterPickableHits(hits)) {
+    const mesh = meshFromIntersectObject(h.object)
+    if (!mesh || !h.face) continue
+    return { ...h, object: mesh }
+  }
+  return null
+}
+
+/** Первое попадание в деталь (игнорируя линии каркаса). */
+function firstSolidPartHit(hits: THREE.Intersection[]): { hit: THREE.Intersection; mesh: THREE.Mesh } | null {
+  const hit = pickSolidSurfaceHit(hits)
+  if (!hit) return null
+  return { hit, mesh: hit.object as THREE.Mesh }
+}
+
+function firstMeshFaceHit(hits: THREE.Intersection[]): THREE.Intersection | null {
+  return pickSolidSurfaceHit(hits)
 }
 
 function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
@@ -1952,6 +2575,10 @@ function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
 function inferAutoAssemblyPickTarget(modelId: string): Exclude<AssemblyPickTarget, null> | null {
   const srcId = assemblySourceModelId.value
   const tgtId = assemblyTargetModelId.value
+  if (assemblyMateType.value === 'coord') {
+    if (!srcId || modelId !== srcId) return null
+    return 'source'
+  }
   if (!srcId || !tgtId) return null
   if (assemblyMateType.value === 'symmetric') {
     if (modelId === tgtId) {
@@ -1980,22 +2607,18 @@ function inferAutoAssemblyPickTarget(modelId: string): Exclude<AssemblyPickTarge
 function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
   const wrapper = findWrapperGroup(hit.object)
   const modelId = String(wrapper?.userData?.modelId ?? '')
-  if (!modelId) {
+  if (!wrapper || !modelId) {
     assemblyStatus.value = 'Не удалось определить модель для выбранной грани.'
     assemblyPickTarget.value = null
     return
   }
-  const face = hit.face
-  if (!face) {
-    assemblyStatus.value = 'Грань не определена. Попробуйте кликнуть в другое место.'
+  const built = buildAssemblyPlaneFromHit(hit, wrapper, modelId)
+  if (!built.pick) {
+    assemblyStatus.value = built.error ?? 'Не удалось выбрать грань.'
     assemblyPickTarget.value = null
     return
   }
-  const normal = face.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
-  const localPoint = wrapper.worldToLocal(hit.point.clone())
-  const tri = buildWorldFaceTriangleFromHit(hit)
-  const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
-  if (tri) pick.previewGeometry = tri
+  const pick = built.pick
   const t = assemblyPickTarget.value
   if (!t) {
     assemblyStatus.value = 'Выберите поле плоскости в панели сборки или кликните по грани (автовыбор).'
@@ -2003,7 +2626,13 @@ function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
   }
   const srcId = assemblySourceModelId.value
   const tgtId = assemblyTargetModelId.value
-  if (t === 'source' || t === 'symPart1' || t === 'symPart2') {
+  if (assemblyMateType.value === 'coord') {
+    if (!srcId || modelId !== srcId) {
+      assemblyStatus.value = 'Координаты: кликните по грани модели-источника.'
+      assemblyPickTarget.value = null
+      return
+    }
+  } else if (t === 'source' || t === 'symPart1' || t === 'symPart2') {
     if (!srcId || modelId !== srcId) {
       assemblyStatus.value = 'Кликните по грани модели-источника (модель 1).'
       assemblyPickTarget.value = null
@@ -2050,20 +2679,65 @@ function pickAssemblyPlaneFromHit(hit: THREE.Intersection) {
 function applyAssemblyMate() {
   const sourceId = assemblySourceModelId.value
   const targetId = assemblyTargetModelId.value
-  if (!sourceId || !targetId) {
-    assemblyStatus.value = 'Выберите обе модели в списках «Источник» и «Опорная».'
+  if (!sourceId) {
+    assemblyStatus.value = 'Выберите модель-источник.'
+    return
+  }
+  const sourceGroup = modelGroupsById.get(sourceId)
+  const sourceBox = getAssemblyModelBox(sourceId)
+  if (!sourceGroup || !sourceBox) {
+    assemblyStatus.value = 'Модель-источник не в сцене или не имеет геометрии.'
+    return
+  }
+
+  if (assemblyMateType.value === 'coord') {
+    const srcPlane = assemblySourcePlane.value
+    if (!srcPlane || srcPlane.modelId !== sourceId) {
+      assemblyStatus.value = 'Выберите плоскость на модели (кнопка «Выбрать» и клик по грани).'
+      return
+    }
+    const distance = Math.max(0, Number(assemblyDistanceMm.value) || 0)
+    const result = applyCoordPlaneMateToGroup(
+      sourceGroup,
+      srcPlane,
+      assemblyCoordWorldPlane.value,
+      distance,
+      assemblyCoordFlipNormal.value,
+    )
+    if (!result.ok) {
+      assemblyStatus.value = result.message
+      return
+    }
+    assemblyMates.value = [
+      ...assemblyMates.value,
+      {
+        id: newAssemblyMateId(),
+        type: 'coord',
+        sourceId,
+        sourcePlane: persistAssemblyPlane(srcPlane),
+        worldPlane: assemblyCoordWorldPlane.value,
+        distanceMm: distance,
+        flipNormal: assemblyCoordFlipNormal.value,
+      },
+    ]
+    refreshAfterAssemblyMove()
+    assemblyStatus.value = `Сопряжение зафиксировано: ${result.message}. Для выравнивания по другой оси добавьте второе сопряжение к другой грани.`
+    clearAssemblyPickStateAfterMateApply()
+    return
+  }
+
+  if (!targetId) {
+    assemblyStatus.value = 'Выберите опорную модель.'
     return
   }
   if (sourceId === targetId) {
     assemblyStatus.value = 'Источник и опорная модель должны отличаться.'
     return
   }
-  const sourceGroup = modelGroupsById.get(sourceId)
   const targetGroup = modelGroupsById.get(targetId)
-  const sourceBox = getAssemblyModelBox(sourceId)
   const targetBox = getAssemblyModelBox(targetId)
-  if (!sourceGroup || !targetGroup || !sourceBox || !targetBox) {
-    assemblyStatus.value = 'Одна из моделей не в сцене или не имеет геометрии.'
+  if (!targetGroup || !targetBox) {
+    assemblyStatus.value = 'Опорная модель не в сцене или не имеет геометрии.'
     return
   }
   const axis = assemblyAxis.value
@@ -2117,11 +2791,14 @@ function applyAssemblyMate() {
       return
     }
     const distance = assemblyMateType.value === 'distance' ? Math.max(0, Number(assemblyDistanceMm.value) || 0) : 0
+    const nwDst = dstPlane.normal.clone().transformDirection(targetGroup.matrixWorld).normalize()
+    alignSourcePlaneNormalToWorld(sourceGroup, srcPlane, nwDst, false)
     const dv = matePlaneDeltaVector(sourceGroup, targetGroup, srcPlane, dstPlane, distance)
     if (!dv) {
-      assemblyStatus.value = 'Плоскости не параллельны или слишком наклонены — выберите другие грани.'
+      assemblyStatus.value = 'Не удалось совместить плоскости после поворота — проверьте выбор граней.'
       return
     }
+    updatePlaneSelectionNormalToWorld(srcPlane, sourceGroup, nwDst)
     sourceGroup.position.add(dv)
     if (assemblyMateType.value === 'distance') {
       assemblyMates.value = [
@@ -2186,6 +2863,114 @@ function onTintBrightnessWheel(ev: WheelEvent) {
   applyModelTint()
   applySceneLightingForShadingMode()
 }
+
+function clampColorVividness(v: number): number {
+  return Math.min(COLOR_VIVIDNESS_MAX, Math.max(COLOR_VIVIDNESS_MIN, v))
+}
+
+function onColorVividnessInput(ev: Event) {
+  const val = Number((ev.target as HTMLInputElement).value)
+  if (!Number.isFinite(val)) return
+  colorVividness.value = clampColorVividness(val)
+  refreshImportedPartColors()
+}
+
+function refreshImportedPartColors() {
+  if (!meshGroup) return
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const hex = obj.userData?.partColorHex as string | undefined
+    if (hex) applyHexToMesh(obj, hex)
+  })
+}
+
+function applySceneBackground() {
+  if (!scene) return
+  scene.background = new THREE.Color(sceneBackgroundHex.value)
+}
+
+function onSceneBackgroundInput(ev: Event) {
+  const val = (ev.target as HTMLInputElement).value
+  if (!val) return
+  sceneBackgroundHex.value = val
+  applySceneBackground()
+}
+
+function onExtraLightsChange() {
+  applySceneLightingForShadingMode()
+}
+
+function openSettingsModal() {
+  settingsModalOpen.value = true
+}
+
+function closeSettingsModal() {
+  settingsModalOpen.value = false
+}
+
+function ensureModelUnitsMillimeters(wrapper: THREE.Group): void {
+  if (wrapper.userData?.unitsNormalized === 'mm') return
+  const box = new THREE.Box3().setFromObject(wrapper)
+  if (box.isEmpty()) return
+  const size = box.getSize(new THREE.Vector3())
+  const maxAxis = Math.max(size.x, size.y, size.z)
+  if (maxAxis >= METERS_LIKELY_MAX_AXIS) {
+    wrapper.userData.unitsNormalized = 'mm'
+    return
+  }
+  wrapper.scale.multiplyScalar(METERS_TO_MM_SCALE)
+  wrapper.userData.unitsNormalized = 'mm'
+  wrapper.userData.unitScaleFromMeters = METERS_TO_MM_SCALE
+}
+
+function getReferenceSceneBox(): THREE.Box3 | null {
+  if (focusedModelId.value) {
+    const g = modelGroupsById.get(focusedModelId.value)
+    if (g) {
+      const b = new THREE.Box3().setFromObject(g)
+      if (!b.isEmpty()) return b
+    }
+  }
+  for (const m of loadedModels.value) {
+    if (!m.inScene) continue
+    const g = modelGroupsById.get(m.id)
+    if (!g) continue
+    const b = new THREE.Box3().setFromObject(g)
+    if (!b.isEmpty()) return b
+  }
+  if (meshGroup?.children.length) {
+    const b = new THREE.Box3().setFromObject(meshGroup)
+    if (!b.isEmpty()) return b
+  }
+  return null
+}
+
+function refreshScenePresentationFromReference() {
+  const refBox = getReferenceSceneBox()
+  const sceneBox = getFullSceneBox()
+  const sizingBox = sceneBox ?? refBox
+  if (!sizingBox) return
+  const size = sizingBox.getSize(new THREE.Vector3())
+  loadedSceneCharDim = Math.max(size.x, size.y, size.z, 1)
+  updateGroundGrid(sizingBox)
+  updateSceneLighting(refBox ?? sizingBox)
+  syncWorldCoordSystemGroup()
+}
+
+function applyNavigationForFocusedModel() {
+  applyAutoNavigationLimits()
+}
+
+watch(focusedModelId, (id) => {
+  if (id) expandedModelIds.value = { ...expandedModelIds.value, [id]: true }
+  if (!scene) return
+  refreshScenePresentationFromReference()
+  applyNavigationForFocusedModel()
+})
+
+watch(colorVividness, () => {
+  refreshImportedPartColors()
+})
 
 function calculateSceneMetrics(): { areaMm2: number; volumeMm3: number; triangles: number } {
   if (!meshGroup) return { areaMm2: 0, volumeMm3: 0, triangles: 0 }
@@ -2691,15 +3476,15 @@ function createMeasurementTextSprite(text: string, color = '#eaf2ff'): THREE.Spr
   tex.minFilter = THREE.LinearFilter
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: true })
   const sprite = new THREE.Sprite(mat)
-  const scale = Math.max(8, dimFontSizeMm.value)
+  const scale = Math.max(4, dimFontSizeMm.value)
   sprite.scale.set(scale * 1.85, scale, 1)
   return sprite
 }
 
-function adaptiveMeasurementScale(worldPoint: THREE.Vector3): number {
-  if (!camera) return 1
-  const d = camera.position.distanceTo(worldPoint)
-  return Math.max(0.7, Math.min(3.2, d / 900))
+function adaptiveMeasurementScale(_worldPoint: THREE.Vector3): number {
+  const base = Math.max(4, dimFontSizeMm.value)
+  const targetH = Math.max(loadedSceneCharDim * 0.014, 0.35)
+  return Math.max(0.2, Math.min(1.4, targetH / base))
 }
 
 function orientOffsetDirForScreen(dir: THREE.Vector3, anchor: THREE.Vector3): THREE.Vector3 {
@@ -2872,7 +3657,7 @@ function rebuildSavedMeasurementsVisuals() {
       addGostArrowHead(savedMeasurementsGroup, bProj, aProj.clone().sub(bProj), DIM_GOST_COLOR, arrow, row.id)
       const mid = aProj.clone().add(bProj).multiplyScalar(0.5)
       const t = createMeasurementTextSprite(measurementValueText(row))
-      t.scale.multiplyScalar(scale * 2)
+      t.scale.multiplyScalar(scale)
       t.userData.measurementId = row.id
       t.position.copy(mid)
       savedMeasurementsGroup.add(t)
@@ -2912,13 +3697,17 @@ function updateGroundGrid(box?: THREE.Box3) {
   }
   if (!showGroundGrid.value) return
 
-  const sizeVec = box ? box.getSize(new THREE.Vector3()) : new THREE.Vector3(2000, 2000, 2000)
-  const maxDim = Math.max(sizeVec.x, sizeVec.y, sizeVec.z)
-  const gridSize = Math.max(1000, Math.ceil(maxDim * 1.6 / 100) * 100)
-  const divisions = Math.min(100, Math.max(20, Math.round(gridSize / 100)))
-  const y = box ? box.min.y : 0
+  const refBox = box ?? getReferenceSceneBox()
+  if (!refBox) return
+  const sizeVec = refBox.getSize(new THREE.Vector3())
+  const maxDim = Math.max(sizeVec.x, sizeVec.y, sizeVec.z, 1)
+  const center = refBox.getCenter(new THREE.Vector3())
+  const gridSize = Math.min(Math.max(2000, maxDim * 2.2), 50000)
+  const step = Math.max(200, Math.round(gridSize / 40 / 100) * 100)
+  const divisions = Math.min(60, Math.max(8, Math.round(gridSize / step)))
+  const y = refBox.min.y
   groundGrid = new THREE.GridHelper(gridSize, divisions, 0x9aa7bb, 0xd7dee8)
-  groundGrid.position.set(0, y, 0)
+  groundGrid.position.set(center.x, y, center.z)
   ;(groundGrid.material as THREE.Material).transparent = true
   ;(groundGrid.material as THREE.Material).opacity = 0.45
   scene.add(groundGrid)
@@ -2977,7 +3766,7 @@ function initScene() {
   if (!containerRef.value) return
 
   scene = new THREE.Scene()
-  scene.background = new THREE.Color(0xffffff)
+  scene.background = new THREE.Color(sceneBackgroundHex.value)
 
   camera = new THREE.PerspectiveCamera(
     50,
@@ -2987,7 +3776,7 @@ function initScene() {
   )
   camera.position.set(500, 400, 500)
 
-  renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true })
+  renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, logarithmicDepthBuffer: true })
   renderer.setSize(containerRef.value.clientWidth, containerRef.value.clientHeight)
   idlePixelRatio = Math.min(window.devicePixelRatio, 2)
   renderer.setPixelRatio(idlePixelRatio)
@@ -3039,6 +3828,9 @@ function initScene() {
   scene.add(meshGroup)
   hiddenOutlineGroup = new THREE.Group()
   scene.add(hiddenOutlineGroup)
+  partFocusEdgeGroup = new THREE.Group()
+  partFocusEdgeGroup.name = 'partFocusEdges'
+  scene.add(partFocusEdgeGroup)
   overlayGroup = new THREE.Group()
   overlayGroup.visible = overlayEnabled.value
   scene.add(overlayGroup)
@@ -3063,6 +3855,7 @@ function initScene() {
   const axes = new THREE.AxesHelper(axesSize)
   axesHelper.add(axes)
   scene.add(axesHelper)
+  syncWorldCoordSystemGroup()
   updateGroundGrid()
 
   raycaster = new THREE.Raycaster()
@@ -3128,15 +3921,16 @@ function initScene() {
       if (shouldUpdateHover) {
         const rect = renderer.domElement.getBoundingClientRect()
         raycaster.setFromCamera(mouse, camera)
-        hits = raycaster.intersectObject(meshGroup, true)
+        hits = intersectPickableMeshes(raycaster)
         while (highlightGroup.children.length) {
           const c = highlightGroup.children[0]
           highlightGroup.remove(c)
           if ('geometry' in c && c.geometry) c.geometry.dispose()
           if ('material' in c && c.material) (c.material as THREE.Material).dispose()
         }
-        if (hits.length > 0) {
-        const hit = hits[0]
+        const hoverHit = pickSolidSurfaceHit(hits)
+        if (hoverHit) {
+        const hit = hoverHit
         const mesh = hit.object as THREE.Mesh
         const face = hit.face!
         const pos = mesh.geometry.attributes.position
@@ -3263,15 +4057,6 @@ function initScene() {
               )
               highlightGroup.add(circleLine)
             }
-          }
-
-          const closest = getClosestSnapPoint(candidates, camera, mouse)
-          if (closest !== null) {
-            const sphereGeom = new THREE.SphereGeometry(2, 12, 10)
-            const sphereMat = new THREE.MeshBasicMaterial({ color: 0xffff00 })
-            const sphereMesh = new THREE.Mesh(sphereGeom, sphereMat)
-            sphereMesh.position.copy(closest)
-            highlightGroup.add(sphereMesh)
           }
 
           if (needsHoleAnalysis && holeInfo && hoverTooltipEl) {
@@ -3507,15 +4292,15 @@ function onResize() {
   renderer.setPixelRatio(isCameraInteracting ? Math.min(INTERACTION_PIXEL_RATIO, idlePixelRatio) : idlePixelRatio)
   renderer.setSize(w, h)
   controls?.handleResize()
-  clampFloatingPanelsToViewport()
 }
 
 function centerModel(box: THREE.Box3) {
-  applyAutoNavigationLimits(box)
+  applyAutoNavigationLimits()
   updateSceneLighting(box)
   const center = box.getCenter(new THREE.Vector3())
   const size = box.getSize(new THREE.Vector3())
   const maxDim = Math.max(size.x, size.y, size.z, 1e-9)
+  loadedSceneCharDim = maxDim
   const minDim = Math.min(size.x, size.y, size.z)
   /** Почти плоский bbox (тонкий лист в одной плоскости). */
   const isFlatSheet = maxDim > 1e-6 && minDim / maxDim < 0.03
@@ -3553,6 +4338,7 @@ function centerModel(box: THREE.Box3) {
     axesHelper.scale.setScalar(axesLen / 100)
   }
   updateGroundGrid(box)
+  updateCameraClipPlanes()
 }
 
 function resetView() {
@@ -3565,7 +4351,7 @@ function resetView() {
 /** Delete / Backspace: разметка замечания → измерение → замечание → модель (на вкладке «Модели»). */
 function handleViewerDeleteKey(): boolean {
   if (
-    leftSidebarTab.value === 'remarks' &&
+    isRemarksPanelActive.value &&
     remarkScreenLayerEditable.value &&
     (remarkScreenSelectedShapeId.value || remarkScreenSelectedImageId.value)
   ) {
@@ -3583,7 +4369,7 @@ function handleViewerDeleteKey(): boolean {
     deleteRemarkById(selectedRemarkId.value, true)
     return true
   }
-  if (leftSidebarTab.value === 'models' && focusedModelId.value && modelGroupsById.has(focusedModelId.value)) {
+  if (leftSidebarTab.value === 'tree' && focusedModelId.value && modelGroupsById.has(focusedModelId.value)) {
     deleteFocusedModel()
     return true
   }
@@ -3592,7 +4378,7 @@ function handleViewerDeleteKey(): boolean {
 
 function focusModelInView() {
   if (!camera || !controls || !meshGroup || meshGroup.children.length === 0) return
-  const box = new THREE.Box3().setFromObject(meshGroup)
+  const box = getReferenceSceneBox() ?? new THREE.Box3().setFromObject(meshGroup)
   if (box.isEmpty()) return
   const center = box.getCenter(new THREE.Vector3())
   const size = box.getSize(new THREE.Vector3())
@@ -3641,7 +4427,17 @@ function onWindowKeyDown(ev: KeyboardEvent) {
   }
   if (ev.code === 'Escape') {
     ev.preventDefault()
-    modelRotateMode.value = false
+  if (placementActive.value) {
+    cancelModelPlacement()
+    return
+  }
+  if (partTreeIsolateState.value) {
+    restorePartTreeIsolate()
+    selectedPartRowKeys.value = new Set()
+    clearComponentHighlight()
+    return
+  }
+  modelRotateMode.value = false
     clearPendingAssemblyPlaneSelections()
     clearMeasurements()
     setMeasureMode(false)
@@ -3784,26 +4580,270 @@ function viewPerpendicularToFace() {
   controls.update()
 }
 
-function applyWireframeToObject(obj: THREE.Object3D, enabled: boolean, opacityValue?: number) {
-  const opacity = opacityValue ?? frameOpacityRef.value
-  obj.traverse((o: THREE.Object3D) => {
-    if (o instanceof THREE.Mesh && o.material) {
-      const arr = Array.isArray(o.material) ? o.material : [o.material]
-      arr.forEach((m: THREE.Material) => {
-        const mat = m as THREE.Material & { wireframe?: boolean; transparent?: boolean; opacity?: number; depthWrite?: boolean }
-        if ('wireframe' in mat) mat.wireframe = false
-        if ('transparent' in mat) mat.transparent = enabled
-        if ('opacity' in mat) mat.opacity = enabled ? opacity : 1
-        if (enabled && 'depthWrite' in mat) mat.depthWrite = false
-        if (!enabled && 'depthWrite' in mat) mat.depthWrite = true
-      })
+function disposeWireframeEdgeChild(ch: THREE.Object3D) {
+  if (!(ch instanceof THREE.LineSegments)) return
+  ch.geometry?.dispose()
+  const mat = ch.material
+  if (Array.isArray(mat)) mat.forEach((m) => m.dispose())
+  else mat?.dispose()
+}
+
+function removeWireframeEdgesFromObject(root: THREE.Object3D) {
+  root.traverse((o: THREE.Object3D) => {
+    if (!(o instanceof THREE.Mesh)) return
+    delete o.userData.wireframeEdgeAttached
+    for (let i = o.children.length - 1; i >= 0; i--) {
+      const ch = o.children[i]
+      if (!ch.userData?.wireframeEdge) continue
+      o.remove(ch)
+      disposeWireframeEdgeChild(ch)
     }
   })
 }
 
+function attachWireframeEdgesToMesh(mesh: THREE.Mesh) {
+  if (mesh.userData.wireframeEdgeAttached || !mesh.geometry) return
+  const pos = mesh.geometry.attributes.position
+  if (!pos || pos.count < 3) return
+  const edges = new THREE.EdgesGeometry(mesh.geometry, WIREFRAME_EDGE_THRESHOLD_DEG)
+  const lineOpacity = frameOpacityRef.value
+  const mat = new THREE.LineBasicMaterial({
+    color: 0x141820,
+    transparent: lineOpacity < 0.999,
+    opacity: lineOpacity,
+    depthTest: true,
+  })
+  const lines = new THREE.LineSegments(edges, mat)
+  lines.userData.wireframeEdge = true
+  lines.raycast = noopRaycast
+  lines.renderOrder = 2
+  mesh.add(lines)
+  mesh.userData.wireframeEdgeAttached = true
+}
+
+function updateWireframeEdgeLineOpacity() {
+  if (!meshGroup) return
+  const lineOpacity = frameOpacityRef.value
+  meshGroup.traverse((o: THREE.Object3D) => {
+    if (!(o instanceof THREE.Mesh)) return
+    o.children.forEach((ch) => {
+      if (!ch.userData?.wireframeEdge || !(ch instanceof THREE.LineSegments)) return
+      const m = ch.material as THREE.LineBasicMaterial
+      m.opacity = lineOpacity
+      m.transparent = lineOpacity < 0.999
+      m.needsUpdate = true
+    })
+  })
+}
+
+/** Глобальный каркас (кнопка «Каркас») — линии по контуру, грани скрыты. */
+function syncWireframeEdges(scope?: THREE.Object3D) {
+  if (!meshGroup) return
+  if (!wireframeModeRef.value) {
+    removeWireframeEdgesFromObject(meshGroup)
+    restoreWireframeFaceGhost()
+    return
+  }
+  removeWireframeEdgesFromObject(scope ?? meshGroup)
+  let built = 0
+  meshGroup.traverse((o: THREE.Object3D) => {
+    if (built >= WIREFRAME_MAX_EDGE_MESHES) return
+    if (!(o instanceof THREE.Mesh) || !o.visible) return
+    attachWireframeEdgesToMesh(o)
+    built += 1
+  })
+  syncWireframeFaceGhost()
+}
+
+function setMeshWireframeFaceGhost(mesh: THREE.Mesh, ghost: boolean) {
+  if (!mesh.material) return
+  const arr = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  if (ghost) {
+    if (!wireframeFaceMatBackup.has(mesh)) {
+      wireframeFaceMatBackup.set(
+        mesh,
+        arr.map((m) => {
+          const mm = m as THREE.Material & { opacity?: number; transparent?: boolean; depthWrite?: boolean }
+          return {
+            transparent: !!mm.transparent,
+            opacity: typeof mm.opacity === 'number' ? mm.opacity : 1,
+            depthWrite: mm.depthWrite !== false,
+          }
+        }),
+      )
+    }
+    arr.forEach((m) => {
+      const mm = m as THREE.Material & { opacity?: number; transparent?: boolean; depthWrite?: boolean }
+      mm.transparent = true
+      mm.opacity = WIREFRAME_GHOST_FACE_OPACITY
+      mm.depthWrite = false
+      mm.needsUpdate = true
+    })
+    return
+  }
+  const backup = wireframeFaceMatBackup.get(mesh)
+  if (backup) {
+    arr.forEach((m, i) => {
+      const mm = m as THREE.Material & { opacity?: number; transparent?: boolean; depthWrite?: boolean }
+      const b = backup[i]
+      if (!b) return
+      mm.transparent = b.transparent
+      mm.opacity = b.opacity
+      mm.depthWrite = b.depthWrite
+      mm.needsUpdate = true
+    })
+    wireframeFaceMatBackup.delete(mesh)
+  }
+  applyUserOpacityToMesh(mesh)
+}
+
+function restoreWireframeFaceGhost() {
+  ;[...wireframeFaceMatBackup.keys()].forEach((mesh) => setMeshWireframeFaceGhost(mesh, false))
+  wireframeFaceMatBackup.clear()
+}
+
+function syncWireframeFaceGhost() {
+  if (!meshGroup) return
+  if (!wireframeModeRef.value) {
+    restoreWireframeFaceGhost()
+    return
+  }
+  meshGroup.traverse((o: THREE.Object3D) => {
+    if (!(o instanceof THREE.Mesh)) return
+    if (o.visible) setMeshWireframeFaceGhost(o, true)
+    else if (wireframeFaceMatBackup.has(o)) setMeshWireframeFaceGhost(o, false)
+  })
+}
+
+function resetMeshMaterialOpacity(mesh: THREE.Mesh) {
+  if (!mesh.material) return
+  const arr = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  arr.forEach((m) => {
+    const mm = m as THREE.Material & { opacity?: number; transparent?: boolean; depthWrite?: boolean }
+    mm.transparent = false
+    mm.opacity = 1
+    mm.depthWrite = true
+    mm.needsUpdate = true
+  })
+}
+
+function applyUserOpacityToMesh(mesh: THREE.Mesh) {
+  if (wireframeFaceMatBackup.has(mesh)) return
+  if (!mesh.material) return
+  const op = meshUserOpacityByUuid.value[mesh.uuid] ?? 1
+  const arr = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  arr.forEach((m: THREE.Material) => {
+    const mat = m as THREE.Material & { transparent?: boolean; opacity?: number; depthWrite?: boolean }
+    const transparent = op < 0.999
+    if ('transparent' in mat) mat.transparent = transparent
+    if ('opacity' in mat) mat.opacity = op
+    if ('depthWrite' in mat) mat.depthWrite = !transparent || op > 0.92
+    mat.needsUpdate = true
+  })
+}
+
+function applyUserOpacityToMeshGroup(scope?: THREE.Object3D) {
+  const root = scope ?? meshGroup
+  if (!root) return
+  root.traverse((o: THREE.Object3D) => {
+    if (o instanceof THREE.Mesh) applyUserOpacityToMesh(o)
+  })
+}
+
+function setMeshesUserOpacity(uuids: string[], opacity: number) {
+  const next = { ...meshUserOpacityByUuid.value }
+  for (const uuid of uuids) {
+    if (opacity >= 0.999) delete next[uuid]
+    else next[uuid] = Math.max(0.05, Math.min(1, opacity))
+  }
+  meshUserOpacityByUuid.value = next
+  for (const uuid of uuids) {
+    const mesh = findMeshByUuid(uuid)
+    if (!mesh) continue
+    if (wireframeFaceMatBackup.has(mesh)) continue
+    if (opacity >= 0.999) resetMeshMaterialOpacity(mesh)
+    applyUserOpacityToMesh(mesh)
+  }
+}
+
+function collectAllMeshUuidsInModel(modelId: string): string[] {
+  const g = modelGroupsById.get(modelId)
+  const uuids: string[] = []
+  g?.traverse((o) => {
+    if (o instanceof THREE.Mesh) uuids.push(o.uuid)
+  })
+  return uuids
+}
+
+function clearMeshesUserOpacity(uuids: string[]) {
+  if (uuids.length === 0) return
+  const next = { ...meshUserOpacityByUuid.value }
+  for (const uuid of uuids) delete next[uuid]
+  meshUserOpacityByUuid.value = next
+  for (const uuid of uuids) {
+    const mesh = findMeshByUuid(uuid)
+    if (!mesh) continue
+    if (!wireframeFaceMatBackup.has(mesh)) resetMeshMaterialOpacity(mesh)
+    applyUserOpacityToMesh(mesh)
+  }
+}
+
+function collectMeshesUnderPart(part: THREE.Object3D): THREE.Mesh[] {
+  const list: THREE.Mesh[] = []
+  part.traverse((o) => {
+    if (o instanceof THREE.Mesh) list.push(o)
+  })
+  return list
+}
+
+function findTreeRowIdForMesh(modelId: string, part: THREE.Object3D): string | null {
+  const rows = componentTreeRowsByModel.value[modelId]
+  if (!rows) return null
+  const uuids = new Set(collectMeshesUnderPart(part).map((m) => m.uuid))
+  for (const r of rows) {
+    if (r.targetIds?.some((id) => uuids.has(id))) return r.id
+  }
+  return null
+}
+
+function getContextMenuTargetMeshUuids(scope: 'mesh' | 'row'): string[] {
+  const mid = contextMenuTargetModelId.value
+  const part = contextMenuTargetPart
+  if (!mid || !part) return []
+  if (scope === 'row') {
+    const rowId = findTreeRowIdForMesh(mid, part)
+    if (rowId) return collectTargetIdsForTreeNode(mid, rowId)
+  }
+  return collectMeshesUnderPart(part).map((m) => m.uuid)
+}
+
+function setContextMenuOpacity(opacity: number, scope: 'mesh' | 'row' | 'model') {
+  const mid = contextMenuTargetModelId.value
+  if (!mid) return
+  let uuids: string[] = []
+  if (scope === 'model') uuids = collectAllMeshUuidsInModel(mid)
+  else uuids = getContextMenuTargetMeshUuids(scope === 'row' ? 'row' : 'mesh')
+  if (uuids.length === 0) return
+  setMeshesUserOpacity(uuids, opacity)
+  partContextMenuOpen.value = false
+  contextMenuTargetPart = null
+  contextMenuTargetModelId.value = null
+}
+
+function resetContextMenuOpacity(scope: 'mesh' | 'model') {
+  const mid = contextMenuTargetModelId.value
+  if (!mid) return
+  const uuids =
+    scope === 'model' ? collectAllMeshUuidsInModel(mid) : getContextMenuTargetMeshUuids('mesh')
+  clearMeshesUserOpacity(uuids)
+  partContextMenuOpen.value = false
+  contextMenuTargetPart = null
+  contextMenuTargetModelId.value = null
+}
+
 function toggleWireframe() {
   wireframeModeRef.value = !wireframeModeRef.value
-  applyWireframeToObject(meshGroup, wireframeModeRef.value)
+  syncWireframeEdges()
   if (renderer && containerRef.value) {
     const pr = wireframeModeRef.value ? 1 : Math.min(window.devicePixelRatio, 2)
     renderer.setPixelRatio(pr)
@@ -3955,6 +4995,22 @@ function updateMouseFromClient(clientX: number, clientY: number) {
 function onCanvasMouseMove(ev: MouseEvent) {
   updateMouseFromClient(ev.clientX, ev.clientY)
   hoverDirty = true
+  if (placementActive.value) updatePlacementFromCursor(ev.clientX, ev.clientY)
+  if (boxSelectDrag && renderer) {
+    const rect = renderer.domElement.getBoundingClientRect()
+    const x0 = boxSelectDrag.startX - rect.left
+    const y0 = boxSelectDrag.startY - rect.top
+    const x1 = ev.clientX - rect.left
+    const y1 = ev.clientY - rect.top
+    const mode: 'window' | 'crossing' = x1 >= x0 ? 'window' : 'crossing'
+    boxSelectRect.value = {
+      left: Math.min(x0, x1),
+      top: Math.min(y0, y1),
+      width: Math.abs(x1 - x0),
+      height: Math.abs(y1 - y0),
+      mode,
+    }
+  }
 }
 
 function onContainerMouseMove(ev: MouseEvent) {
@@ -3974,6 +5030,7 @@ function onControlsEnd() {
   isCameraInteracting = false
   hoverDirty = true
   rebuildSavedMeasurementsVisuals()
+  updateCameraClipPlanes(true)
   if (renderer) {
     renderer.setPixelRatio(idlePixelRatio)
   }
@@ -4055,6 +5112,137 @@ function applyTransformSnapshot(s: TransformSnapshot) {
   meshGroup?.updateMatrixWorld(true)
 }
 
+/** Точка привязки габарита в локальной СК модели (низ по Z — «на полу»). */
+function getModelPlacementAnchorLocal(group: THREE.Group, bottomOnPlane = true): THREE.Vector3 {
+  const saved = group.position.clone()
+  group.position.set(0, 0, 0)
+  group.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(group)
+  const anchor = box.getCenter(new THREE.Vector3())
+  if (bottomOnPlane) anchor.z = box.min.z
+  group.position.copy(saved)
+  group.updateMatrixWorld(true)
+  return anchor
+}
+
+/** Первая модель в сцене: центр габарита в начале мировой СК. */
+function anchorModelCenterAtWorldOrigin(group: THREE.Group) {
+  group.position.set(0, 0, 0)
+  group.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(group)
+  if (box.isEmpty()) return
+  const c = box.getCenter(new THREE.Vector3())
+  group.position.set(-c.x, -c.y, -c.z)
+  meshGroup?.updateMatrixWorld(true)
+}
+
+function placeModelAnchorAtWorld(group: THREE.Group, worldPoint: THREE.Vector3) {
+  const offset = placementAnchorLocal.clone().applyQuaternion(group.quaternion)
+  group.position.copy(worldPoint).sub(offset)
+  meshGroup?.updateMatrixWorld(true)
+}
+
+function syncPlacementFieldsFromGroup(modelId: string) {
+  const g = modelGroupsById.get(modelId)
+  if (!g) return
+  placementPosMm.value = {
+    x: Math.round(g.position.x * 10) / 10,
+    y: Math.round(g.position.y * 10) / 10,
+    z: Math.round(g.position.z * 10) / 10,
+  }
+}
+
+function pickPlacementPlanePoint(clientX: number, clientY: number): THREE.Vector3 | null {
+  if (!camera || !renderer) return null
+  const rect = renderer.domElement.getBoundingClientRect()
+  const mx = ((clientX - rect.left) / rect.width) * 2 - 1
+  const my = -((clientY - rect.top) / rect.height) * 2 + 1
+  const r = new THREE.Raycaster()
+  r.setFromCamera(new THREE.Vector2(mx, my), camera)
+  placementPickPlane.normal.set(0, 0, 1)
+  placementPickPlane.constant = -placementPickPlane.normal.dot(new THREE.Vector3(0, 0, 0))
+  const hit = r.ray.intersectPlane(placementPickPlane, placementPickPoint)
+  return hit ? placementPickPoint.clone() : null
+}
+
+function updatePlacementFromCursor(clientX: number, clientY: number) {
+  const id = placementModelId.value
+  const g = id ? modelGroupsById.get(id) : null
+  if (!placementActive.value || !g) return
+  const pt = pickPlacementPlanePoint(clientX, clientY)
+  if (!pt) return
+  placeModelAnchorAtWorld(g, pt)
+  syncPlacementFieldsFromGroup(id!)
+}
+
+function applyPlacementFromFields() {
+  const id = placementModelId.value
+  const g = id ? modelGroupsById.get(id) : null
+  if (!g) return
+  const { x, y, z } = placementPosMm.value
+  g.position.set(Number(x) || 0, Number(y) || 0, Number(z) || 0)
+  meshGroup?.updateMatrixWorld(true)
+}
+
+function beginModelPlacement(modelId: string, opts?: { removeFromSceneOnCancel?: boolean }) {
+  const g = modelGroupsById.get(modelId)
+  if (!g || !meshGroup) return
+  if (placementActive.value && placementModelId.value && placementModelId.value !== modelId) {
+    cancelModelPlacement()
+  }
+  placementAnchorLocal = getModelPlacementAnchorLocal(g, true)
+  placementCancelRemovesFromScene = opts?.removeFromSceneOnCancel ?? false
+  placementModelId.value = modelId
+  placementActive.value = true
+  focusedModelId.value = modelId
+  leftSidebarTab.value = 'tree'
+  const name = loadedModels.value.find((m) => m.id === modelId)?.name ?? 'модель'
+  placementStatusHint.value = `Размещение «${name}»: двигайте мышью, ЛКМ — зафиксировать, Esc — отмена.`
+  syncPlacementFieldsFromGroup(modelId)
+  meshGroup.updateMatrixWorld(true)
+}
+
+function confirmModelPlacement() {
+  if (!placementActive.value || !placementModelId.value) return
+  const id = placementModelId.value
+  placementActive.value = false
+  placementModelId.value = null
+  placementStatusHint.value = ''
+  placementCancelRemovesFromScene = false
+  applyNavigationForFocusedModel()
+  scheduleSceneMetricsRecalc()
+  focusedModelId.value = id
+}
+
+function cancelModelPlacement() {
+  if (!placementActive.value) return
+  const id = placementModelId.value
+  placementActive.value = false
+  placementModelId.value = null
+  placementStatusHint.value = ''
+  if (id && placementCancelRemovesFromScene) {
+    placementCancelRemovesFromScene = false
+    setModelInScene(id, false)
+    return
+  }
+  placementCancelRemovesFromScene = false
+}
+
+function afterModelAddedToScene(
+  wrapper: THREE.Group,
+  modelId: string,
+  hadOtherModelsInScene: boolean,
+  startPlacementIfNotFirst: boolean,
+) {
+  if (!hadOtherModelsInScene) {
+    anchorModelCenterAtWorldOrigin(wrapper)
+    return
+  }
+  if (startPlacementIfNotFirst) {
+    beginModelPlacement(modelId, { removeFromSceneOnCancel: true })
+  }
+}
+
 function pushTransformUndo(entry: TransformUndoEntry) {
   undoTransformStack.push(entry)
   if (undoTransformStack.length > UNDO_STACK_MAX) undoTransformStack.shift()
@@ -4105,14 +5293,25 @@ function togglePinModelId(modelId: string) {
   pinnedByModelId.value = { ...pinnedByModelId.value, [modelId]: next }
 }
 
-/** Инкрементальное вращение вокруг фиксированного pivot (мировые оси Y и X). */
-function rotateWrapperAroundPivotDragAxes(
+/** Вращение модели вокруг pivot по осям экрана (как поворот камеры: куда мышь — туда модель). */
+function rotateWrapperAroundPivotScreenAxes(
   wrapper: THREE.Group,
   pivotLocal: THREE.Vector3,
-  dRadY: number,
-  dRadX: number,
+  dxPx: number,
+  dyPx: number,
+  cam: THREE.Camera,
+  orbitTarget: THREE.Vector3,
 ) {
   if (!wrapper.parent) return
+  const eye = new THREE.Vector3().subVectors(cam.position, orbitTarget)
+  if (eye.lengthSq() < 1e-12) return
+  eye.normalize()
+  const upRef = cam.up
+  let right = new THREE.Vector3().crossVectors(eye, upRef)
+  if (right.lengthSq() < 1e-12) right.set(1, 0, 0)
+  else right.normalize()
+  const screenUp = new THREE.Vector3().crossVectors(right, eye).normalize()
+  const sens = MODEL_ROTATE_MOUSE_SENS
   const apply = (axis: THREE.Vector3, ang: number) => {
     if (ang === 0 || !Number.isFinite(ang)) return
     const q = new THREE.Quaternion().setFromAxisAngle(axis, ang)
@@ -4121,8 +5320,8 @@ function rotateWrapperAroundPivotDragAxes(
     wrapper.position.add(pivotLocal)
     wrapper.quaternion.premultiply(q)
   }
-  apply(new THREE.Vector3(0, 1, 0), dRadY)
-  apply(new THREE.Vector3(1, 0, 0), dRadX)
+  apply(screenUp, dxPx * sens)
+  apply(right, dyPx * sens)
 }
 
 function copyFocusedTransform() {
@@ -4576,30 +5775,147 @@ function splitMergedMeshesUsingSpec(root: THREE.Object3D, stepMetaPayload?: any)
   return changed
 }
 
-function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group) {
-  const buckets = new Map<string, { label: string; ids: string[]; visibleCount: number }>()
-  wrapper.traverse((obj: THREE.Object3D) => {
-    if (!(obj instanceof THREE.Mesh)) return
+function buildGeometryBucketsForMeshes(
+  meshes: THREE.Mesh[],
+  fallbackIndexStart: number,
+): Map<
+  string,
+  {
+    label: string
+    categoryId: PartCategoryId
+    ids: string[]
+    visibleCount: number
+    labelVotes: string[]
+  }
+> {
+  const buckets = new Map<
+    string,
+    {
+      label: string
+      categoryId: PartCategoryId
+      ids: string[]
+      visibleCount: number
+      labelVotes: string[]
+    }
+  >()
+  meshes.forEach((obj, i) => {
     const inferred = inferComponentLabel(obj)
-    const label = inferred || `Деталь ${buckets.size + 1}`
-    const key = normalizeComponentLabel(label).toLowerCase()
-    const prev = buckets.get(key)
+    const rawLabel = inferred || obj.name || `Деталь ${fallbackIndexStart + i + 1}`
+    const groupKey = meshPartGroupKey(obj, rawLabel)
+    const categoryId = inferPartCategory(rawLabel)
+    const prev = buckets.get(groupKey)
     if (prev) {
       prev.ids.push(obj.uuid)
       if (obj.visible) prev.visibleCount += 1
+      prev.labelVotes.push(rawLabel)
       return
     }
-    buckets.set(key, { label, ids: [obj.uuid], visibleCount: obj.visible ? 1 : 0 })
+    buckets.set(groupKey, {
+      label: rawLabel,
+      categoryId,
+      ids: [obj.uuid],
+      visibleCount: obj.visible ? 1 : 0,
+      labelVotes: [rawLabel],
+    })
   })
-  const roots: ComponentTreeNode[] = [...buckets.values()]
+  buckets.forEach((b) => {
+    b.label = pickGeometryGroupLabel({ labels: b.labelVotes })
+    b.categoryId = inferPartCategory(b.label)
+  })
+  return buckets
+}
+
+/** Плоский список групп деталей (имя как в модели, все экземпляры типа в одной строке). */
+function bucketsToPartGroupNodes(
+  modelId: string,
+  buckets: Map<
+    string,
+    { label: string; categoryId: PartCategoryId; ids: string[]; visibleCount: number }
+  >,
+  idPrefix: string,
+): ComponentTreeNode[] {
+  return [...buckets.values()]
     .sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-    .map((x, idx) => ({
-      id: `${modelId}:part:${idx}`,
-      label: x.label,
-      visible: x.visibleCount > 0,
-      targetIds: x.ids,
+    .map((g, idx) => ({
+      id: `${modelId}:${idPrefix}grp:${idx}`,
+      label: g.label,
+      visible: g.visibleCount > 0,
+      targetIds: g.ids,
       children: [],
+      nodeKind: 'group' as const,
     }))
+}
+
+function findTreeNodeById(nodes: ComponentTreeNode[], rowId: string): ComponentTreeNode | null {
+  for (const n of nodes) {
+    if (n.id === rowId) return n
+    const inChild = findTreeNodeById(n.children, rowId)
+    if (inChild) return inChild
+  }
+  return null
+}
+
+function collectTargetIdsForTreeNode(modelId: string, rowId: string): string[] {
+  const roots = componentTreeByModel.value[modelId]
+  if (!roots) return []
+  const node = findTreeNodeById(roots, rowId)
+  if (!node) {
+    const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+    return row?.targetIds ?? []
+  }
+  const ids: string[] = []
+  const walk = (n: ComponentTreeNode) => {
+    n.targetIds.forEach((id) => ids.push(id))
+    n.children.forEach(walk)
+  }
+  walk(node)
+  return [...new Set(ids)]
+}
+
+/** Дерево из иерархии GLB (STEP/XCAF сохраняет узлы сборки). */
+function tryBuildTreeFromSceneHierarchy(modelId: string, wrapper: THREE.Group): ComponentTreeNode[] | null {
+  const structural = wrapper.children.filter(
+    (c) => !(c instanceof THREE.Mesh) && c.children.length > 0 && String(c.name || '').trim().length > 0,
+  )
+  if (structural.length === 0) return null
+
+  const assemblyNodes: ComponentTreeNode[] = []
+  for (let si = 0; si < structural.length; si++) {
+    const branch = structural[si]
+    const meshes: THREE.Mesh[] = []
+    branch.traverse((o) => {
+      if (o instanceof THREE.Mesh) meshes.push(o)
+    })
+    if (meshes.length === 0) continue
+    const buckets = buildGeometryBucketsForMeshes(meshes, si * 1000)
+    const partNodes = bucketsToPartGroupNodes(modelId, buckets, `s${si}:`)
+    if (partNodes.length === 0) continue
+    const branchLabel = String(branch.name).trim() || `Сборка ${si + 1}`
+    assemblyNodes.push({
+      id: `${modelId}:asm:${si}`,
+      label: branchLabel,
+      visible: partNodes.some((c) => c.visible),
+      targetIds: [],
+      children: partNodes,
+      nodeKind: 'category',
+    })
+  }
+  return assemblyNodes.length > 0 ? assemblyNodes : null
+}
+
+function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group) {
+  const hierarchyRoots = tryBuildTreeFromSceneHierarchy(modelId, wrapper)
+  if (hierarchyRoots) {
+    componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: hierarchyRoots }
+    return
+  }
+
+  const meshes: THREE.Mesh[] = []
+  wrapper.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) meshes.push(obj)
+  })
+  const buckets = buildGeometryBucketsForMeshes(meshes, 0)
+  const roots = bucketsToPartGroupNodes(modelId, buckets, '')
   componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
 }
 
@@ -4624,11 +5940,390 @@ function refreshComponentTreeVisibility(modelId: string) {
 function flattenComponentTree(nodes: ComponentTreeNode[], depth = 0): ComponentTreeRow[] {
   const rows: ComponentTreeRow[] = []
   nodes.forEach((n) => {
-    rows.push({ id: n.id, label: n.label, visible: n.visible, targetIds: n.targetIds, depth })
+    rows.push({
+      id: n.id,
+      label: n.label,
+      visible: n.visible,
+      targetIds: n.targetIds,
+      depth,
+      nodeKind: n.nodeKind,
+    })
+    if (n.nodeKind === 'category' && !isCategoryExpandedForRow(n.id)) return
     rows.push(...flattenComponentTree(n.children, depth + 1))
   })
   return rows
 }
+
+function categoryExpandKeyFromRowId(modelId: string, rowId: string): string | null {
+  const m = rowId.match(/^[^:]+:cat:(.+)$/)
+  if (!m) return null
+  return `${modelId}:${m[1]}`
+}
+
+function isCategoryExpandedForRow(rowId: string): boolean {
+  const modelId = rowId.split(':')[0]
+  const key = categoryExpandKeyFromRowId(modelId, rowId)
+  if (!key) return true
+  return expandedCategoryIds.value[key] !== false
+}
+
+function toggleCategoryExpanded(modelId: string, rowId: string) {
+  const key = categoryExpandKeyFromRowId(modelId, rowId)
+  if (!key) return
+  expandedCategoryIds.value = {
+    ...expandedCategoryIds.value,
+    [key]: expandedCategoryIds.value[key] === false,
+  }
+}
+
+function findMeshByUuid(uuid: string): THREE.Mesh | null {
+  if (!meshGroup) return null
+  let found: THREE.Mesh | null = null
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!found && obj instanceof THREE.Mesh && obj.uuid === uuid) found = obj
+  })
+  return found
+}
+
+function collectFocusedMeshIds(): Set<string> {
+  const ids = new Set<string>()
+  selectedPartRowKeys.value.forEach((key) => {
+    const sep = key.indexOf(':')
+    if (sep < 0) return
+    const modelId = key.slice(0, sep)
+    const rowId = key.slice(sep + 1)
+    collectTargetIdsForTreeNode(modelId, rowId).forEach((id) => ids.add(id))
+  })
+  return ids
+}
+
+function clearPartFocusVisuals() {
+  dimmedMeshBackups.forEach((backup, mesh) => {
+    mesh.material = backup.material
+    mesh.visible = backup.visible
+  })
+  dimmedMeshBackups.clear()
+  partFocusActive.value = false
+}
+
+function applyPartFocusVisuals(focusedMeshIds: Set<string>) {
+  clearPartFocusVisuals()
+  if (!partIsolateDimOthers.value || !meshGroup || focusedMeshIds.size === 0) return
+  let dimmed = 0
+  const maxDim = 800
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (dimmed >= maxDim) return
+    if (!(obj instanceof THREE.Mesh) || !obj.visible || focusedMeshIds.has(obj.uuid)) return
+    if (!obj.material) return
+    dimmedMeshBackups.set(obj, { material: obj.material, visible: obj.visible })
+    obj.material = sharedGhostMaterial
+    dimmed += 1
+  })
+  partFocusActive.value = dimmed > 0
+}
+
+function getBboxForMeshIds(ids: Set<string>): THREE.Box3 | null {
+  const box = new THREE.Box3()
+  let any = false
+  ids.forEach((uuid) => {
+    const mesh = findMeshByUuid(uuid)
+    if (!mesh?.visible) return
+    mesh.updateMatrixWorld(true)
+    const b = new THREE.Box3().setFromObject(mesh)
+    if (!b.isEmpty()) {
+      box.union(b)
+      any = true
+    }
+  })
+  return any ? box : null
+}
+
+function focusCameraOnMeshIds(ids: Set<string>) {
+  if (!camera || !controls || ids.size === 0) return
+  const box = getBboxForMeshIds(ids)
+  if (!box || box.isEmpty()) return
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const maxDim = Math.max(size.x, size.y, size.z, 1)
+  const direction = camera.position.clone().sub(controls.target)
+  if (direction.lengthSq() < 1e-8) direction.set(1, 0.75, 1)
+  direction.normalize()
+  camera.position.copy(center).add(direction.multiplyScalar(maxDim * 1.65))
+  controls.target.copy(center)
+  controls.update()
+}
+
+function applySelectionVisualsAndFocus() {
+  clearComponentHighlight()
+  const focusedIds = collectFocusedMeshIds()
+  if (focusedIds.size === 0) {
+    clearPartFocusVisuals()
+    selectedComponentRowId.value = null
+    return
+  }
+  if (!meshGroup) return
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh) || !obj.visible || !obj.material || !focusedIds.has(obj.uuid)) return
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+    mats.forEach((m: THREE.Material) => {
+      if ('emissive' in m) {
+        const mm = m as THREE.MeshPhongMaterial
+        mm.emissive.setHex(0x336699)
+        if ('emissiveIntensity' in mm) mm.emissiveIntensity = 0.45
+      }
+    })
+    highlightedComponentMeshes.add(obj)
+  })
+  if (partIsolateDimOthers.value) applyPartFocusVisuals(focusedIds)
+}
+
+function restorePartTreeIsolate() {
+  const st = partTreeIsolateState.value
+  if (!st) return
+  const g = modelGroupsById.get(st.modelId)
+  if (g) {
+    g.traverse((obj: THREE.Object3D) => {
+      if (!(obj instanceof THREE.Mesh)) return
+      const prev = st.meshVisible.get(obj.uuid)
+      if (prev !== undefined) obj.visible = prev
+      restoreMeshRaycast(obj)
+    })
+    refreshComponentTreeVisibility(st.modelId)
+  }
+  partTreeIsolateState.value = null
+  scheduleSceneMetricsRecalc()
+}
+
+function isolatePartFromTree(modelId: string, rowId: string) {
+  const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+  if (row?.nodeKind === 'category') return
+
+  if (partTreeIsolateState.value?.modelId === modelId && partTreeIsolateState.value?.rowId === rowId) {
+    restorePartTreeIsolate()
+    selectedPartRowKeys.value = new Set()
+    selectedComponentRowId.value = null
+    clearPartFocusVisuals()
+    clearComponentHighlight()
+    return
+  }
+
+  restorePartTreeIsolate()
+
+  const keepIds = new Set(collectTargetIdsForTreeNode(modelId, rowId))
+  if (keepIds.size === 0) return
+  const g = modelGroupsById.get(modelId)
+  if (!g) return
+
+  const meshVisible = new Map<string, boolean>()
+  g.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    meshVisible.set(obj.uuid, obj.visible)
+    obj.visible = keepIds.has(obj.uuid)
+  })
+
+  partTreeIsolateState.value = { modelId, rowId, meshVisible, keepIds }
+  applyIsolateRaycastBlocks(modelId, keepIds)
+  focusedModelId.value = modelId
+  expandedModelIds.value = { ...expandedModelIds.value, [modelId]: true }
+
+  const key = `${modelId}:${rowId}`
+  selectedPartRowKeys.value = new Set([key])
+  selectedComponentRowId.value = key
+  clearPartFocusVisuals()
+  clearComponentHighlight()
+  applySelectionVisualsAndFocus()
+
+  focusCameraOnMeshIds(keepIds)
+  refreshComponentTreeVisibility(modelId)
+  scheduleSceneMetricsRecalc()
+}
+
+function resetPartSelectionAndView() {
+  restorePartTreeIsolate()
+  selectedPartRowKeys.value = new Set()
+  selectedComponentRowId.value = null
+  clearPartFocusVisuals()
+  clearComponentHighlight()
+}
+
+function restoreOriginalModelColors(modelId?: string) {
+  resetPartSelectionAndView()
+  layerColorOverrideByUuid.value = {}
+  const groups = modelId
+    ? [modelGroupsById.get(modelId)].filter((g): g is THREE.Group => !!g)
+    : [...modelGroupsById.values()]
+  for (const g of groups) {
+    g.traverse((obj: THREE.Object3D) => {
+      if (!(obj instanceof THREE.Mesh) || !obj.material) return
+      const hex = normalizeHexColor(String(obj.userData?.partColorHex ?? ''))
+      if (hex) applyHexToMesh(obj, hex)
+    })
+    finalizeModelPartColors(g, null)
+  }
+  applyShadingMode()
+}
+
+function meshScreenRect(mesh: THREE.Mesh, canvasRect: DOMRect): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  if (!camera) return null
+  mesh.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(mesh)
+  if (box.isEmpty()) return null
+  const corners = [
+    new THREE.Vector3(box.min.x, box.min.y, box.min.z),
+    new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+    new THREE.Vector3(box.min.x, box.max.y, box.min.z),
+    new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+    new THREE.Vector3(box.max.x, box.min.y, box.min.z),
+    new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+    new THREE.Vector3(box.max.x, box.max.y, box.min.z),
+    new THREE.Vector3(box.max.x, box.max.y, box.max.z),
+  ]
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  const v = new THREE.Vector3()
+  for (const c of corners) {
+    v.copy(c).project(camera)
+    const sx = ((v.x + 1) / 2) * canvasRect.width
+    const sy = ((-v.y + 1) / 2) * canvasRect.height
+    minX = Math.min(minX, sx)
+    minY = Math.min(minY, sy)
+    maxX = Math.max(maxX, sx)
+    maxY = Math.max(maxY, sy)
+  }
+  if (!Number.isFinite(minX)) return null
+  return { minX, minY, maxX, maxY }
+}
+
+function rectFullyInside(a: { minX: number; minY: number; maxX: number; maxY: number }, sel: { left: number; top: number; right: number; bottom: number }) {
+  return a.minX >= sel.left && a.maxX <= sel.right && a.minY >= sel.top && a.maxY <= sel.bottom
+}
+
+function rectIntersects(a: { minX: number; minY: number; maxX: number; maxY: number }, sel: { left: number; top: number; right: number; bottom: number }) {
+  return !(a.maxX < sel.left || a.minX > sel.right || a.maxY < sel.top || a.minY > sel.bottom)
+}
+
+function finishBoxSelect(clientX: number, clientY: number) {
+  if (!renderer || !boxSelectDrag) return
+  const rect = renderer.domElement.getBoundingClientRect()
+  const x0 = boxSelectDrag.startX - rect.left
+  const y0 = boxSelectDrag.startY - rect.top
+  const x1 = clientX - rect.left
+  const y1 = clientY - rect.top
+  const mode: 'window' | 'crossing' = x1 >= x0 ? 'window' : 'crossing'
+  const sel = {
+    left: Math.min(x0, x1),
+    top: Math.min(y0, y1),
+    right: Math.max(x0, x1),
+    bottom: Math.max(y0, y1),
+  }
+  if (Math.abs(x1 - x0) < 4 && Math.abs(y1 - y0) < 4) {
+    boxSelectDrag = null
+    boxSelectRect.value = null
+    return
+  }
+  const next = boxSelectDrag.additive ? new Set(selectedPartRowKeys.value) : new Set<string>()
+  Object.entries(componentTreeRowsByModel.value).forEach(([modelId, rows]) => {
+    rows.forEach((row) => {
+      if (row.nodeKind === 'category' || !row.targetIds.length) return
+      let matched = false
+      for (const uuid of row.targetIds) {
+        const mesh = findMeshByUuid(uuid)
+        if (!mesh?.visible) continue
+        const mb = meshScreenRect(mesh, rect)
+        if (!mb) continue
+        const ok = mode === 'window' ? rectFullyInside(mb, sel) : rectIntersects(mb, sel)
+        if (ok) {
+          matched = true
+          break
+        }
+      }
+      if (matched) next.add(`${modelId}:${row.id}`)
+    })
+  })
+  selectedPartRowKeys.value = next
+  const first = next.values().next().value
+  selectedComponentRowId.value = first ?? null
+  applySelectionVisualsAndFocus()
+  if (next.size > 0) focusCameraOnMeshIds(collectFocusedMeshIds())
+  boxSelectDrag = null
+  boxSelectRect.value = null
+  if (controls) controls.enabled = true
+}
+
+function assignSelectedPartsToLayer(layerId: string) {
+  if (!layerId || selectedPartRowKeys.value.size === 0) return
+  const nextLayer = { ...meshLayerByUuid.value }
+  selectedPartRowKeys.value.forEach((key) => {
+    const sep = key.indexOf(':')
+    if (sep < 0) return
+    const modelId = key.slice(0, sep)
+    const rowId = key.slice(sep + 1)
+    const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+    row?.targetIds.forEach((uuid) => {
+      nextLayer[uuid] = layerId
+    })
+  })
+  meshLayerByUuid.value = nextLayer
+}
+
+function applyLayerColorToSelected(hex: string) {
+  if (!hex || selectedPartRowKeys.value.size === 0) return
+  const next = { ...layerColorOverrideByUuid.value }
+  selectedPartRowKeys.value.forEach((key) => {
+    const sep = key.indexOf(':')
+    if (sep < 0) return
+    const modelId = key.slice(0, sep)
+    const rowId = key.slice(sep + 1)
+    const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+    row?.targetIds.forEach((uuid) => {
+      next[uuid] = hex
+      const mesh = findMeshByUuid(uuid)
+      if (mesh?.material && 'color' in mesh.material) {
+        ;(mesh.material as THREE.MeshPhongMaterial).color.set(hex)
+      }
+    })
+  })
+  layerColorOverrideByUuid.value = next
+}
+
+function addSceneLayer3d() {
+  const n = sceneLayers3d.value.length
+  const id = `layer-${Date.now()}`
+  sceneLayers3d.value = [
+    ...sceneLayers3d.value,
+    { id, name: `${n} — Слой ${n}`, color: '#c8d4e8', visible: true },
+  ]
+}
+
+function toggleSceneLayerVisibility(layerId: string) {
+  sceneLayers3d.value = sceneLayers3d.value.map((l) =>
+    l.id === layerId ? { ...l, visible: !l.visible } : l,
+  )
+  applySceneLayerVisibility()
+}
+
+function applySceneLayerVisibility() {
+  if (!meshGroup) return
+  const hiddenLayers = new Set(sceneLayers3d.value.filter((l) => !l.visible).map((l) => l.id))
+  meshGroup.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const layerId = meshLayerByUuid.value[obj.uuid] ?? 'layer-0'
+    if (hiddenLayers.has(layerId)) obj.visible = false
+  })
+  refreshAllComponentTreeVisibility()
+}
+
+function refreshAllComponentTreeVisibility() {
+  Object.keys(componentTreeByModel.value).forEach((modelId) => refreshComponentTreeVisibility(modelId))
+}
+
+const selectedPartsSummary = computed(() => {
+  const n = selectedPartRowKeys.value.size
+  if (n === 0) return 'Нет выбранных деталей'
+  return `Выбрано групп деталей: ${n}`
+})
 
 const componentTreeRowsByModel = computed<Record<string, ComponentTreeRow[]>>(() => {
   const out: Record<string, ComponentTreeRow[]> = {}
@@ -4636,6 +6331,18 @@ const componentTreeRowsByModel = computed<Record<string, ComponentTreeRow[]>>(()
     out[modelId] = flattenComponentTree(nodes)
   })
   return out
+})
+
+const focusedComponentTreeRows = computed(() => {
+  const id = focusedModelId.value
+  if (!id) return []
+  return componentTreeRowsByModel.value[id] ?? []
+})
+
+const focusedModelForTree = computed(() => {
+  const id = focusedModelId.value
+  if (!id) return null
+  return loadedModels.value.find((m) => m.id === id) ?? null
 })
 
 function toggleComponentVisibility(modelId: string, rowId: string) {
@@ -4650,15 +6357,23 @@ function toggleComponentVisibility(modelId: string, rowId: string) {
     if (targetSet.has(obj.uuid)) obj.visible = nextVisible
   })
   syncOverlayVisibilityForModel(modelId)
-  syncHiddenOutlinesForModel(modelId)
+  clearHiddenOutlinesForModel(modelId)
   refreshComponentTreeVisibility(modelId)
+  if (!nextVisible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
+    const next = new Set(selectedPartRowKeys.value)
+    next.delete(`${modelId}:${rowId}`)
+    selectedPartRowKeys.value = next
+    applySelectionVisualsAndFocus()
+  } else if (nextVisible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
+    selectComponentRow(modelId, rowId)
+  }
   scheduleSceneMetricsRecalc()
 }
 
 function setSingleComponentVisibility(modelId: string, obj: THREE.Object3D, visible: boolean) {
   obj.visible = visible
   syncOverlayVisibilityForModel(modelId)
-  syncHiddenOutlinesForModel(modelId)
+  clearHiddenOutlinesForModel(modelId)
   refreshComponentTreeVisibility(modelId)
   scheduleSceneMetricsRecalc()
 }
@@ -4669,31 +6384,102 @@ function clearComponentHighlight() {
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
     mats.forEach((m: THREE.Material) => {
       if ('emissive' in m) {
-        (m as THREE.MeshPhongMaterial).emissive.setHex(0x000000)
+        const mm = m as THREE.MeshPhongMaterial
+        mm.emissive.setHex(0x000000)
+        if ('emissiveIntensity' in mm) mm.emissiveIntensity = 1
       }
     })
   })
   highlightedComponentMeshes.clear()
 }
 
-function selectComponentRow(modelId: string, rowId: string) {
+function findPartRowForMeshUuid(modelId: string, meshUuid: string): ComponentTreeRow | null {
+  const rows = componentTreeRowsByModel.value[modelId] ?? []
+  for (const row of rows) {
+    if (row.nodeKind === 'category') continue
+    if (row.targetIds.includes(meshUuid)) return row
+  }
+  return null
+}
+
+function selectComponentRow(modelId: string, rowId: string, ev?: MouseEvent) {
   const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
-  selectedComponentRowId.value = row ? `${modelId}:${rowId}` : null
-  clearComponentHighlight()
-  if (!row) return
+  if (row?.nodeKind === 'category') {
+    toggleCategoryExpanded(modelId, rowId)
+    return
+  }
+  const key = `${modelId}:${rowId}`
+  const additive = !!(ev?.ctrlKey || ev?.metaKey || ev?.shiftKey)
+  const next = additive ? new Set(selectedPartRowKeys.value) : new Set<string>()
+  if (additive && next.has(key)) next.delete(key)
+  else next.add(key)
+  selectedPartRowKeys.value = next
+  selectedComponentRowId.value = next.size === 1 ? key : next.has(key) ? key : [...next][0] ?? null
+  applySelectionVisualsAndFocus()
+}
+
+function selectComponentRowAndFocus(modelId: string, rowId: string) {
+  isolatePartFromTree(modelId, rowId)
+}
+
+function isModelExpanded(modelId: string): boolean {
+  if (expandedModelIds.value[modelId] === true) return true
+  if (expandedModelIds.value[modelId] === false) return false
+  return focusedModelId.value === modelId
+}
+
+function toggleModelExpanded(modelId: string) {
+  expandedModelIds.value = { ...expandedModelIds.value, [modelId]: !isModelExpanded(modelId) }
+}
+
+function modelPartsAnyVisible(modelId: string): boolean {
+  const rows = componentTreeRowsByModel.value[modelId]
+  if (!rows?.length) {
+    const g = modelGroupsById.get(modelId)
+    if (!g) return false
+    let any = false
+    g.traverse((obj: THREE.Object3D) => {
+      if (any || !(obj instanceof THREE.Mesh)) return
+      if (obj.visible) any = true
+    })
+    return any
+  }
+  return rows.some((r) => r.visible)
+}
+
+function toggleModelPartsVisibility(modelId: string) {
   const group = modelGroupsById.get(modelId)
   if (!group) return
-  const targetSet = new Set(row.targetIds)
+  const item = loadedModels.value.find((m) => m.id === modelId)
+  if (item && !item.inScene) {
+    setModelInScene(modelId, true)
+    return
+  }
+  const nextVisible = !modelPartsAnyVisible(modelId)
   group.traverse((obj: THREE.Object3D) => {
-    if (!(obj instanceof THREE.Mesh) || !obj.material || !targetSet.has(obj.uuid)) return
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
-    mats.forEach((m: THREE.Material) => {
-      if ('emissive' in m) {
-        (m as THREE.MeshPhongMaterial).emissive.setHex(0x223344)
-      }
-    })
-    highlightedComponentMeshes.add(obj)
+    if (obj instanceof THREE.Mesh) obj.visible = nextVisible
   })
+  syncOverlayVisibilityForModel(modelId)
+  clearHiddenOutlinesForModel(modelId)
+  refreshComponentTreeVisibility(modelId)
+  if (!nextVisible) clearComponentHighlight()
+  scheduleSceneMetricsRecalc()
+}
+
+function onModelTreeHeaderClick(item: { id: string; inScene: boolean }) {
+  focusedModelId.value = item.id
+  expandedModelIds.value = { ...expandedModelIds.value, [item.id]: true }
+  if (!item.inScene) setModelInScene(item.id, true)
+  else applyNavigationForFocusedModel()
+}
+
+function onModelTreeHeaderDblClick(item: { id: string; inScene: boolean }) {
+  onModelTreeHeaderClick(item)
+  focusModelInView()
+}
+
+function modelTreeRows(modelId: string): ComponentTreeRow[] {
+  return componentTreeRowsByModel.value[modelId] ?? []
 }
 
 function disposeAssemblyHighlightGroupMeshes() {
@@ -4721,6 +6507,168 @@ function stripStaleAssemblyFaceTriangles() {
   disposePlanePreviewGeometry(assemblySymBase2.value ?? undefined)
   disposePlanePreviewGeometry(assemblySymPart1.value ?? undefined)
   disposePlanePreviewGeometry(assemblySymPart2.value ?? undefined)
+}
+
+const MESH_PATCH_MAX_TRIS = 1400
+const PLANAR_NORMAL_MAX_DEV = 0.055
+const CYLINDER_AXIS_MAX_DOT = 0.14
+
+function meshTriangleWorldNormal(mesh: THREE.Mesh, triIndex: number): THREE.Vector3 | null {
+  const geom = mesh.geometry as THREE.BufferGeometry
+  const pos = geom.attributes.position as THREE.BufferAttribute | undefined
+  if (!pos) return null
+  const index = geom.index
+  const ia = index ? index.getX(triIndex * 3) : triIndex * 3
+  const ib = index ? index.getX(triIndex * 3 + 1) : triIndex * 3 + 1
+  const ic = index ? index.getX(triIndex * 3 + 2) : triIndex * 3 + 2
+  const va = new THREE.Vector3(pos.getX(ia), pos.getY(ia), pos.getZ(ia))
+  const vb = new THREE.Vector3(pos.getX(ib), pos.getY(ib), pos.getZ(ib))
+  const vc = new THREE.Vector3(pos.getX(ic), pos.getY(ic), pos.getZ(ic))
+  return new THREE.Vector3()
+    .crossVectors(vb.clone().sub(va), vc.clone().sub(va))
+    .transformDirection(mesh.matrixWorld)
+    .normalize()
+}
+
+function buildMeshFaceAdjacency(mesh: THREE.Mesh): Map<string, number[]> {
+  const geom = mesh.geometry as THREE.BufferGeometry
+  const index = geom.index
+  const triCount = index ? index.count / 3 : (geom.attributes.position as THREE.BufferAttribute).count / 3
+  const edgeToTris = new Map<string, number[]>()
+  const edgeKey = (a: number, b: number) => (a < b ? `${a}_${b}` : `${b}_${a}`)
+  const triVert = (ti: number, corner: number) => (index ? index.getX(ti * 3 + corner) : ti * 3 + corner)
+  for (let ti = 0; ti < triCount; ti++) {
+    const a = triVert(ti, 0)
+    const b = triVert(ti, 1)
+    const c = triVert(ti, 2)
+    for (const [u, v] of [
+      [a, b],
+      [b, c],
+      [c, a],
+    ] as [number, number][]) {
+      const k = edgeKey(u, v)
+      const list = edgeToTris.get(k) ?? []
+      list.push(ti)
+      edgeToTris.set(k, list)
+    }
+  }
+  const adj = new Map<number, number[]>()
+  for (const tris of edgeToTris.values()) {
+    if (tris.length !== 2) continue
+    const [t0, t1] = tris
+    const l0 = adj.get(t0) ?? []
+    l0.push(t1)
+    adj.set(t0, l0)
+    const l1 = adj.get(t1) ?? []
+    l1.push(t0)
+    adj.set(t1, l1)
+  }
+  return adj
+}
+
+function analyzeMeshSurfaceFromHit(
+  hit: THREE.Intersection,
+  wrapper: THREE.Group,
+): {
+  kind: MeshFaceSurfaceKind
+  normalWorld: THREE.Vector3
+  normalLocal: THREE.Vector3
+  cylinderAxisLocal?: THREE.Vector3
+} | null {
+  const mesh = hit.object as THREE.Mesh
+  if (!mesh.geometry || hit.faceIndex === undefined) return null
+  const startTri = hit.faceIndex
+  const adj = buildMeshFaceAdjacency(mesh)
+  const normals: THREE.Vector3[] = []
+  const queue = [startTri]
+  const seen = new Set<number>([startTri])
+  while (queue.length > 0 && normals.length < MESH_PATCH_MAX_TRIS) {
+    const ti = queue.pop()!
+    const n = meshTriangleWorldNormal(mesh, ti)
+    if (n) normals.push(n)
+    const nb = adj.get(ti) ?? []
+    for (const nt of nb) {
+      if (seen.has(nt)) continue
+      seen.add(nt)
+      queue.push(nt)
+    }
+  }
+  if (normals.length === 0) return null
+  const avg = new THREE.Vector3()
+  normals.forEach((n) => avg.add(n))
+  if (avg.lengthSq() < 1e-12) return null
+  avg.normalize()
+  let maxDev = 0
+  for (const n of normals) {
+    maxDev = Math.max(maxDev, 1 - Math.abs(n.dot(avg)))
+  }
+  const normalWorld = avg.clone()
+  const normalLocal = worldNormalToModelLocal(wrapper, normalWorld)
+  if (maxDev <= PLANAR_NORMAL_MAX_DEV) {
+    return { kind: 'plane', normalWorld, normalLocal }
+  }
+  let bestAxis: THREE.Vector3 | null = null
+  let bestScore = Infinity
+  for (let i = 0; i < Math.min(normals.length, 48); i++) {
+    for (let j = i + 1; j < Math.min(normals.length, 48); j++) {
+      const c = new THREE.Vector3().crossVectors(normals[i], normals[j])
+      if (c.lengthSq() < 0.02) continue
+      c.normalize()
+      let s = 0
+      for (const n of normals) s += Math.abs(n.dot(c))
+      const score = s / normals.length
+      if (score < bestScore) {
+        bestScore = score
+        bestAxis = c.clone()
+      }
+    }
+  }
+  if (bestAxis && bestScore <= CYLINDER_AXIS_MAX_DOT) {
+    const cylinderAxisLocal = worldNormalToModelLocal(wrapper, bestAxis)
+    return { kind: 'cylinder', normalWorld, normalLocal, cylinderAxisLocal }
+  }
+  return { kind: 'unknown', normalWorld, normalLocal }
+}
+
+function assemblyPickRequiresPlanarSurface(): boolean {
+  if (assemblyMateType.value === 'coord') return true
+  if (assemblyMateType.value === 'symmetric') return true
+  return assemblyMateType.value === 'plane' || assemblyMateType.value === 'distance'
+}
+
+function buildAssemblyPlaneFromHit(
+  hit: THREE.Intersection,
+  wrapper: THREE.Group,
+  modelId: string,
+): { pick: AssemblyPlaneSelection | null; error?: string } {
+  const face = hit.face
+  if (!face) return { pick: null, error: 'Грань не определена.' }
+  const analysis = analyzeMeshSurfaceFromHit(hit, wrapper)
+  if (!analysis) return { pick: null, error: 'Не удалось проанализировать грань.' }
+  if (assemblyPickRequiresPlanarSurface()) {
+    if (analysis.kind === 'cylinder') {
+      return {
+        pick: null,
+        error:
+          'Цилиндрическая поверхность: для совмещения плоскостей выберите плоскую грань. Сопряжение осей цилиндров будет добавлено отдельно.',
+      }
+    }
+    if (analysis.kind !== 'plane') {
+      return { pick: null, error: 'Нужна плоская грань (клик по грани, а не по ребру или скруглению).' }
+    }
+  }
+  const localPoint = wrapper.worldToLocal(hit.point.clone())
+  const tri = buildWorldFaceTriangleFromHit(hit)
+  const pick: AssemblyPlaneSelection = {
+    modelId,
+    point: hit.point.clone(),
+    localPoint,
+    normal: analysis.normalLocal.clone(),
+    surfaceKind: analysis.kind,
+  }
+  if (analysis.cylinderAxisLocal) pick.cylinderAxisLocal = analysis.cylinderAxisLocal.clone()
+  if (tri) pick.previewGeometry = tri
+  return { pick }
 }
 
 function buildWorldFaceTriangleFromHit(hit: THREE.Intersection): THREE.BufferGeometry | null {
@@ -4776,6 +6724,78 @@ function addStoredPlaneIndicator(sp: StoredAssemblyPlane, color: number, opacity
   addAssemblyPlaneDiskIndicator(sp.modelId, local, nw, color, opacity)
 }
 
+function worldCoordSystemScale(): number {
+  const sceneBox = getFullSceneBox()
+  if (sceneBox) {
+    const s = sceneBox.getSize(new THREE.Vector3())
+    return Math.max(800, Math.max(s.x, s.y, s.z) * 0.35)
+  }
+  return Math.max(800, loadedSceneCharDim * 0.35)
+}
+
+function syncWorldCoordSystemGroup() {
+  if (!scene) return
+  if (!showWorldCoordSystem.value) {
+    if (worldCoordSystemGroup) worldCoordSystemGroup.visible = false
+    return
+  }
+  if (!worldCoordSystemGroup) {
+    worldCoordSystemGroup = new THREE.Group()
+    worldCoordSystemGroup.name = 'WorldCoordSystem'
+    const axes = new THREE.AxesHelper(1)
+    axes.name = 'WorldAxes'
+    worldCoordSystemGroup.add(axes)
+    for (const opt of WORLD_COORD_PLANE_OPTIONS) {
+      const { normal } = worldCoordPlaneDefinition(opt.id)
+      const size = 1
+      const geom = new THREE.PlaneGeometry(size, size)
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x88aacc,
+        transparent: true,
+        opacity: 0.06,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+      const mesh = new THREE.Mesh(geom, mat)
+      mesh.userData = { worldCoordPlaneId: opt.id, isWorldCoordPlane: true }
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize())
+      mesh.name = `WorldPlane_${opt.id}`
+      worldCoordSystemGroup.add(mesh)
+    }
+    scene.add(worldCoordSystemGroup)
+  }
+  worldCoordSystemGroup.visible = true
+  const scale = worldCoordSystemScale()
+  worldCoordSystemGroup.position.set(0, 0, 0)
+  worldCoordSystemGroup.scale.setScalar(scale)
+  const axes = worldCoordSystemGroup.getObjectByName('WorldAxes') as THREE.AxesHelper | undefined
+  if (axes) axes.scale.setScalar(1)
+}
+
+function selectWorldCoordPlane(id: WorldCoordPlaneId) {
+  assemblyCoordWorldPlane.value = id
+  refreshAllAssemblyVisuals()
+  assemblyStatus.value = `Координатная плоскость: ${worldCoordPlaneOptionLabel(id)} (начало координат сцены 0,0,0).`
+}
+
+function addWorldCoordPlaneVisual(id: WorldCoordPlaneId, color: number, opacity: number) {
+  if (!assemblyHighlightGroup) return
+  const { normal } = worldCoordPlaneDefinition(id)
+  const size = Math.max(loadedSceneCharDim * 1.25, 3000)
+  const geom = new THREE.PlaneGeometry(size, size)
+  const mat = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  })
+  const mesh = new THREE.Mesh(geom, mat)
+  mesh.position.copy(WORLD_COORD_PLANE_ORIGIN)
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal.clone().normalize())
+  assemblyHighlightGroup.add(mesh)
+}
+
 function addPickPlaneVisual(p: AssemblyPlaneSelection, color: number, opacity: number) {
   if (p.previewGeometry && assemblyHighlightGroup) {
     const mat = new THREE.MeshBasicMaterial({
@@ -4805,6 +6825,9 @@ function refreshAllAssemblyVisuals() {
         addStoredPlaneIndicator(m.base2, 0x228844, 0.55)
         addStoredPlaneIndicator(m.part1, 0xaa77ff, 0.55)
         addStoredPlaneIndicator(m.part2, 0x6633cc, 0.55)
+      } else if (m.type === 'coord') {
+        addStoredPlaneIndicator(m.sourcePlane, 0x3399ff, 0.55)
+        addWorldCoordPlaneVisual(m.worldPlane, 0x44dd88, 0.32)
       } else {
         addStoredPlaneIndicator(m.sourcePlane, 0x3399ff, 0.55)
         addStoredPlaneIndicator(m.targetPlane, 0xff8833, 0.55)
@@ -4812,7 +6835,10 @@ function refreshAllAssemblyVisuals() {
       return
     }
   }
-  if (assemblyMateType.value === 'symmetric') {
+  if (assemblyMateType.value === 'coord') {
+    if (assemblySourcePlane.value) addPickPlaneVisual(assemblySourcePlane.value, 0x44aaff, 0.45)
+    addWorldCoordPlaneVisual(assemblyCoordWorldPlane.value, 0x55ee99, 0.28)
+  } else if (assemblyMateType.value === 'symmetric') {
     if (assemblySymBase1.value) addPickPlaneVisual(assemblySymBase1.value, 0x55dd88, 0.45)
     if (assemblySymBase2.value) addPickPlaneVisual(assemblySymBase2.value, 0x33aa55, 0.45)
     if (assemblySymPart1.value) addPickPlaneVisual(assemblySymPart1.value, 0xbb88ff, 0.45)
@@ -4886,6 +6912,33 @@ watch([dimArrowSizeMm, dimLineOffsetMm, dimFontSizeMm], () => {
 
 function onCanvasMouseDown(ev: MouseEvent) {
   if (partContextMenuOpen.value) partContextMenuOpen.value = false
+  if (ev.button === 0 && placementActive.value && placementModelId.value && camera && renderer) {
+    const pt = pickPlacementPlanePoint(ev.clientX, ev.clientY)
+    const g = modelGroupsById.get(placementModelId.value)
+    if (pt && g) placeModelAnchorAtWorld(g, pt)
+    confirmModelPlacement()
+    ev.preventDefault()
+    ev.stopPropagation()
+    return
+  }
+  if (
+    ev.button === 0 &&
+    partBoxSelectMode.value &&
+    !measureModeRef.value &&
+    !modelRotateMode.value &&
+    !leftButtonMoveModel.value &&
+    !placementActive.value
+  ) {
+    boxSelectDrag = {
+      startX: ev.clientX,
+      startY: ev.clientY,
+      additive: !!(ev.ctrlKey || ev.metaKey || ev.shiftKey),
+    }
+    controls.enabled = false
+    ev.preventDefault()
+    ev.stopPropagation()
+    return
+  }
   if (ev.button === 2) {
     rightMouseDown = true
     rightMouseDragged = false
@@ -4980,9 +7033,9 @@ function onCanvasMouseDown(ev: MouseEvent) {
     const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
     const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
     raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
-    const hits = raycaster.intersectObject(meshGroup, true)
-    if (hits.length > 0) {
-      const wrapper = findWrapperGroup(hits[0].object)
+    const rotateHit = pickSolidSurfaceHit(intersectPickableMeshes(raycaster))
+    if (rotateHit) {
+      const wrapper = findWrapperGroup(rotateHit.object)
       if (wrapper) {
         const mid = String(wrapper.userData?.modelId ?? '')
         if (mid && !isModelPinned(mid)) {
@@ -5008,16 +7061,16 @@ function onCanvasMouseDown(ev: MouseEvent) {
     const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
     const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
     raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
-    const hits = raycaster.intersectObject(meshGroup, true)
-    if (hits.length > 0) {
-      const wrapper = findWrapperGroup(hits[0].object)
+    const moveHit = pickSolidSurfaceHit(intersectPickableMeshes(raycaster))
+    if (moveHit) {
+      const wrapper = findWrapperGroup(moveHit.object)
       if (wrapper) {
         const mid = String(wrapper.userData?.modelId ?? '')
         if (mid && isModelPinned(mid)) return
         dragMoveUndoBefore = getTransformSnapshot(wrapper)
         draggedModelGroup = wrapper
         dragStartModelPos = wrapper.position.clone()
-        dragStartIntersection = hits[0].point.clone()
+        dragStartIntersection = moveHit.point.clone()
         didDragModel = false
         controls.enabled = false
         ev.preventDefault()
@@ -5042,10 +7095,10 @@ function tryPickContextTarget(clientX: number, clientY: number): boolean {
   const mx = ((clientX - rect.left) / rect.width) * 2 - 1
   const my = -((clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(new THREE.Vector2(mx, my), camera)
-  const hits = raycaster.intersectObject(meshGroup, true)
-  if (hits.length > 0) {
-    const wrapper = findWrapperGroup(hits[0].object)
-    const partNode = wrapper ? findPartNodeInWrapper(hits[0].object, wrapper) : null
+  const pickHit = pickSolidSurfaceHit(intersectPickableMeshes(raycaster))
+  if (pickHit) {
+    const wrapper = findWrapperGroup(pickHit.object)
+    const partNode = wrapper ? findPartNodeInWrapper(pickHit.object, wrapper) : null
     if (wrapper && partNode) {
       contextMenuTargetPart = partNode
       const mid = String(wrapper.userData?.modelId ?? '')
@@ -5146,11 +7199,13 @@ function onCanvasMouseMovePan(ev: MouseEvent) {
     const dy = ev.clientY - dragRotateLastClientY
     dragRotateLastClientX = ev.clientX
     dragRotateLastClientY = ev.clientY
-    rotateWrapperAroundPivotDragAxes(
+    rotateWrapperAroundPivotScreenAxes(
       draggedRotateWrapper,
       dragRotatePivotLocal,
-      dx * MODEL_ROTATE_MOUSE_SENS,
-      -dy * MODEL_ROTATE_MOUSE_SENS,
+      dx,
+      dy,
+      camera,
+      controls.target,
     )
     return
   }
@@ -5172,6 +7227,12 @@ function onCanvasMouseMovePan(ev: MouseEvent) {
 }
 
 function onCanvasMouseUp(ev: MouseEvent) {
+  if (ev.button === 0 && boxSelectDrag) {
+    finishBoxSelect(ev.clientX, ev.clientY)
+    ev.preventDefault()
+    ev.stopPropagation()
+    return
+  }
   if (ev.button === 2) {
     if (rightMouseDown && !rightMouseDragged && contextMenuCanShow.value && tryPickContextTarget(ev.clientX, ev.clientY)) {
       showContextMenuAt(ev.clientX, ev.clientY)
@@ -5253,7 +7314,9 @@ function onCanvasWheel(ev: WheelEvent) {
   lastWheelTime = now
   const dist = camera.position.distanceTo(zoomAnchorPoint)
   const sign = mouseInvertWheel.value ? (ev.deltaY > 0 ? 1 : -1) : (ev.deltaY > 0 ? -1 : 1)
-  const zoomFactor = 1 + sign * mouseZoomSpeed.value * Math.max(1, dist * 0.001)
+  /** Процентный зум (~5–7% за шаг): не зависит от расстояния — без рывков на больших сборках. */
+  const step = mouseZoomSpeed.value * 2.4
+  const zoomFactor = sign > 0 ? 1 / (1 + step) : 1 + step
   let newDist = dist * zoomFactor
   const minD = mouseMinDistance.value
   const maxD = mouseMaxDistance.value
@@ -5261,6 +7324,7 @@ function onCanvasWheel(ev: WheelEvent) {
   const dirFromPoint = camera.position.clone().sub(zoomAnchorPoint).normalize()
   camera.position.copy(zoomAnchorPoint).add(dirFromPoint.multiplyScalar(newDist))
   controls.target.copy(zoomAnchorPoint)
+  updateCameraClipPlanes()
   rebuildSavedMeasurementsVisuals()
 }
 
@@ -5278,21 +7342,23 @@ function onCanvasClick(ev: MouseEvent) {
   mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1
   mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(mouse, camera)
-  const hits = raycaster.intersectObject(meshGroup, true)
+  const hits = intersectPickableMeshes(raycaster)
   if (remarkAnchorPickMode.value && selectedRemark.value) {
-    if (hits.length === 0) {
+    const surfaceHit = pickSolidSurfaceHit(hits)
+    if (!surfaceHit) {
       window.alert('Кликните по детали в сцене, чтобы поставить якорь.')
       return
     }
-    pickRemarkAnchorFromHit(hits[0])
+    pickRemarkAnchorFromHit(surfaceHit)
     return
   }
   if (assemblyPickTarget.value) {
-    if (hits.length === 0) {
+    const surfaceHit = pickSolidSurfaceHit(hits)
+    if (!surfaceHit) {
       assemblyStatus.value = 'Не попали в модель. Кликните по нужной плоскости.'
       return
     }
-    pickAssemblyPlaneFromHit(hits[0])
+    pickAssemblyPlaneFromHit(surfaceHit)
     return
   }
   if (measureModeRef.value && measureType === 'cad-linear') {
@@ -5305,33 +7371,44 @@ function onCanvasClick(ev: MouseEvent) {
     return
   }
   if ((assemblyPanelOpen.value || (assemblySourceModelId.value && assemblyTargetModelId.value)) && hits.length > 0) {
-    const wrapper = findWrapperGroup(hits[0].object)
-    const modelId = String(wrapper?.userData?.modelId ?? '')
-    const autoTarget = modelId ? inferAutoAssemblyPickTarget(modelId) : null
-    if (autoTarget) {
-      assemblyPickTarget.value = autoTarget
-      pickAssemblyPlaneFromHit(hits[0])
-      return
+    const surfaceHit = pickSolidSurfaceHit(hits)
+    if (surfaceHit) {
+      const wrapper = findWrapperGroup(surfaceHit.object)
+      const modelId = String(wrapper?.userData?.modelId ?? '')
+      const autoTarget = modelId ? inferAutoAssemblyPickTarget(modelId) : null
+      if (autoTarget) {
+        assemblyPickTarget.value = autoTarget
+        pickAssemblyPlaneFromHit(surfaceHit)
+        return
+      }
     }
   }
   if (sectionModeRef.value) {
-    if (hits.length === 0) return
-    const hit = hits[0]
-    const worldNormal = hit.face!.normal.clone().transformDirection(hit.object.matrixWorld)
-    setSectionFromHit(hit.point.clone(), worldNormal)
+    const surfaceHit = pickSolidSurfaceHit(hits)
+    if (!surfaceHit) return
+    const worldNormal = surfaceHit.face!.normal.clone().transformDirection(surfaceHit.object.matrixWorld)
+    setSectionFromHit(surfaceHit.point.clone(), worldNormal)
     return
   }
   if (!measureModeRef.value) {
-    if (hits.length > 0) {
-      const hit = hits[0]
-      const wrap = findWrapperGroup(hit.object)
+    const partHit = firstSolidPartHit(hits)
+    if (partHit) {
+      const wrap = findWrapperGroup(partHit.mesh)
       if (wrap) {
         const mid = String(wrap.userData?.modelId ?? '')
-        if (mid) focusedModelId.value = mid
+        if (mid) {
+          focusedModelId.value = mid
+          const row = findPartRowForMeshUuid(mid, partHit.mesh.uuid)
+          if (row) selectComponentRow(mid, row.id, ev)
+        }
       }
-      const worldNormal = hit.face!.normal.clone().transformDirection(hit.object.matrixWorld).normalize()
-      selectedFacePoint = hit.point.clone()
-      selectedFaceNormal = worldNormal
+      if (partHit.hit.face) {
+        selectedFacePoint = partHit.hit.point.clone()
+        selectedFaceNormal = partHit.hit.face.normal
+          .clone()
+          .transformDirection(partHit.mesh.matrixWorld)
+          .normalize()
+      }
     } else {
       focusedModelId.value = null
     }
@@ -5344,11 +7421,11 @@ function onCanvasClick(ev: MouseEvent) {
     `MeasureClick#${clickId} start: type=${measureType}, hits=${hits.length}, points=${measurementPoints.length}, mode=${measureModeRef.value ? 'on' : 'off'}`
   )
   if (measureType === 'radius') {
-    if (hits.length === 0) {
+    const hit = pickSolidSurfaceHit(hits)
+    if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} radius: no hits`)
       return
     }
-    const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const wrapper = findWrapperGroup(hit.object)
     const modelId = String(wrapper?.userData?.modelId ?? '')
@@ -5379,7 +7456,8 @@ function onCanvasClick(ev: MouseEvent) {
     return
   }
   if (measureType === 'diameter') {
-    if (hits.length === 0) {
+    const hit = pickSolidSurfaceHit(hits)
+    if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} diameter: no hits`)
       return
     }
@@ -5391,7 +7469,6 @@ function onCanvasClick(ev: MouseEvent) {
       radiusOrDiameterResult = null
       updateMeasurementGraphics()
     }
-    const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const wrapper = findWrapperGroup(hit.object)
     const modelId = String(wrapper?.userData?.modelId ?? '')
@@ -5478,11 +7555,11 @@ function onCanvasClick(ev: MouseEvent) {
     return
   }
   if (measureType === 'arc') {
-    if (hits.length === 0) {
+    const hit = pickSolidSurfaceHit(hits)
+    if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} arc: no hits`)
       return
     }
-    const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const candidates = getSnapCandidates(hit)
     const closest = getClosestSnapPoint(candidates, camera, mouse)
@@ -5513,11 +7590,11 @@ function onCanvasClick(ev: MouseEvent) {
     return
   }
   if (measureType === 'hole-center-distance') {
-    if (hits.length === 0) {
+    const hit = pickSolidSurfaceHit(hits)
+    if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} hole-center-distance: no hits`)
       return
     }
-    const hit = hits[0]
     const mesh = hit.object as THREE.Mesh
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
       ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
@@ -5568,11 +7645,11 @@ function onCanvasClick(ev: MouseEvent) {
     logger.info('Viewer3D', `MeasureClick#${clickId} done hole-center-distance: ${(performance.now() - clickT0).toFixed(1)} ms`)
     return
   }
-  if (hits.length === 0) {
+  const hit = pickSolidSurfaceHit(hits)
+  if (!hit) {
     logger.info('Viewer3D', `MeasureClick#${clickId} distance: no hits`)
     return
   }
-  const hit = hits[0]
   const mesh = hit.object as THREE.Mesh
   const wrapper = findWrapperGroup(hit.object)
   const modelId = String(wrapper?.userData?.modelId ?? '')
@@ -6584,7 +8661,8 @@ function renderModelThumbnail(group: THREE.Object3D, width = 160, height = 120):
       camera.lookAt(center)
       const tempScene = new THREE.Scene()
       tempScene.background = new THREE.Color(0xf0f0f0)
-      tempScene.add(group.clone(true))
+      const thumbClone = group.clone(true)
+      tempScene.add(thumbClone)
       tempScene.add(new THREE.AmbientLight(0xffffff, 0.8))
       const dir = new THREE.DirectionalLight(0xffffff, 0.6)
       dir.position.set(maxDim, maxDim, maxDim)
@@ -6596,6 +8674,7 @@ function renderModelThumbnail(group: THREE.Object3D, width = 160, height = 120):
       renderer.readRenderTargetPixels(rt, 0, 0, width, height, pixels)
       renderer.setRenderTarget(null)
       rt.dispose()
+      disposeObject3DResources(thumbClone)
       const canvas = document.createElement('canvas')
       canvas.width = width
       canvas.height = height
@@ -6616,7 +8695,7 @@ function renderModelThumbnail(group: THREE.Object3D, width = 160, height = 120):
         }
       }
       ctx.putImageData(imageData, 0, 0)
-      resolve(canvas.toDataURL('image/png') || '')
+      resolve(canvas.toDataURL('image/jpeg', 0.82) || '')
     } catch {
       resolve('')
     }
@@ -6680,35 +8759,24 @@ function loadGlbUrl(
           loadedModels.value = []
         }
         wrapper.add(gltf.scene)
+        ensureModelUnitsMillimeters(wrapper)
         ensureExplodeCacheForModel(wrapper)
-        markImportedMeshColors(gltf.scene)
-        if (partMeta) {
-          const r = bindPartMetaToMeshes(gltf.scene, partMeta)
-          logger.info('Viewer3D', `meta.json загружен: привязано ${r.mapped}/${r.totalMeshes} мешей`)
-        }
-        if (opts && meshGroup.children.length > 0) {
-          const box = new THREE.Box3().setFromObject(wrapper)
-          const size = box.getSize(new THREE.Vector3())
-          let maxX = -Infinity
-          for (const c of meshGroup.children) {
-            const b = new THREE.Box3().setFromObject(c)
-            maxX = Math.max(maxX, b.max.x)
-          }
-          if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
-        }
+        finalizeModelPartColors(gltf.scene, partMeta)
+        const hadModelsBeforeAdd = meshGroup.children.length > 0
         meshGroup.add(wrapper)
         if (opts) buildComponentTreeForModel(opts.modelId, wrapper)
         applyShadingMode()
-        if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
+        syncWireframeEdges(wrapper)
         if (currentSectionAxis) setSectionAxis(currentSectionAxis)
         else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
-        const box = new THREE.Box3().setFromObject(meshGroup)
-        const size = box.getSize(new THREE.Vector3())
+        const loadBox = new THREE.Box3().setFromObject(wrapper)
         const sceneMs = performance.now() - t0
-        console.log(
-          `${LOG_PREFIX} GLB: габариты ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)}, загрузка в сцену: ${(sceneMs / 1000).toFixed(2)} с`
-        )
-        centerModel(box)
+          if (!loadBox.isEmpty()) {
+          const size = loadBox.getSize(new THREE.Vector3())
+          console.log(
+            `${LOG_PREFIX} GLB: габариты ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)}, загрузка в сцену: ${(sceneMs / 1000).toFixed(2)} с`
+          )
+        }
         URL.revokeObjectURL(url)
         if (opts) {
           const visibleCount = loadedModels.value.filter((m) => m.inScene).length
@@ -6724,11 +8792,17 @@ function loadGlbUrl(
             ...loadedModels.value,
             { id: opts.modelId, name: opts.modelName, thumbnailDataUrl: THUMBNAIL_PLACEHOLDER, inScene },
           ]
-          loadedFileName = opts.modelName
-          if (inScene && meshGroup.children.length > 0) {
-            const box = new THREE.Box3().setFromObject(meshGroup)
-            centerModel(box)
+          if (inScene) {
+            focusedModelId.value = opts.modelId
+            expandedModelIds.value = { ...expandedModelIds.value, [opts.modelId]: true }
+            afterModelAddedToScene(wrapper, opts.modelId, hadModelsBeforeAdd, true)
+            const sceneBox = new THREE.Box3().setFromObject(meshGroup)
+            if (!sceneBox.isEmpty()) {
+              if (!hadModelsBeforeAdd) centerModel(sceneBox)
+              else if (!placementActive.value) refreshScenePresentationFromReference()
+            }
           }
+          loadedFileName = opts.modelName
           const scheduleThumb = () => {
             const cb = () => {
               renderModelThumbnail(wrapper).then((thumb) => {
@@ -6756,6 +8830,9 @@ function loadGlbUrl(
             }
             alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
           }
+        } else if (!loadBox.isEmpty()) {
+          anchorModelCenterAtWorldOrigin(wrapper)
+          centerModel(new THREE.Box3().setFromObject(meshGroup))
         }
         scheduleSceneMetricsRecalc()
         resolve()
@@ -6798,27 +8875,13 @@ async function loadSTL(
   }
   wrapper.add(mesh)
   applyShadingMode()
-  if (opts && meshGroup.children.length > 0) {
-    const box = new THREE.Box3().setFromObject(wrapper)
-    const size = box.getSize(new THREE.Vector3())
-    let maxX = -Infinity
-    for (const c of meshGroup.children) {
-      const b = new THREE.Box3().setFromObject(c)
-      maxX = Math.max(maxX, b.max.x)
-    }
-    if (maxX > -Infinity) wrapper.position.x = maxX + size.x / 2 + 30
-  }
+  const hadModelsBeforeAddStl = meshGroup.children.length > 0
   meshGroup.add(wrapper)
   // ensureExplodeCacheForModel(wrapper)
   if (opts) buildComponentTreeForModel(opts.modelId, wrapper)
-  if (wireframeModeRef.value) applyWireframeToObject(wrapper, true)
+  syncWireframeEdges(wrapper)
   if (currentSectionAxis) setSectionAxis(currentSectionAxis)
   else if (sectionPlane) applySectionToMeshGroup(sectionPlane)
-  const box = new THREE.Box3().setFromObject(meshGroup)
-  const size = box.getSize(new THREE.Vector3())
-  logger.info('Viewer3D', `STL загружен: ${geometry.attributes.position?.count ?? 0} вершин, габариты ${size.x.toFixed(0)}×${size.y.toFixed(0)}×${size.z.toFixed(0)}`)
-  console.log(`${LOG_PREFIX} STL: габариты модели ${size.x.toFixed(1)} x ${size.y.toFixed(1)} x ${size.z.toFixed(1)}, центрирование камеры`)
-  centerModel(box)
   if (opts) {
     const visibleCount = loadedModels.value.filter((m) => m.inScene).length
     const inScene = visibleCount < MAX_MODELS_IN_SCENE
@@ -6834,9 +8897,13 @@ async function loadSTL(
       { id: opts.modelId, name: opts.modelName, thumbnailDataUrl: THUMBNAIL_PLACEHOLDER, inScene },
     ]
     loadedFileName = opts.modelName
-    if (inScene && meshGroup.children.length > 0) {
+    if (inScene) {
+      afterModelAddedToScene(wrapper, opts.modelId, hadModelsBeforeAddStl, true)
       const bbox = new THREE.Box3().setFromObject(meshGroup)
-      centerModel(bbox)
+      if (!bbox.isEmpty()) {
+        if (!hadModelsBeforeAddStl) centerModel(bbox)
+        else if (!placementActive.value) refreshScenePresentationFromReference()
+      }
     }
     const scheduleThumb = () => {
       const cb = () => {
@@ -6859,6 +8926,9 @@ async function loadSTL(
     }
     scheduleThumb()
     if (!inScene) alert(`В сцене уже ${MAX_MODELS_IN_SCENE} моделей. Модель добавлена в библиотеку — нажмите на неё, чтобы показать.`)
+  } else {
+    const box = new THREE.Box3().setFromObject(meshGroup)
+    if (!box.isEmpty()) centerModel(box)
   }
   scheduleSceneMetricsRecalc()
 }
@@ -7336,7 +9406,7 @@ onUnmounted(() => {
     containerRef.value.removeChild(hoverTooltipEl)
   }
   hoverTooltipEl = null
-  clearMeshGroup()
+  disposeAllLoadedModels()
   if (animationId) cancelAnimationFrame(animationId)
   stripStaleAssemblyFaceTriangles()
   disposeAssemblyHighlightGroupMeshes()
@@ -7396,10 +9466,20 @@ function getMeasurementReport():
   return null
 }
 
+function onModelCardClick(item: { id: string; inScene: boolean }) {
+  onModelTreeHeaderClick(item)
+}
+
 function setModelInScene(id: string, inScene: boolean) {
   const group = modelGroupsById.get(id)
   const item = loadedModels.value.find((m) => m.id === id)
   if (!group || !item) return
+  if (!inScene && placementModelId.value === id) {
+    placementActive.value = false
+    placementModelId.value = null
+    placementStatusHint.value = ''
+    placementCancelRemovesFromScene = false
+  }
   if (inScene) {
     const visibleCount = loadedModels.value.filter((m) => m.inScene).length
     if (visibleCount >= MAX_MODELS_IN_SCENE) {
@@ -7407,32 +9487,33 @@ function setModelInScene(id: string, inScene: boolean) {
       return
     }
     if (!meshGroup.children.includes(group)) {
-      if (meshGroup.children.length > 0) {
-        const box = new THREE.Box3().setFromObject(group)
-        const size = box.getSize(new THREE.Vector3())
-        let maxX = -Infinity
-        for (const c of meshGroup.children) {
-          const b = new THREE.Box3().setFromObject(c)
-          maxX = Math.max(maxX, b.max.x)
-        }
-        if (maxX > -Infinity) group.position.x = maxX + size.x / 2 + 30
-      }
       meshGroup.add(group)
       if (!componentTreeByModel.value[id]) buildComponentTreeForModel(id, group)
     }
-    if (wireframeModeRef.value) applyWireframeToObject(group, true)
+    syncWireframeEdges(group)
     applyShadingMode()
     group.visible = true
   } else {
     meshGroup.remove(group)
     removeOverlayForModel(id)
+    purgeModelAuxiliaryState(group)
     group.visible = false
   }
   refreshComponentTreeVisibility(id)
   loadedModels.value = loadedModels.value.map((m) => (m.id === id ? { ...m, inScene } : m))
-  if (meshGroup.children.length > 0) {
-    const box = new THREE.Box3().setFromObject(meshGroup)
-    centerModel(box)
+  if (inScene) {
+    focusedModelId.value = id
+    const othersInScene = loadedModels.value.filter((m) => m.inScene && m.id !== id).length
+    if (othersInScene === 0) {
+      anchorModelCenterAtWorldOrigin(group)
+      const box = new THREE.Box3().setFromObject(meshGroup)
+      if (!box.isEmpty()) centerModel(box)
+    } else {
+      beginModelPlacement(id, { removeFromSceneOnCancel: true })
+    }
+  } else if (meshGroup.children.length > 0) {
+    refreshScenePresentationFromReference()
+    applyNavigationForFocusedModel()
   }
   scheduleSceneMetricsRecalc()
 }
@@ -7446,13 +9527,16 @@ function deleteFocusedModel() {
 }
 
 function removeModel(id: string) {
+  if (placementModelId.value === id) cancelModelPlacement()
+  if (partTreeIsolateState.value?.modelId === id) restorePartTreeIsolate()
   const group = modelGroupsById.get(id)
-  if (!group || !meshGroup) return
+  if (!group) return
+  purgeModelAuxiliaryState(group)
   const nextPin = { ...pinnedByModelId.value }
   delete nextPin[id]
   pinnedByModelId.value = nextPin
   if (focusedModelId.value === id) focusedModelId.value = null
-  meshGroup.remove(group)
+  if (meshGroup) meshGroup.remove(group)
   removeOverlayForModel(id, true)
   const { [id]: _removed, ...restTrees } = componentTreeByModel.value
   componentTreeByModel.value = restTrees
@@ -7529,8 +9613,22 @@ function planeToExported(sp: StoredAssemblyPlane, idToName: Map<string, string>)
 
 function mateToExported(m: StoredAssemblyMate, idToName: Map<string, string>): ExportedAssemblyMate | null {
   const sn = idToName.get(m.sourceId)
+  if (!sn) return null
+  if (m.type === 'coord') {
+    const a = planeToExported(m.sourcePlane, idToName)
+    if (!a) return null
+    return {
+      id: m.id,
+      type: 'coord',
+      sourceModelName: sn,
+      sourcePlane: a,
+      worldPlane: m.worldPlane,
+      distanceMm: m.distanceMm,
+      flipNormal: m.flipNormal,
+    }
+  }
   const tn = idToName.get(m.targetId)
-  if (!sn || !tn) return null
+  if (!tn) return null
   if (m.type === 'plane') {
     const a = planeToExported(m.sourcePlane, idToName)
     const b = planeToExported(m.targetPlane, idToName)
@@ -7570,13 +9668,27 @@ function mateToExported(m: StoredAssemblyMate, idToName: Map<string, string>): E
 
 function mateFromExported(m: ExportedAssemblyMate, nameToId: Map<string, string>): StoredAssemblyMate | null {
   const sid = nameToId.get(m.sourceModelName)
-  const tid = nameToId.get(m.targetModelName)
-  if (!sid || !tid) return null
+  if (!sid) return null
   const ip = (p: ExportedAssemblyPlane): StoredAssemblyPlane | null => {
     const mid = nameToId.get(p.modelName)
     if (!mid) return null
     return storedPlaneFromExported(p, mid)
   }
+  if (m.type === 'coord') {
+    const sp = ip(m.sourcePlane)
+    if (!sp) return null
+    return {
+      id: m.id,
+      type: 'coord',
+      sourceId: sid,
+      sourcePlane: sp,
+      worldPlane: m.worldPlane,
+      distanceMm: m.distanceMm,
+      flipNormal: !!m.flipNormal,
+    }
+  }
+  const tid = nameToId.get(m.targetModelName)
+  if (!tid) return null
   if (m.type === 'plane') {
     const sp = ip(m.sourcePlane)
     const tp = ip(m.targetPlane)
@@ -7614,6 +9726,58 @@ function mateFromExported(m: ExportedAssemblyMate, nameToId: Map<string, string>
   }
 }
 
+function collectPartLayersForProject(): AssemblyProjectPartLayerV1[] {
+  const out: AssemblyProjectPartLayerV1[] = []
+  const seen = new Set<string>()
+  for (const m of loadedModels.value) {
+    const g = modelGroupsById.get(m.id)
+    if (!g) continue
+    g.traverse((obj: THREE.Object3D) => {
+      if (!(obj instanceof THREE.Mesh)) return
+      const geomKey = meshPartGroupKey(obj, inferComponentLabel(obj) || obj.name || '')
+      const layerId = meshLayerByUuid.value[obj.uuid] ?? 'layer-0'
+      const colorOverride = layerColorOverrideByUuid.value[obj.uuid]
+      if (layerId === 'layer-0' && !colorOverride) return
+      const dedupe = `${m.name}\0${geomKey}\0${layerId}\0${colorOverride ?? ''}`
+      if (seen.has(dedupe)) return
+      seen.add(dedupe)
+      out.push({
+        modelName: m.name,
+        geomKey,
+        layerId,
+        ...(colorOverride ? { colorOverride } : {}),
+      })
+    })
+  }
+  return out
+}
+
+function applyPartLayersFromProject(partLayers: AssemblyProjectPartLayerV1[]) {
+  if (!partLayers.length) return
+  const nameToId = new Map(loadedModels.value.map((m) => [m.name, m.id]))
+  const nextMeshLayer: Record<string, string> = { ...meshLayerByUuid.value }
+  const nextColors: Record<string, string> = { ...layerColorOverrideByUuid.value }
+  for (const pl of partLayers) {
+    const modelId = nameToId.get(pl.modelName)
+    const g = modelId ? modelGroupsById.get(modelId) : undefined
+    if (!g) continue
+    g.traverse((obj: THREE.Object3D) => {
+      if (!(obj instanceof THREE.Mesh)) return
+      if (meshGeometryGroupKey(obj) !== pl.geomKey) return
+      nextMeshLayer[obj.uuid] = pl.layerId
+      if (pl.colorOverride) {
+        nextColors[obj.uuid] = pl.colorOverride
+        if (obj.material && 'color' in obj.material) {
+          ;(obj.material as THREE.MeshPhongMaterial).color.set(pl.colorOverride)
+        }
+      }
+    })
+  }
+  meshLayerByUuid.value = nextMeshLayer
+  layerColorOverrideByUuid.value = nextColors
+  applySceneLayerVisibility()
+}
+
 function saveAssemblyProjectJson(): void {
   if (loadedModels.value.length === 0) {
     alert('Нет загруженных моделей — нечего сохранять.')
@@ -7639,12 +9803,20 @@ function saveAssemblyProjectJson(): void {
     const ex = mateToExported(m, idToName)
     if (ex) assemblyMatesOut.push(ex)
   }
+  const partLayers = collectPartLayersForProject()
   const payload: AssemblyProjectFileV1 = {
     format: '3d-viewer-assembly-project',
     version: 1,
     savedAt: new Date().toISOString(),
     models,
     assemblyMates: assemblyMatesOut,
+    sceneLayers: sceneLayers3d.value.map((l) => ({
+      id: l.id,
+      name: l.name,
+      color: l.color,
+      visible: l.visible,
+    })),
+    ...(partLayers.length > 0 ? { partLayers } : {}),
   }
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' })
   const a = document.createElement('a')
@@ -7653,7 +9825,7 @@ function saveAssemblyProjectJson(): void {
   a.download = `assembly-project-${stamp}.json`
   a.click()
   URL.revokeObjectURL(a.href)
-  logger.info('Viewer3D', `Проект сборки сохранён (${models.length} моделей, ${assemblyMatesOut.length} связей)`)
+  logger.info('Viewer3D', `Проект сборки сохранён (${models.length} моделей, ${assemblyMatesOut.length} связей, ${partLayers.length} назначений слоёв)`)
 }
 
 function applyAssemblyProjectJson(data: unknown): { ok: boolean; message: string } {
@@ -7693,9 +9865,24 @@ function applyAssemblyProjectJson(data: unknown): { ok: boolean; message: string
   assemblyMates.value = importedMates
   selectedAssemblyMateId.value = null
   meshGroup.updateMatrixWorld(true)
+  if (Array.isArray(obj.sceneLayers) && obj.sceneLayers.length > 0) {
+    sceneLayers3d.value = obj.sceneLayers.map((l) => ({
+      id: String(l.id),
+      name: String(l.name),
+      color: String(l.color ?? '#e8eef8'),
+      visible: l.visible !== false,
+    }))
+  }
+  if (Array.isArray(obj.partLayers) && obj.partLayers.length > 0) {
+    applyPartLayersFromProject(obj.partLayers)
+  }
   refreshAfterAssemblyMove()
   refreshAllAssemblyVisuals()
-  assemblyStatus.value = `Проект загружен: ${obj.models!.length} моделей, ${importedMates.length} связей.`
+  const layerInfo =
+    Array.isArray(obj.partLayers) && obj.partLayers.length > 0
+      ? `, слои: ${obj.sceneLayers?.length ?? sceneLayers3d.value.length}, назначений: ${obj.partLayers.length}`
+      : ''
+  assemblyStatus.value = `Проект загружен: ${obj.models!.length} моделей, ${importedMates.length} связей${layerInfo}.`
   logger.info('Viewer3D', assemblyStatus.value)
   return { ok: true, message: assemblyStatus.value }
 }
@@ -7716,6 +9903,16 @@ function cancelActiveTool(): boolean {
   }
   if (cadLinearPickTarget.value) {
     cadLinearPickTarget.value = null
+    cancelled = true
+  }
+  if (placementActive.value) {
+    cancelModelPlacement()
+    cancelled = true
+  }
+  if (partBoxSelectMode.value) {
+    partBoxSelectMode.value = false
+    boxSelectDrag = null
+    boxSelectRect.value = null
     cancelled = true
   }
   return cancelled
@@ -7750,6 +9947,8 @@ defineExpose({
   setLeftSidebarTab,
   cancelActiveTool,
   undoLastAction: () => undoTransform(),
+  openSettingsModal,
+  closeSettingsModal,
   saveModel3dRemarksToFile,
   confirmDiscardModel3dRemarksAsync,
   get isRemarksDirty() {
@@ -7769,6 +9968,7 @@ defineExpose({
         <button type="button" :class="{ active: headerToolsTab === 'viewTools' }" @click="headerToolsTab = 'viewTools'">Вид и инструменты</button>
         <button type="button" :class="{ active: headerToolsTab === 'display' }" @click="headerToolsTab = 'display'">Отображение</button>
         <button type="button" :class="{ active: headerToolsTab === 'export' }" @click="headerToolsTab = 'export'">Экспорт</button>
+        <button type="button" class="viewer-settings-open-btn" title="Настройки сцены, мыши и цвета" @click="openSettingsModal">Настройки</button>
       </div>
       <div class="viewer-3d-tools">
         <div v-show="headerToolsTab === 'viewTools'" class="viewer-header-block" data-group="Вид и инструменты">
@@ -7954,7 +10154,7 @@ defineExpose({
               @input="onHeaderOffsetInput"
             />
           </template>
-          <button type="button" class="viewer-3d-btn" :class="{ active: measureMode || leftSidebarTab === 'measurements' }" @click="onMeasureHeaderClick">Измерение</button>
+          <button type="button" class="viewer-3d-btn" :class="{ active: measureMode || (leftSidebarTab === 'params' && paramsSubTab === 'measurements') }" @click="onMeasureHeaderClick">Измерение</button>
           <button
             type="button"
             class="viewer-3d-btn"
@@ -7975,14 +10175,14 @@ defineExpose({
           >
             Вращение
           </button>
-          <button type="button" class="viewer-3d-btn" :class="{ active: leftSidebarTab === 'assembly' }" @click="onAssemblyHeaderClick">Сборка</button>
+          <button type="button" class="viewer-3d-btn" :class="{ active: leftSidebarTab === 'params' && paramsSubTab === 'assembly' }" @click="onAssemblyHeaderClick">Сборка</button>
         </div>
         <div v-show="headerToolsTab === 'display'" class="viewer-header-block viewer-header-block-frame" data-group="Отображение">
           <button
             type="button"
             class="viewer-3d-btn"
             :class="{ active: wireframeModeRef }"
-            :title="`Каркас (прозрачные грани, opacity ${frameOpacityRef})`"
+            :title="`Каркас: линии по контуру деталей (яркость ${frameOpacityRef}). Прозрачность граней — ПКМ по детали.`"
             @click="toggleWireframe"
           >
             Каркас
@@ -7994,7 +10194,7 @@ defineExpose({
             :max="FRAME_OPACITY_MAX"
             :step="FRAME_OPACITY_STEP"
             :value="frameOpacityRef"
-            title="Прозрачность граней (колёсико или ввод)"
+            title="Яркость линий каркаса"
             @input="onFrameOpacityInput"
             @wheel.prevent="onFrameOpacityWheel"
           />
@@ -8005,6 +10205,7 @@ defineExpose({
             :max="FRAME_OPACITY_MAX"
             :step="FRAME_OPACITY_STEP"
             :value="frameOpacityRef"
+            title="Яркость линий каркаса"
             @input="onFrameOpacityInput"
           />
           <label class="viewer-scene-shading" title="Режим шейдинга модели">
@@ -8044,15 +10245,29 @@ defineExpose({
     </header>
     <div class="viewer-body">
       <div class="viewer-left-sidebar">
-        <div class="viewer-left-sidebar-tabs" role="tablist" aria-label="Панель 3D">
-          <button type="button" class="viewer-left-tab" role="tab" :class="{ active: leftSidebarTab === 'models' }" @click="setLeftSidebarTab('models')">Модели</button>
-          <button type="button" class="viewer-left-tab" role="tab" :class="{ active: leftSidebarTab === 'assembly' }" @click="setLeftSidebarTab('assembly')">Сборка</button>
-          <button type="button" class="viewer-left-tab" role="tab" :class="{ active: leftSidebarTab === 'measurements' }" @click="setLeftSidebarTab('measurements')">Измерения</button>
-          <button type="button" class="viewer-left-tab" role="tab" :class="{ active: leftSidebarTab === 'remarks' }" @click="setLeftSidebarTab('remarks')">Замечания</button>
+        <div class="viewer-left-sidebar-tabs viewer-left-sidebar-tabs--kompas" role="tablist" aria-label="Панель 3D">
+          <button type="button" class="viewer-left-tab" role="tab" title="Дерево модели" :class="{ active: leftSidebarTab === 'tree' }" @click="setLeftSidebarTab('tree')">
+            <ViewerSidebarIcons name="tree" />
+          </button>
+          <button type="button" class="viewer-left-tab" role="tab" title="Параметры" :class="{ active: leftSidebarTab === 'params' }" @click="setParamsSubTab('assembly')">
+            <ViewerSidebarIcons name="params" />
+          </button>
+          <button type="button" class="viewer-left-tab" role="tab" title="Дерево слоёв" :class="{ active: leftSidebarTab === 'layers' }" @click="setLeftSidebarTab('layers')">
+            <ViewerSidebarIcons name="layers" />
+          </button>
+          <button type="button" class="viewer-left-tab" role="tab" title="Библиотека" :class="{ active: leftSidebarTab === 'library' }" @click="setLeftSidebarTab('library')">
+            <ViewerSidebarIcons name="library" />
+          </button>
         </div>
-        <div v-show="leftSidebarTab === 'models'" class="viewer-left-sidebar-pane">
+        <div v-show="leftSidebarTab === 'params'" class="viewer-params-subtabs" role="tablist">
+          <button type="button" class="viewer-params-subtab" :class="{ active: paramsSubTab === 'assembly' }" @click="setParamsSubTab('assembly')">Сборка</button>
+          <button type="button" class="viewer-params-subtab" :class="{ active: paramsSubTab === 'measurements' }" @click="setParamsSubTab('measurements')">Измерения</button>
+          <button type="button" class="viewer-params-subtab" :class="{ active: paramsSubTab === 'selection' }" @click="setParamsSubTab('selection')">Выделение</button>
+          <button type="button" class="viewer-params-subtab" :class="{ active: paramsSubTab === 'remarks' }" @click="setParamsSubTab('remarks')">Замечания</button>
+        </div>
+        <div v-show="leftSidebarTab === 'tree'" class="viewer-left-sidebar-pane">
         <div class="viewer-models-header">
-          <span class="viewer-models-title">Модели</span>
+          <span class="viewer-models-title">Дерево модели</span>
           <span class="viewer-models-count">({{ loadedModels.length }})</span>
           <button type="button" class="viewer-models-add" title="Добавить модель" @click="openFileDialog">+</button>
         </div>
@@ -8062,17 +10277,75 @@ defineExpose({
         <div v-if="loadedModels.length === 0" class="viewer-models-empty">
           Откройте модель или перетащите файлы (STL, STEP, IGES). В сцене — до {{ MAX_MODELS_IN_SCENE }}, загрузка — до {{ MAX_FILES_SELECT }} за раз.
         </div>
-        <div v-else class="viewer-models-list">
+        <template v-else>
+        <div class="viewer-tree-actions">
+          <button type="button" class="viewer-placement-btn" title="Снять подсветку и затемнение" @click="resetPartSelectionAndView">Сбросить выделение</button>
+          <button type="button" class="viewer-placement-btn viewer-placement-btn-primary" title="Вернуть цвета из STEP/meta" @click="restoreOriginalModelColors()">Исходные цвета</button>
+        </div>
+        <label class="viewer-tree-isolate-check">
+          <input v-model="partIsolateDimOthers" type="checkbox" @change="partIsolateDimOthers ? applySelectionVisualsAndFocus() : clearPartFocusVisuals()" />
+          <span>Затемнять остальные при выделении (тяжело на больших сборках)</span>
+        </label>
+        <div class="viewer-models-hint">
+          Клик в окне — выделение детали. Двойной клик в дереве — изоляция (скрыть остальные детали модели, деталь в цвете). Повторный двойной клик — показать все. ПКМ — прозрачность. Каркас — только кнопка в шапке.
+        </div>
+        <div v-if="placementActive" class="viewer-placement-panel">
+          <div class="viewer-placement-title">Размещение модели</div>
+          <p v-if="placementStatusHint" class="viewer-placement-hint">{{ placementStatusHint }}</p>
+          <div class="viewer-placement-coords">
+            <label class="viewer-placement-field">
+              <span>X</span>
+              <input v-model.number="placementPosMm.x" type="number" step="0.1" class="viewer-placement-input" @change="applyPlacementFromFields" />
+            </label>
+            <label class="viewer-placement-field">
+              <span>Y</span>
+              <input v-model.number="placementPosMm.y" type="number" step="0.1" class="viewer-placement-input" @change="applyPlacementFromFields" />
+            </label>
+            <label class="viewer-placement-field">
+              <span>Z</span>
+              <input v-model.number="placementPosMm.z" type="number" step="0.1" class="viewer-placement-input" @change="applyPlacementFromFields" />
+            </label>
+          </div>
+          <div class="viewer-placement-actions">
+            <button type="button" class="viewer-placement-btn" @click="applyPlacementFromFields">Применить</button>
+            <button type="button" class="viewer-placement-btn viewer-placement-btn-primary" @click="confirmModelPlacement">Зафиксировать</button>
+            <button type="button" class="viewer-placement-btn" @click="cancelModelPlacement">Отмена</button>
+          </div>
+        </div>
+        <div class="viewer-model-accordion">
           <div
             v-for="item in loadedModels"
             :key="item.id"
-            class="viewer-models-card"
-            :class="{ 'viewer-models-card-hidden': !item.inScene }"
-            @click="!item.inScene && setModelInScene(item.id, true)"
+            class="viewer-model-accordion-item"
+            :class="{
+              'viewer-model-accordion-focused': focusedModelId === item.id,
+              'viewer-model-accordion-hidden': !item.inScene,
+            }"
           >
-            <img :src="item.thumbnailDataUrl" :alt="item.name" class="viewer-models-thumb" />
-            <span class="viewer-models-name" :title="item.name">{{ item.name }}</span>
-            <div class="viewer-models-actions">
+            <div
+              class="viewer-model-accordion-header"
+              :class="{ 'viewer-model-accordion-header-active': focusedModelId === item.id }"
+              title="Клик — фокус и зум к модели; двойной клик — камера на модель (F)"
+              @click="onModelTreeHeaderClick(item)"
+              @dblclick="onModelTreeHeaderDblClick(item)"
+            >
+              <button
+                type="button"
+                class="viewer-model-accordion-chevron"
+                :title="isModelExpanded(item.id) ? 'Свернуть' : 'Развернуть'"
+                @click.stop="toggleModelExpanded(item.id)"
+              >
+                {{ isModelExpanded(item.id) ? '▼' : '▶' }}
+              </button>
+              <span class="viewer-model-accordion-name" :title="item.name">{{ item.name }}</span>
+              <button
+                type="button"
+                class="viewer-component-item-eye-btn"
+                :title="modelPartsAnyVisible(item.id) && item.inScene ? 'Скрыть все детали' : 'Показать все детали'"
+                @click.stop="toggleModelPartsVisibility(item.id)"
+              >
+                {{ modelPartsAnyVisible(item.id) && item.inScene ? '👁' : '🚫' }}
+              </button>
               <button
                 v-if="item.inScene"
                 type="button"
@@ -8093,46 +10366,43 @@ defineExpose({
               </button>
               <button type="button" class="viewer-models-btn viewer-models-btn-remove" title="Удалить модель" @click.stop="removeModel(item.id)">×</button>
             </div>
-          </div>
-        </div>
-        <!--
-          Временно скрыто по запросу: дерево компонентов отключено,
-          пока не будет исправлена корректная группировка/скрытие деталей.
-        <div v-if="Object.keys(componentTreeRowsByModel).length" class="viewer-component-tree">
-          <div class="viewer-component-tree-header">Компоненты</div>
-          <div
-            v-for="m in loadedModels.filter((it) => componentTreeRowsByModel[it.id]?.length)"
-            :key="`tree-${m.id}`"
-            class="viewer-component-model-group"
-          >
-            <div class="viewer-component-model-title">{{ m.name }}</div>
-            <div
-              v-for="row in componentTreeRowsByModel[m.id]"
-              :key="row.id"
-              class="viewer-component-item"
-              :class="{ 'viewer-component-item-selected': selectedComponentRowId === `${m.id}:${row.id}` }"
-              :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
-              :title="row.label"
-              @click="selectComponentRow(m.id, row.id)"
-            >
-              <span class="viewer-component-item-label">{{ row.label }}</span>
-              <span class="viewer-component-item-spacer"></span>
-              <button
-                v-if="row.targetIds.length > 0"
-                type="button"
-                class="viewer-component-item-eye-btn"
-                :title="row.visible ? 'Скрыть компонент' : 'Показать компонент'"
-                @click.stop="toggleComponentVisibility(m.id, row.id)"
+            <div v-if="isModelExpanded(item.id)" class="viewer-model-accordion-parts">
+              <div v-if="modelTreeRows(item.id).length === 0" class="viewer-component-tree-empty">
+                Нет отдельных деталей в сцене.
+              </div>
+              <div
+                v-for="row in modelTreeRows(item.id)"
+                :key="row.id"
+                class="viewer-component-item"
+                :class="{
+                  'viewer-component-item-selected': selectedPartRowKeys.has(`${item.id}:${row.id}`),
+                  'viewer-component-item-category': row.nodeKind === 'category',
+                }"
+                :style="{ paddingLeft: `${8 + row.depth * 14}px` }"
+                title="Клик — выделение; двойной клик — изоляция (скрыть остальные, деталь в цвете)"
+                @click="selectComponentRow(item.id, row.id, $event)"
+                @dblclick.stop="selectComponentRowAndFocus(item.id, row.id)"
               >
-                {{ row.visible ? '👁' : '🚫' }}
-              </button>
-              <span v-else class="viewer-component-item-eye-btn" title="Геометрия объединена в один меш, скрытие по деталям недоступно">•</span>
+                <span v-if="row.nodeKind === 'category'" class="viewer-component-item-chevron">{{ isCategoryExpandedForRow(row.id) ? '▼' : '▶' }}</span>
+                <span class="viewer-component-item-label" :class="{ 'viewer-component-item-label--category': row.nodeKind === 'category' }">{{ row.label }}</span>
+                <span v-if="row.targetIds.length > 1" class="viewer-component-item-count">×{{ row.targetIds.length }}</span>
+                <span class="viewer-component-item-spacer"></span>
+                <button
+                  v-if="row.targetIds.length > 0"
+                  type="button"
+                  class="viewer-component-item-eye-btn"
+                  :title="row.visible ? 'Скрыть' : 'Показать'"
+                  @click.stop="toggleComponentVisibility(item.id, row.id)"
+                >
+                  {{ row.visible ? '👁' : '🚫' }}
+                </button>
+              </div>
             </div>
           </div>
         </div>
-        -->
+        </template>
         </div>
-        <div v-show="leftSidebarTab === 'assembly'" class="viewer-left-sidebar-pane viewer-sidebar-panel">
+        <div v-show="leftSidebarTab === 'params' && paramsSubTab === 'assembly'" class="viewer-left-sidebar-pane viewer-sidebar-panel">
           <div class="viewer-assembly-body viewer-assembly-body--sidebar">
             <div class="viewer-assembly-row">
               <label>Тип сопряжения</label>
@@ -8140,6 +10410,7 @@ defineExpose({
                 <option value="plane">По плоскостям</option>
                 <option value="distance">На расстоянии</option>
                 <option value="symmetric">Симметрия по ширине</option>
+                <option value="coord">К координатным плоскостям</option>
               </select>
             </div>
             <div class="viewer-assembly-row">
@@ -8149,14 +10420,43 @@ defineExpose({
                 <option v-for="m in visibleAssemblyModels" :key="'src-mini-' + m.id" :value="m.id">{{ m.name }}</option>
               </select>
             </div>
-            <div class="viewer-assembly-row">
+            <div v-if="assemblyMateType !== 'coord'" class="viewer-assembly-row">
               <label>Опорная</label>
               <select v-model="assemblyTargetModelId" class="viewer-assembly-select">
                 <option value="">— выберите —</option>
                 <option v-for="m in visibleAssemblyModels" :key="'dst-mini-' + m.id" :value="m.id">{{ m.name }}</option>
               </select>
             </div>
-            <template v-if="assemblyMateType === 'symmetric'">
+            <template v-if="assemblyMateType === 'coord'">
+              <div class="viewer-assembly-row">
+                <label>Плоскость модели</label>
+                <div class="viewer-assembly-pick">
+                  <input class="viewer-assembly-input viewer-assembly-input-pick" :value="assemblySourcePlaneText" readonly />
+                  <button type="button" class="viewer-assembly-pick-btn" @click="startAssemblyPlanePick('source')">Выбрать</button>
+                </div>
+              </div>
+              <div class="viewer-assembly-row">
+                <label>Координатная плоскость</label>
+                <select v-model="assemblyCoordWorldPlane" class="viewer-assembly-select" @change="refreshAllAssemblyVisuals">
+                  <option v-for="opt in WORLD_COORD_PLANE_OPTIONS" :key="opt.id" :value="opt.id">{{ opt.label }}</option>
+                </select>
+              </div>
+              <div class="viewer-assembly-note viewer-assembly-note-coord">
+                {{ WORLD_COORD_PLANE_OPTIONS.find((o) => o.id === assemblyCoordWorldPlane)?.hint }}
+              </div>
+              <label class="viewer-assembly-row-check">
+                <input v-model="assemblyCoordFlipNormal" type="checkbox" @change="refreshAllAssemblyVisuals" />
+                <span>Развернуть нормаль (обратная сторона)</span>
+              </label>
+              <div class="viewer-assembly-row">
+                <label>Смещение, мм</label>
+                <input v-model.number="assemblyDistanceMm" type="number" class="viewer-assembly-input" min="0" step="0.1" />
+              </div>
+              <div class="viewer-assembly-note">
+                Плоскости XY, XZ, YZ проходят через начало координат сцены. Для выравнивания по двум осям примените два сопряжения к разным граням.
+              </div>
+            </template>
+            <template v-else-if="assemblyMateType === 'symmetric'">
               <div class="viewer-assembly-row">
                 <label>База: плоскость 1</label>
                 <div class="viewer-assembly-pick">
@@ -8206,9 +10506,40 @@ defineExpose({
               <label>Расстояние, мм</label>
               <input v-model.number="assemblyDistanceMm" type="number" class="viewer-assembly-input" min="0" step="0.1" />
             </div>
+            <div class="viewer-assembly-world-csys">
+              <button
+                type="button"
+                class="viewer-assembly-world-csys-title"
+                @click="worldCoordSystemExpanded = !worldCoordSystemExpanded"
+              >
+                {{ worldCoordSystemExpanded ? '▼' : '▶' }} Мировая СК (ноль сцены)
+              </button>
+              <div v-show="worldCoordSystemExpanded" class="viewer-assembly-world-csys-body">
+                <label class="viewer-assembly-row-check">
+                  <input v-model="showWorldCoordSystem" type="checkbox" @change="syncWorldCoordSystemGroup" />
+                  <span>Показать оси и плоскости в сцене</span>
+                </label>
+                <div class="viewer-assembly-world-plane-btns">
+                  <button
+                    v-for="opt in WORLD_COORD_PLANE_OPTIONS"
+                    :key="opt.id"
+                    type="button"
+                    class="viewer-assembly-world-plane-btn"
+                    :class="{ active: assemblyCoordWorldPlane === opt.id }"
+                    :title="opt.hint"
+                    @click="selectWorldCoordPlane(opt.id)"
+                  >
+                    {{ opt.label }}
+                  </button>
+                </div>
+                <div class="viewer-assembly-note">
+                  Начало координат — (0, 0, 0) сцены. Плоскости для сопряжения «К координатным»; не привязаны к деталям.
+                </div>
+              </div>
+            </div>
             <button type="button" class="viewer-assembly-apply" @click="applyAssemblyMate">Применить сопряжение</button>
             <button type="button" class="viewer-assembly-apply" :disabled="assemblyMates.length === 0" @click="clearAllAssemblyMates">Очистить сопряжения</button>
-            <div class="viewer-assembly-note">Выбор плоскостей: «Выбрать», затем клик по грани в сцене.</div>
+            <div class="viewer-assembly-note">Плоская грань: «Выбрать» → клик по грани. Модель повернётся к выбранной плоскости (мировой или опорной).</div>
             <div v-if="assemblyStatus" class="viewer-assembly-status">{{ assemblyStatus }}</div>
             <div v-if="assemblyMates.length > 0" class="viewer-assembly-mates">
               <div class="viewer-assembly-mates-title">Связи</div>
@@ -8227,7 +10558,37 @@ defineExpose({
             </div>
           </div>
         </div>
-        <div v-show="leftSidebarTab === 'measurements'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-measurements-sidebar">
+        <div v-show="leftSidebarTab === 'params' && paramsSubTab === 'selection'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-selection-panel">
+          <div class="viewer-selection-header">Выделение и слои</div>
+          <p class="viewer-selection-summary">{{ selectedPartsSummary }}</p>
+          <button
+            type="button"
+            class="viewer-3d-btn viewer-selection-mode-btn"
+            :class="{ active: partBoxSelectMode }"
+            @click="partBoxSelectMode = !partBoxSelectMode"
+          >
+            {{ partBoxSelectMode ? 'Рамка: вкл' : 'Рамка: выкл' }}
+          </button>
+          <p class="viewer-models-hint">
+            Рамка на сцене: слева направо — синяя (только полностью внутри), справа налево — зелёная (пересечение). Ctrl — добавить к выделению.
+          </p>
+          <div class="viewer-selection-row">
+            <label>Слой</label>
+            <select v-model="selectedLayerAssignId" class="viewer-assembly-select">
+              <option v-for="layer in sceneLayers3d" :key="layer.id" :value="layer.id">{{ layer.name }}</option>
+            </select>
+            <button type="button" class="viewer-placement-btn viewer-placement-btn-primary" @click="assignSelectedPartsToLayer(selectedLayerAssignId)">
+              Назначить
+            </button>
+          </div>
+          <div class="viewer-selection-row">
+            <label>Цвет</label>
+            <input type="color" class="viewer-selection-color" value="#6699cc" @change="applyLayerColorToSelected(($event.target as HTMLInputElement).value)" />
+          </div>
+          <button type="button" class="viewer-placement-btn" @click="resetPartSelectionAndView">Снять выделение</button>
+          <button type="button" class="viewer-placement-btn" @click="restoreOriginalModelColors()">Исходные цвета</button>
+        </div>
+        <div v-show="leftSidebarTab === 'params' && paramsSubTab === 'measurements'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-measurements-sidebar">
           <div class="viewer-measurements-header">
             <span>Измерения</span>
             <button type="button" class="viewer-measurements-clear" @click="clearMeasurementHistory">очистить</button>
@@ -8300,7 +10661,7 @@ defineExpose({
             </div>
           </div>
         </div>
-        <div v-show="leftSidebarTab === 'remarks'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-remarks-panel">
+        <div v-show="leftSidebarTab === 'params' && paramsSubTab === 'remarks'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-remarks-panel">
           <p class="viewer-remarks-hint">
             Замечание запоминает ракурс камеры и разметку на экране (screenLayer). Якорь на детали остаётся при орбите.
             JSON сохраняется рядом с моделью; картинки — в том же файле (dataUrl) или в папке *_assets при экспорте.
@@ -8500,11 +10861,43 @@ defineExpose({
             </button>
           </template>
         </div>
+        <div v-show="leftSidebarTab === 'layers'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-layers-panel">
+          <div class="viewer-models-header">
+            <span class="viewer-models-title">Дерево слоёв</span>
+            <button type="button" class="viewer-models-add" title="Новый слой" @click="addSceneLayer3d">+</button>
+          </div>
+          <div v-for="layer in sceneLayers3d" :key="layer.id" class="viewer-layer-row">
+            <button type="button" class="viewer-component-item-eye-btn" @click="toggleSceneLayerVisibility(layer.id)">
+              {{ layer.visible ? '👁' : '🚫' }}
+            </button>
+            <span class="viewer-layer-swatch" :style="{ background: layer.color }"></span>
+            <span class="viewer-layer-name">{{ layer.name }}</span>
+          </div>
+          <p class="viewer-models-hint">Слой управляет видимостью назначенных деталей. Назначение — вкладка Параметры → Выделение.</p>
+        </div>
+        <div v-show="leftSidebarTab === 'library'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-library-panel">
+          <div class="viewer-models-header">
+            <span class="viewer-models-title">Библиотека</span>
+            <button type="button" class="viewer-models-add" title="Добавить модель" @click="openFileDialog">+</button>
+          </div>
+          <div v-if="libraryModels.length === 0" class="viewer-models-empty">Модели вне сцены появятся здесь (лимит {{ MAX_MODELS_IN_SCENE }} в сцене).</div>
+          <div v-for="item in libraryModels" :key="item.id" class="viewer-library-item">
+            <span class="viewer-model-accordion-name" :title="item.name">{{ item.name }}</span>
+            <button type="button" class="viewer-models-btn viewer-models-btn-add" title="Добавить в сцену" @click="setModelInScene(item.id, true)">⊕</button>
+            <button type="button" class="viewer-models-btn viewer-models-btn-remove" title="Удалить" @click="removeModel(item.id)">×</button>
+          </div>
+        </div>
       </div>
       <div class="viewer-main">
         <div ref="containerRef" class="viewer-container" />
+        <div
+          v-if="boxSelectRect"
+          class="viewer-box-select-rect"
+          :class="boxSelectRect.mode === 'window' ? 'viewer-box-select-rect--window' : 'viewer-box-select-rect--crossing'"
+          :style="{ left: `${boxSelectRect.left}px`, top: `${boxSelectRect.top}px`, width: `${boxSelectRect.width}px`, height: `${boxSelectRect.height}px` }"
+        />
         <Model3dScreenLayerOverlay
-          v-if="selectedRemark && leftSidebarTab === 'remarks'"
+          v-if="selectedRemark && isRemarksPanelActive"
           ref="screenLayerOverlayRef"
           :shapes="selectedRemarkScreenShapes"
           :images="selectedRemarkScreenImages"
@@ -8550,9 +10943,124 @@ defineExpose({
           >
             Скрыть деталь
           </button>
+          <template v-if="contextMenuTargetModelId && contextMenuTargetPart">
+            <div class="viewer-part-context-menu-label">Прозрачность</div>
+            <div class="viewer-part-context-menu-opacity-row">
+              <button
+                type="button"
+                class="viewer-part-context-menu-opacity-btn"
+                title="Только выбранная геометрия под курсором"
+                @click="setContextMenuOpacity(1, 'mesh')"
+              >
+                100%
+              </button>
+              <button type="button" class="viewer-part-context-menu-opacity-btn" @click="setContextMenuOpacity(0.75, 'mesh')">75%</button>
+              <button type="button" class="viewer-part-context-menu-opacity-btn" @click="setContextMenuOpacity(0.5, 'mesh')">50%</button>
+              <button type="button" class="viewer-part-context-menu-opacity-btn" @click="setContextMenuOpacity(0.25, 'mesh')">25%</button>
+              <button type="button" class="viewer-part-context-menu-opacity-btn" @click="setContextMenuOpacity(0.1, 'mesh')">10%</button>
+            </div>
+            <button type="button" class="viewer-part-context-menu-item" @click="setContextMenuOpacity(0.5, 'row')">
+              50% — одно имя в дереве (все экз.)
+            </button>
+            <button type="button" class="viewer-part-context-menu-item" @click="setContextMenuOpacity(0.5, 'model')">
+              50% — вся сборка
+            </button>
+            <button type="button" class="viewer-part-context-menu-item" @click="resetContextMenuOpacity('mesh')">
+              Сбросить прозрачность — деталь
+            </button>
+            <button type="button" class="viewer-part-context-menu-item" @click="resetContextMenuOpacity('model')">
+              Сбросить прозрачность — вся сборка
+            </button>
+          </template>
         </div>
         <div v-if="isLoading" class="loading-overlay">
           <span class="loading-text">Загрузка модели…</span>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="settingsModalOpen" class="viewer-settings-backdrop" @click.self="closeSettingsModal">
+      <div class="viewer-settings-modal" role="dialog" aria-labelledby="viewer-settings-title">
+        <div class="viewer-settings-head">
+          <h2 id="viewer-settings-title">Настройки 3D</h2>
+          <button type="button" class="viewer-settings-close" title="Закрыть" @click="closeSettingsModal">×</button>
+        </div>
+        <div class="viewer-settings-body">
+          <section class="viewer-settings-section">
+            <h3>Мышь и навигация</h3>
+            <label class="viewer-settings-row">
+              <span>Макс. отдаление</span>
+              <input v-model.number="mouseMaxDistance" type="number" min="1000" max="500000" step="1000" class="viewer-mouse-input" @change="autoNavLimitsEnabled = false; applyMouseSettings()" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Мин. приближение</span>
+              <input v-model.number="mouseMinDistance" type="number" min="1" max="500" class="viewer-mouse-input" @change="autoNavLimitsEnabled = false; applyMouseSettings()" />
+            </label>
+            <label class="viewer-settings-row viewer-settings-row-check">
+              <span>Автолимиты навигации</span>
+              <input v-model="autoNavLimitsEnabled" type="checkbox" @change="onAutoNavLimitsChange" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Скорость зума</span>
+              <input v-model.number="mouseZoomSpeed" type="number" min="0.01" max="0.09" step="0.005" class="viewer-mouse-input" @change="applyMouseSettings()" />
+            </label>
+            <label class="viewer-settings-row viewer-settings-row-check">
+              <span>Колёсико: к себе = отдаление</span>
+              <input v-model="mouseInvertWheel" type="checkbox" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Скорость вращения</span>
+              <input v-model.number="mouseRotateSpeed" type="number" min="2.2" max="8.8" step="0.5" class="viewer-mouse-input" @change="applyMouseSettings()" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Скорость панорамирования</span>
+              <input v-model.number="mousePanSpeed" type="number" min="0.7" max="3.5" step="0.5" class="viewer-mouse-input" @change="applyMouseSettings()" />
+            </label>
+          </section>
+          <section class="viewer-settings-section">
+            <h3>Цвет и освещение</h3>
+            <label class="viewer-settings-row">
+              <span>Фон сцены</span>
+              <input type="color" :value="sceneBackgroundHex" class="viewer-settings-color" @input="onSceneBackgroundInput" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Насыщенность цветов деталей</span>
+              <input
+                type="range"
+                :min="COLOR_VIVIDNESS_MIN"
+                :max="COLOR_VIVIDNESS_MAX"
+                :step="COLOR_VIVIDNESS_STEP"
+                :value="colorVividness"
+                @input="onColorVividnessInput"
+              />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Яркость тона</span>
+              <input type="range" :min="TINT_BRIGHTNESS_MIN" :max="TINT_BRIGHTNESS_MAX" :step="TINT_BRIGHTNESS_STEP" :value="tintBrightness" @input="onTintBrightnessInput" />
+            </label>
+            <label class="viewer-settings-row">
+              <span>Режим света</span>
+              <select class="viewer-scene-select" :value="shadingMode" @change="onShadingModeChange">
+                <option value="lit">Обычный</option>
+                <option value="unlit">Светлый</option>
+              </select>
+            </label>
+            <label class="viewer-settings-row">
+              <span>Пресет</span>
+              <select class="viewer-scene-select" :value="lightPreset" @change="onLightPresetChange">
+                <option value="engineering">Инженерный</option>
+                <option value="soft">Мягкий</option>
+              </select>
+            </label>
+            <label class="viewer-settings-row viewer-settings-row-check">
+              <span>Доп. заполняющий свет (3 источника)</span>
+              <input v-model="extraFillLightsEnabled" type="checkbox" @change="onExtraLightsChange" />
+            </label>
+            <label class="viewer-settings-row viewer-settings-row-check">
+              <span>Контровой свет (2 источника)</span>
+              <input v-model="extraRimLightsEnabled" type="checkbox" @change="onExtraLightsChange" />
+            </label>
+          </section>
         </div>
       </div>
     </div>
@@ -8890,6 +11398,125 @@ defineExpose({
   border-color: #5d83c7;
   color: #f0f5ff;
 }
+.viewer-left-sidebar-tabs--kompas .viewer-left-tab {
+  flex: 1 1 22%;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.viewer-params-subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem;
+  padding: 0.25rem 0.35rem;
+  border-bottom: 1px solid #3a4a6a;
+  flex-shrink: 0;
+}
+.viewer-params-subtab {
+  flex: 1 1 auto;
+  font-size: 0.62rem;
+  padding: 0.2rem 0.25rem;
+  border: 1px solid #3d4d68;
+  border-radius: 3px;
+  background: #1e2636;
+  color: #9eb4d8;
+  cursor: pointer;
+}
+.viewer-params-subtab.active {
+  background: #334a72;
+  color: #eef4ff;
+}
+.viewer-component-item-category {
+  font-weight: 600;
+  color: #a8bdd8;
+}
+.viewer-component-item-label--category {
+  font-weight: 600;
+  color: #c5d4ef;
+}
+.viewer-component-item-chevron {
+  width: 0.85rem;
+  font-size: 0.55rem;
+  color: #8fa3c4;
+  flex-shrink: 0;
+}
+.viewer-box-select-rect {
+  position: absolute;
+  pointer-events: none;
+  border-width: 1px;
+  border-style: solid;
+  z-index: 12;
+  box-sizing: border-box;
+}
+.viewer-box-select-rect--window {
+  border-color: #4a8cff;
+  background: rgba(74, 140, 255, 0.12);
+}
+.viewer-box-select-rect--crossing {
+  border-color: #44cc66;
+  background: rgba(68, 204, 102, 0.12);
+}
+.viewer-selection-panel .viewer-selection-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #d7e4ff;
+  margin-bottom: 0.35rem;
+}
+.viewer-selection-summary {
+  font-size: 0.68rem;
+  color: #9eb4d8;
+  margin: 0 0 0.35rem;
+}
+.viewer-selection-mode-btn {
+  width: 100%;
+  margin-bottom: 0.35rem;
+}
+.viewer-selection-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.68rem;
+  color: #9eb4d8;
+}
+.viewer-selection-color {
+  width: 2.2rem;
+  height: 1.6rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.viewer-layer-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.viewer-layer-swatch {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.viewer-layer-name {
+  font-size: 0.72rem;
+  color: #d7e4ff;
+}
+.viewer-library-item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.3rem 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.viewer-main {
+  position: relative;
+}
 .viewer-left-sidebar-pane {
   flex: 1;
   min-height: 0;
@@ -9150,6 +11777,91 @@ defineExpose({
   font-size: 0.75rem;
   color: #6a7a8a;
   overflow-y: auto;
+}
+.viewer-tree-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0 0.35rem 0.35rem;
+}
+.viewer-tree-isolate-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  margin: 0 0.35rem 0.35rem;
+  font-size: 0.62rem;
+  color: #9eb4d8;
+  line-height: 1.35;
+  cursor: pointer;
+}
+.viewer-models-hint {
+  font-size: 0.64rem;
+  color: #8fa3c4;
+  padding: 0 0.45rem 0.35rem;
+  line-height: 1.35;
+}
+.viewer-placement-panel {
+  margin: 0 0.35rem 0.5rem;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid #4a6a9a;
+  border-radius: 6px;
+  background: rgba(35, 50, 78, 0.95);
+}
+.viewer-placement-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #c8daf8;
+  margin-bottom: 0.25rem;
+}
+.viewer-placement-hint {
+  font-size: 0.62rem;
+  color: #9eb4d8;
+  margin: 0 0 0.35rem;
+  line-height: 1.35;
+}
+.viewer-placement-coords {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.25rem;
+  margin-bottom: 0.35rem;
+}
+.viewer-placement-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  font-size: 0.62rem;
+  color: #8fa3c4;
+}
+.viewer-placement-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 26px;
+  border-radius: 4px;
+  border: 1px solid #3a4a6a;
+  background: rgba(20, 28, 42, 0.95);
+  color: #e8f0ff;
+  padding: 0 4px;
+  font-size: 0.72rem;
+}
+.viewer-placement-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.viewer-placement-btn {
+  flex: 1 1 auto;
+  min-width: 4.5rem;
+  height: 26px;
+  border-radius: 4px;
+  border: 1px solid #3a4a6a;
+  background: rgba(40, 52, 72, 0.95);
+  color: #d7e4ff;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+.viewer-placement-btn-primary {
+  border-color: #6d8fd0;
+  background: rgba(65, 93, 150, 0.9);
 }
 .viewer-models-metrics {
   margin: 0.1rem 0.2rem 0.4rem;
@@ -9513,6 +12225,65 @@ defineExpose({
   font-size: 0.66rem;
   color: #a9bddf;
 }
+.viewer-assembly-note-coord {
+  margin-top: -0.1rem;
+  font-style: italic;
+}
+.viewer-assembly-row-check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  color: #c8d4e8;
+  margin: 0.15rem 0 0.25rem;
+  cursor: pointer;
+}
+.viewer-assembly-row-check input {
+  flex-shrink: 0;
+}
+.viewer-assembly-world-csys {
+  margin: 0.5rem 0 0.35rem;
+  border: 1px solid rgba(100, 140, 200, 0.35);
+  border-radius: 6px;
+  background: rgba(22, 30, 48, 0.65);
+}
+.viewer-assembly-world-csys-title {
+  width: 100%;
+  text-align: left;
+  padding: 0.35rem 0.45rem;
+  border: none;
+  background: transparent;
+  color: #c8daf8;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.viewer-assembly-world-csys-body {
+  padding: 0 0.45rem 0.45rem;
+}
+.viewer-assembly-world-plane-btns {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: 0.25rem;
+}
+.viewer-assembly-world-plane-btn {
+  text-align: left;
+  font-size: 0.66rem;
+  padding: 0.25rem 0.35rem;
+  border-radius: 4px;
+  border: 1px solid rgba(120, 150, 200, 0.35);
+  background: rgba(35, 48, 72, 0.9);
+  color: #d0dcf0;
+  cursor: pointer;
+}
+.viewer-assembly-world-plane-btn:hover {
+  background: rgba(55, 78, 120, 0.95);
+}
+.viewer-assembly-world-plane-btn.active {
+  border-color: rgba(120, 200, 255, 0.7);
+  background: rgba(50, 90, 140, 0.95);
+}
 .viewer-assembly-status {
   font-size: 0.68rem;
   color: #dce8ff;
@@ -9584,6 +12355,79 @@ defineExpose({
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+.viewer-model-accordion {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.35rem 0.4rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.viewer-model-accordion-item {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  background: rgba(30, 36, 48, 0.55);
+}
+.viewer-model-accordion-item.viewer-model-accordion-focused {
+  border-color: rgba(120, 160, 230, 0.55);
+}
+.viewer-model-accordion-item.viewer-model-accordion-hidden {
+  opacity: 0.72;
+}
+.viewer-model-accordion-header {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.35rem 0.4rem;
+  cursor: pointer;
+  user-select: none;
+}
+.viewer-model-accordion-header-active {
+  background: rgba(70, 100, 150, 0.28);
+}
+.viewer-model-accordion-header:hover {
+  background: rgba(70, 100, 150, 0.18);
+}
+.viewer-model-accordion-chevron {
+  flex-shrink: 0;
+  width: 1.2rem;
+  height: 1.2rem;
+  border: none;
+  background: transparent;
+  color: #a8b8d0;
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.62rem;
+  line-height: 1;
+}
+.viewer-model-accordion-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.72rem;
+  color: #dde6f4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.viewer-model-accordion-parts {
+  padding: 0 0.35rem 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  max-height: 42vh;
+  overflow-y: auto;
+}
+.viewer-model-accordion-parts .viewer-component-item {
+  font-size: 0.68rem;
+}
+.viewer-model-accordion-header .viewer-models-btn {
+  position: static;
+  width: 1.35rem;
+  height: 1.35rem;
+  padding: 0;
+  font-size: 0.85rem;
+  line-height: 1;
 }
 .viewer-component-tree {
   margin: 0.25rem 0.4rem 0.4rem;
@@ -9749,6 +12593,33 @@ defineExpose({
   cursor: pointer;
 }
 .viewer-part-context-menu-item:hover {
+  background: rgba(102, 129, 180, 0.35);
+}
+.viewer-part-context-menu-label {
+  font-size: 0.72rem;
+  color: #9aa8c0;
+  padding: 0.35rem 0.45rem 0.15rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin-top: 0.2rem;
+}
+.viewer-part-context-menu-opacity-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 0 0.3rem 0.25rem;
+}
+.viewer-part-context-menu-opacity-btn {
+  flex: 1 1 auto;
+  min-width: 2.1rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  background: rgba(40, 48, 64, 0.9);
+  color: #e3e9f5;
+  font-size: 0.72rem;
+  padding: 0.28rem 0.2rem;
+  cursor: pointer;
+}
+.viewer-part-context-menu-opacity-btn:hover {
   background: rgba(102, 129, 180, 0.35);
 }
 .viewer-scene-panel {
@@ -9986,5 +12857,94 @@ defineExpose({
 .loading-text {
   font-size: 1.1rem;
   color: #333;
+}
+.viewer-settings-open-btn {
+  margin-left: 6px;
+}
+.viewer-settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 12000;
+  background: rgba(10, 14, 22, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.viewer-settings-modal {
+  width: min(520px, 96vw);
+  max-height: min(86vh, 720px);
+  overflow: auto;
+  background: #1e2430;
+  border: 1px solid #4a5568;
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  color: #e8edf5;
+}
+.viewer-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid #3a4455;
+}
+.viewer-settings-head h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+.viewer-settings-close {
+  border: none;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 1.4rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.viewer-settings-body {
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.viewer-settings-section h3 {
+  margin: 0 0 8px;
+  font-size: 0.85rem;
+  color: #94a3b8;
+  font-weight: 600;
+}
+.viewer-settings-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+}
+.viewer-settings-row-check {
+  grid-template-columns: 1fr auto;
+}
+.viewer-settings-color {
+  width: 48px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid #64748b;
+  border-radius: 4px;
+  background: transparent;
+}
+.viewer-component-tree-empty {
+  padding: 12px;
+  font-size: 0.82rem;
+  color: #94a3b8;
+  line-height: 1.45;
+}
+.viewer-component-item-count {
+  margin-left: 6px;
+  font-size: 0.72rem;
+  color: #94a3b8;
+}
+.viewer-models-card-focused {
+  outline: 2px solid #5b8def;
+  outline-offset: -2px;
 }
 </style>

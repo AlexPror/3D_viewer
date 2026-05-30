@@ -1,7 +1,7 @@
 {
   "name": "viewer",
   "private": true,
-  "version": "1.8.2",
+  "version": "1.9.0",
   "author": "Alexandr Vorobjev <vorobjev.alexandr-2017@yandex.ru>",
   "repository": {
     "type": "git",
