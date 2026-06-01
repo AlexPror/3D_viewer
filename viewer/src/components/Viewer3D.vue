@@ -130,6 +130,7 @@ const showGroundGrid = ref(true)
 let measurementPoints: THREE.Vector3[] = []
 let measurementPointNormals: (THREE.Vector3 | null)[] = []
 let measurementPointModelIds: (string | null)[] = []
+let measurementPointMeshUuids: (string | null)[] = []
 let measurementPointLocals: (SavedVec3 | null)[] = []
 let measurementPointNormalLocals: (SavedVec3 | null)[] = []
 let measurementLine: THREE.Line | null = null
@@ -219,7 +220,7 @@ let animationId: number
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
 export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance' | 'cad-linear'
 let measureSnapMode: MeasureSnapMode = 'intersection'
-let measureType: MeasureType = 'distance'
+const measureTypeRef = ref<MeasureType>('distance')
 let fileInput: HTMLInputElement | null = null
 let loadedFileName: string | null = null
 
@@ -262,6 +263,9 @@ interface AssemblyPlaneSelection {
   modelId: string
   localPoint: THREE.Vector3
   point: THREE.Vector3
+  /** Меш грани (для разнесения деталей). */
+  meshUuid?: string
+  meshLocalPoint?: THREE.Vector3
   /** Нормаль в локальной СК модели (wrapper). */
   normal: THREE.Vector3
   surfaceKind?: MeshFaceSurfaceKind
@@ -405,6 +409,9 @@ interface SavedMeasurement {
   /** Для устойчивого восстановления после перемещения модели. */
   modelId1?: string | null
   modelId2?: string | null
+  /** UUID меша для точки (устойчиво при разнесении деталей). */
+  meshUuid1?: string | null
+  meshUuid2?: string | null
   p1Local?: SavedVec3 | null
   p2Local?: SavedVec3 | null
   n1Local?: SavedVec3 | null
@@ -412,10 +419,12 @@ interface SavedMeasurement {
   /** Радиус/диаметр: центр и нормаль в локале модели. */
   centerLocal?: SavedVec3 | null
   centerModelId?: string | null
+  centerMeshUuid?: string | null
   centerNormalLocal?: SavedVec3 | null
   radiusMmValue?: number | null
   secondCenterLocal?: SavedVec3 | null
   secondCenterModelId?: string | null
+  secondCenterMeshUuid?: string | null
   arcPath?: SavedVec3[] | null
   arcModelId?: string | null
   arcPathLocal?: SavedVec3[] | null
@@ -471,6 +480,7 @@ const OVERLAY_OPACITY_MAX = 1
 const OVERLAY_OPACITY_STEP = 0.01
 const explodeAmount = ref(0)
 const EXPLODE_MIN = 0
+/** 0…100 = процент от максимального габарита модели (макс. сторона bbox, мм). */
 const EXPLODE_MAX = 100
 const EXPLODE_STEP = 1
 const overlayGroupByModelId = new Map<string, THREE.Group>()
@@ -486,6 +496,9 @@ let rightMouseDown = false
 let rightMouseDragged = false
 let rightMouseDownX = 0
 let rightMouseDownY = 0
+let pendingOrbitPivot: THREE.Vector3 | null = null
+let orbitPivotAppliedThisGesture = false
+const ORBIT_PIVOT_MIN_SHIFT_MM = 8
 const RIGHT_DRAG_THRESHOLD_PX = 6
 interface ComponentTreeNode {
   id: string
@@ -1826,45 +1839,383 @@ function clampExplode(v: number): number {
   return Math.max(EXPLODE_MIN, Math.min(EXPLODE_MAX, v))
 }
 
-function ensureExplodeCacheForModel(wrapper: THREE.Group) {
-  const worldBox = new THREE.Box3().setFromObject(wrapper)
-  const worldCenter = worldBox.getCenter(new THREE.Vector3())
-  const localCenter = wrapper.worldToLocal(worldCenter.clone())
-  wrapper.traverse((obj: THREE.Object3D) => {
-    if (!(obj instanceof THREE.Mesh)) return
-    if (!obj.userData.explodeBasePos) obj.userData.explodeBasePos = obj.position.clone()
-    if (!obj.userData.explodeDir) {
-      const meshWorldCenter = new THREE.Box3().setFromObject(obj).getCenter(new THREE.Vector3())
-      const meshLocalCenter = wrapper.worldToLocal(meshWorldCenter.clone())
-      const dir = meshLocalCenter.sub(localCenter)
-      if (dir.lengthSq() < 1e-8) dir.set(1, 0, 0)
-      dir.normalize()
-      obj.userData.explodeDir = dir
+function collectPartGroupsFromTree(nodes: ComponentTreeNode[]): string[][] {
+  const groups: string[][] = []
+  const walk = (list: ComponentTreeNode[]) => {
+    for (const n of list) {
+      if (n.targetIds.length > 0) groups.push([...n.targetIds])
+      if (n.children.length) walk(n.children)
     }
-  })
+  }
+  walk(nodes)
+  return groups
 }
 
-function applyExplodeForModel(wrapper: THREE.Group, amount: number) {
-  ensureExplodeCacheForModel(wrapper)
+/**
+ * Разнесение: ползунок 0…100 = % от макс. стороны габарита модели (мм).
+ * Профиль габаритов фиксируется при импорте (после нормализации в мм).
+ */
+interface ModelExplodeProfile {
+  sizeMm: { x: number; y: number; z: number }
+  diagonalMm: number
+  maxAxisMm: number
+  avgPartOffsetMm: number
+  maxPartOffsetMm: number
+  partGroupCount: number
+  unitsSource: 'mm-native' | 'scaled-from-meters'
+}
+
+function getModelExplodeProfile(wrapper: THREE.Group): ModelExplodeProfile | null {
+  return (wrapper.userData.explodeProfile as ModelExplodeProfile | undefined) ?? null
+}
+
+function getWrapperMaxAxisMm(wrapper: THREE.Group): number {
+  const profile = getModelExplodeProfile(wrapper)
+  if (profile && profile.maxAxisMm > 0) return profile.maxAxisMm
+  wrapper.updateMatrixWorld(true)
   const box = new THREE.Box3().setFromObject(wrapper)
-  const diag = Math.max(1, box.getSize(new THREE.Vector3()).length())
-  const shift = (diag * 0.01) * (amount / 10)
+  if (box.isEmpty()) return 1000
+  const size = box.getSize(new THREE.Vector3())
+  return Math.max(size.x, size.y, size.z)
+}
+
+/** Вызывается сразу после ensureModelUnitsMillimeters при импорте. */
+function updateModelExplodeProfileOnImport(wrapper: THREE.Group, modelName?: string) {
+  wrapper.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(wrapper)
+  if (box.isEmpty()) return
+  const size = box.getSize(new THREE.Vector3())
+  const diagonalMm = size.length()
+  const maxAxisMm = Math.max(size.x, size.y, size.z)
+  const scaledFromMeters = wrapper.userData.unitScaleFromMeters === METERS_TO_MM_SCALE
+  const profile: ModelExplodeProfile = {
+    sizeMm: { x: size.x, y: size.y, z: size.z },
+    diagonalMm,
+    maxAxisMm,
+    avgPartOffsetMm: 0,
+    maxPartOffsetMm: 0,
+    partGroupCount: 0,
+    unitsSource: scaledFromMeters ? 'scaled-from-meters' : 'mm-native',
+  }
+  wrapper.userData.explodeProfile = profile
+  const label = modelName ?? String(wrapper.userData?.modelId ?? 'модель')
+  logger.info(
+    'Viewer3D',
+    `Разнесение: «${label}» ${size.x.toFixed(0)}×${size.y.toFixed(0)}×${size.z.toFixed(0)} мм, ` +
+      `макс. сторона ${maxAxisMm.toFixed(0)} мм → 1% = ${(maxAxisMm / 100).toFixed(1)} мм, 100% = ${maxAxisMm.toFixed(0)} мм, ` +
+      `ед.: ${profile.unitsSource === 'scaled-from-meters' ? 'м→мм' : 'мм'}`,
+  )
+}
+
+function partGroupCentroidWorld(meshUuids: string[], meshByUuid: Map<string, THREE.Mesh>): THREE.Vector3 | null {
+  const centroid = new THREE.Vector3()
+  let count = 0
+  for (const id of meshUuids) {
+    const mesh = meshByUuid.get(id)
+    if (!mesh) continue
+    const box = new THREE.Box3().setFromObject(mesh)
+    centroid.add(box.getCenter(new THREE.Vector3()))
+    count += 1
+  }
+  if (count === 0) return null
+  return centroid.multiplyScalar(1 / count)
+}
+
+function partGroupBBoxVolume(meshUuids: string[], meshByUuid: Map<string, THREE.Mesh>): number {
+  const box = new THREE.Box3()
+  for (const id of meshUuids) {
+    const mesh = meshByUuid.get(id)
+    if (!mesh) continue
+    box.expandByObject(mesh)
+  }
+  if (box.isEmpty()) return 0
+  const s = box.getSize(new THREE.Vector3())
+  return s.x * s.y * s.z
+}
+
+function partGroupMaxExtent(meshUuids: string[], meshByUuid: Map<string, THREE.Mesh>): number {
+  const box = new THREE.Box3()
+  for (const id of meshUuids) {
+    const mesh = meshByUuid.get(id)
+    if (!mesh) continue
+    box.expandByObject(mesh)
+  }
+  if (box.isEmpty()) return 0
+  const s = box.getSize(new THREE.Vector3())
+  return Math.max(s.x, s.y, s.z)
+}
+
+interface ExplodePartGroupLayout {
+  ids: string[]
+  centroid: THREE.Vector3
+  isAnchor: boolean
+  radialDir: THREE.Vector3
+  radialDist: number
+  pairDir: THREE.Vector3
+  extent: number
+}
+
+function partGroupKey(ids: string[]): string {
+  return [...ids].sort().join('|')
+}
+
+function pickLargestPartGroup(partGroups: string[][], meshByUuid: Map<string, THREE.Mesh>): string[] {
+  let best: string[] = []
+  let bestVol = -1
+  for (const ids of partGroups) {
+    const vol = partGroupBBoxVolume(ids, meshByUuid)
+    if (vol > bestVol) {
+      bestVol = vol
+      best = ids
+    }
+  }
+  return best
+}
+
+function ensurePartGroupsCoverAllMeshes(partGroups: string[][], meshByUuid: Map<string, THREE.Mesh>): string[][] {
+  const groups = partGroups.map((g) => [...g])
+  const assigned = new Set<string>()
+  for (const ids of groups) ids.forEach((id) => assigned.add(id))
+  meshByUuid.forEach((_mesh, uuid) => {
+    if (!assigned.has(uuid)) groups.push([uuid])
+  })
+  return groups
+}
+
+/** Доли хода: от якоря + отталкивание соседних деталей друг от друга. */
+const EXPLODE_RADIAL_TRAVEL_BLEND = 0.35
+const EXPLODE_PAIR_TRAVEL_BLEND = 0.9
+
+/**
+ * Якорь — крупнейшая деталь (не двигается). Остальные: от якоря (дальше — сильнее) + разъезд с соседями.
+ */
+function buildExplodeOffsetsFromLargestAnchor(
+  partGroups: string[][],
+  meshByUuid: Map<string, THREE.Mesh>,
+  wrapper: THREE.Group,
+): THREE.Vector3 | null {
+  if (partGroups.length === 0) return null
+  const anchorIds = pickLargestPartGroup(partGroups, meshByUuid)
+  const anchorKey = partGroupKey(anchorIds)
+  const anchorCenter = partGroupCentroidWorld(anchorIds, meshByUuid)
+  if (!anchorCenter) return null
+
+  const layouts: ExplodePartGroupLayout[] = []
+  for (const ids of partGroups) {
+    const cen = partGroupCentroidWorld(ids, meshByUuid)
+    if (!cen) continue
+    const isAnchor = partGroupKey(ids) === anchorKey
+    const radial = cen.clone().sub(anchorCenter)
+    const radialDist = radial.length()
+    const radialDir = radialDist > 1e-6 ? radial.clone().normalize() : new THREE.Vector3(0, 0, 1)
+    layouts.push({
+      ids,
+      centroid: cen,
+      isAnchor,
+      radialDir,
+      radialDist,
+      pairDir: new THREE.Vector3(),
+      extent: partGroupMaxExtent(ids, meshByUuid),
+    })
+  }
+
+  const movable = layouts.filter((g) => !g.isAnchor)
+  const maxRadialDist = movable.reduce((m, g) => Math.max(m, g.radialDist), 1e-6)
+  const refGap = getWrapperMaxAxisMm(wrapper) * 0.04
+
+  for (let i = 0; i < movable.length; i++) {
+    for (let j = i + 1; j < movable.length; j++) {
+      const a = movable[i]
+      const b = movable[j]
+      const diff = a.centroid.clone().sub(b.centroid)
+      const dist = diff.length()
+      if (dist < 1e-6) continue
+      const desired = (a.extent + b.extent) * 0.45 + refGap
+      if (dist >= desired * 1.35) continue
+      const strength = Math.min(1.5, (desired - dist) / Math.max(desired, 1e-6) + 0.15)
+      const push = diff.clone().normalize().multiplyScalar(strength)
+      a.pairDir.add(push)
+      b.pairDir.add(push.clone().negate())
+    }
+  }
+
+  wrapper.userData.explodeMaxRadialDist = maxRadialDist
+
+  for (const g of layouts) {
+    for (const id of g.ids) {
+      const mesh = meshByUuid.get(id)
+      if (!mesh) continue
+      if (!mesh.userData.explodeBasePos) mesh.userData.explodeBasePos = mesh.position.clone()
+      mesh.userData.explodeFixed = g.isAnchor
+      mesh.userData.explodeRadialDir = g.radialDir.clone()
+      mesh.userData.explodeRadialDist = g.radialDist
+      mesh.userData.explodePairDir = g.pairDir.clone()
+      delete mesh.userData.explodeOffsetWorld
+      delete mesh.userData.explodeOffset
+      delete mesh.userData.explodeDir
+    }
+  }
+  return anchorCenter.clone()
+}
+
+function refineExplodeProfileFromPartLayout(
+  wrapper: THREE.Group,
+  anchorCenterWorld: THREE.Vector3,
+  meshByUuid: Map<string, THREE.Mesh>,
+  partGroups: string[][],
+) {
+  const profile = getModelExplodeProfile(wrapper)
+  if (!profile) return
+
+  const anchorKey = partGroupKey(pickLargestPartGroup(partGroups, meshByUuid))
+  const offsets: number[] = []
+  for (const ids of partGroups) {
+    if (partGroupKey(ids) === anchorKey) continue
+    const cen = partGroupCentroidWorld(ids, meshByUuid)
+    if (!cen) continue
+    offsets.push(cen.distanceTo(anchorCenterWorld))
+  }
+
+  profile.partGroupCount = partGroups.length
+  if (offsets.length > 0) {
+    profile.avgPartOffsetMm = offsets.reduce((a, b) => a + b, 0) / offsets.length
+    profile.maxPartOffsetMm = Math.max(...offsets)
+  }
+
+  logger.info(
+    'Viewer3D',
+    `Разнесение: якорь — крупнейшая деталь (${pickLargestPartGroup(partGroups, meshByUuid).length} меш.), ` +
+      `ещё ${Math.max(0, partGroups.length - 1)} групп (от якоря + друг от друга), ход ≈ ${profile.maxAxisMm.toFixed(0)} мм × %`,
+  )
+}
+
+function getWrapperBBoxDiagonalMm(wrapper: THREE.Group): number {
+  const profile = getModelExplodeProfile(wrapper)
+  if (profile) return profile.diagonalMm
+  const box = new THREE.Box3().setFromObject(wrapper)
+  if (box.isEmpty()) return 1000
+  return box.getSize(new THREE.Vector3()).length()
+}
+
+/** Ход разнесения (мм): amount = процент от макс. стороны габарита модели. */
+function explodeTravelMmForWrapper(wrapper: THREE.Group, amount: number): number {
+  if (amount <= 0) return 0
+  const maxAxisMm = getWrapperMaxAxisMm(wrapper)
+  return (amount / 100) * maxAxisMm
+}
+
+const explodeTravelHint = computed(() => {
+  const pct = explodeAmount.value
+  if (pct <= 0) return null
+  let travelMm = 0
+  modelGroupsById.forEach((wrapper) => {
+    travelMm = Math.max(travelMm, explodeTravelMmForWrapper(wrapper, pct))
+  })
+  if (travelMm <= 0) return null
+  const mm = Math.round(travelMm * (1 + EXPLODE_PAIR_TRAVEL_BLEND))
+  return { pct, mm }
+})
+
+function resetMeshesToExplodeBase(wrapper: THREE.Group) {
   wrapper.traverse((obj: THREE.Object3D) => {
     if (!(obj instanceof THREE.Mesh)) return
     const base = obj.userData.explodeBasePos as THREE.Vector3 | undefined
-    const dir = obj.userData.explodeDir as THREE.Vector3 | undefined
-    if (!base || !dir) return
-    obj.position.copy(base).addScaledVector(dir, shift)
-    obj.updateMatrix()
+    if (base) obj.position.copy(base)
   })
   wrapper.updateMatrixWorld(true)
 }
 
+function ensureExplodeCacheForModel(wrapper: THREE.Group, rebuildOffsets = false) {
+  if (!rebuildOffsets && wrapper.userData.explodeCacheReady) return
+  resetMeshesToExplodeBase(wrapper)
+  const meshByUuid = new Map<string, THREE.Mesh>()
+  wrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    delete obj.userData.explodeFixed
+    delete obj.userData.explodeOffsetWorld
+    delete obj.userData.explodeRadialDir
+    delete obj.userData.explodeRadialDist
+    delete obj.userData.explodePairDir
+    meshByUuid.set(obj.uuid, obj)
+  })
+  delete wrapper.userData.explodeMaxRadialDist
+  const modelId = String(wrapper.userData?.modelId ?? '')
+  const tree = modelId ? componentTreeByModel.value[modelId] : undefined
+  let partGroups = tree?.length ? collectPartGroupsFromTree(tree) : []
+  partGroups = ensurePartGroupsCoverAllMeshes(partGroups, meshByUuid)
+  const anchorCenter = buildExplodeOffsetsFromLargestAnchor(partGroups, meshByUuid, wrapper)
+  if (anchorCenter) refineExplodeProfileFromPartLayout(wrapper, anchorCenter, meshByUuid, partGroups)
+  wrapper.userData.explodeCacheReady = true
+}
+
+function resetExplodeAmount() {
+  explodeAmount.value = 0
+  applyExplodeToAllModels()
+}
+
+function applyExplodePositionsOnly(wrapper: THREE.Group, amount: number) {
+  if (!wrapper.userData.explodeCacheReady) {
+    ensureExplodeCacheForModel(wrapper, true)
+  }
+  const travelMm = explodeTravelMmForWrapper(wrapper, amount)
+  const maxRadialDist = (wrapper.userData.explodeMaxRadialDist as number | undefined) ?? 1
+  const baseWorld = new THREE.Vector3()
+  const targetWorld = new THREE.Vector3()
+  const moveWorld = new THREE.Vector3()
+  wrapper.traverse((obj: THREE.Object3D) => {
+    if (!(obj instanceof THREE.Mesh)) return
+    const mesh = obj
+    const base = mesh.userData.explodeBasePos as THREE.Vector3 | undefined
+    if (!base) return
+    const parent = mesh.parent
+    mesh.position.copy(base)
+    if (mesh.userData.explodeFixed || travelMm <= 0 || !parent) {
+      mesh.updateMatrix()
+      return
+    }
+    const radialDir = mesh.userData.explodeRadialDir as THREE.Vector3 | undefined
+    const radialDist = (mesh.userData.explodeRadialDist as number | undefined) ?? 0
+    const pairDir = mesh.userData.explodePairDir as THREE.Vector3 | undefined
+    if (!radialDir && (!pairDir || pairDir.lengthSq() < 1e-12)) {
+      mesh.updateMatrix()
+      return
+    }
+    mesh.updateMatrixWorld(true)
+    mesh.getWorldPosition(baseWorld)
+    moveWorld.set(0, 0, 0)
+    if (radialDir && radialDir.lengthSq() > 1e-12) {
+      const radialT = maxRadialDist > 1e-6 ? radialDist / maxRadialDist : 1
+      const radialScale = EXPLODE_RADIAL_TRAVEL_BLEND + (1 - EXPLODE_RADIAL_TRAVEL_BLEND) * radialT
+      moveWorld.add(radialDir.clone().multiplyScalar(travelMm * radialScale))
+    }
+    if (pairDir && pairDir.lengthSq() > 1e-12) {
+      moveWorld.add(pairDir.clone().normalize().multiplyScalar(travelMm * EXPLODE_PAIR_TRAVEL_BLEND))
+    }
+    if (moveWorld.lengthSq() < 1e-12) {
+      mesh.updateMatrix()
+      return
+    }
+    targetWorld.copy(baseWorld).add(moveWorld)
+    parent.worldToLocal(targetWorld)
+    mesh.position.copy(targetWorld)
+    mesh.updateMatrix()
+  })
+  wrapper.updateMatrixWorld(true)
+  if (wireframeModeRef.value) syncWireframeEdges(wrapper)
+}
+
+function applyExplodeForModel(wrapper: THREE.Group, amount: number) {
+  applyExplodePositionsOnly(wrapper, amount)
+}
+
 function applyExplodeToAllModels() {
   modelGroupsById.forEach((wrapper) => {
-    applyExplodeForModel(wrapper, explodeAmount.value)
+    applyExplodePositionsOnly(wrapper, explodeAmount.value)
   })
   scheduleSceneMetricsRecalc()
+  refreshActiveMeasurementAnchors()
+  if (measureModeRef.value && measurementPoints.length) updateMeasurementGraphics()
+  rebuildSavedMeasurementsVisuals()
 }
 
 function onExplodeInput(ev: Event) {
@@ -1873,6 +2224,10 @@ function onExplodeInput(ev: Event) {
   explodeAmount.value = clampExplode(v)
   applyExplodeToAllModels()
 }
+
+watch(explodeAmount, (v) => {
+  if (v > EXPLODE_MAX) explodeAmount.value = EXPLODE_MAX
+})
 
 function clampOverlayOpacity(v: number): number {
   return Math.max(OVERLAY_OPACITY_MIN, Math.min(OVERLAY_OPACITY_MAX, v))
@@ -2342,7 +2697,7 @@ function startAssemblyPlanePick(target: Exclude<AssemblyPickTarget, null>) {
 }
 
 function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
-  measureType = 'cad-linear'
+  measureTypeRef.value = 'cad-linear'
   measureModeRef.value = true
   cadLinearPickTarget.value = target
   const hints: Record<Exclude<CadLinearPickTarget, null>, string> = {
@@ -2355,7 +2710,7 @@ function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
 
 function beginNextCadLinearDimension() {
   clearCadLinearPicks()
-  measureType = 'cad-linear'
+  measureTypeRef.value = 'cad-linear'
   measureModeRef.value = true
   cadLinearPickTarget.value = 'plane1'
   cadLinearStatus.value = 'Линейный размер: выберите 1-ю измеряемую плоскость (клик по грани).'
@@ -2399,13 +2754,15 @@ function saveCadLinearFromPickedPlanes() {
     p2.point.clone(),
     p1.modelId,
     p2.modelId,
-    vecToSaved(p1.localPoint),
-    vecToSaved(p2.localPoint),
+    vecToSaved(p1.meshLocalPoint ?? p1.localPoint),
+    vecToSaved(p2.meshLocalPoint ?? p2.localPoint),
     n1,
     n2,
     pd.modelId,
     vecToSaved(pd.localPoint),
     vecToSaved(pd.normal),
+    p1.meshUuid ?? null,
+    p2.meshUuid ?? null,
   )
   beginNextCadLinearDimension()
   cadLinearStatus.value = 'Линейный размер сохранён. Выберите 1-ю плоскость для следующего.'
@@ -2544,9 +2901,19 @@ function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
     return
   }
   const normal = face.normal.clone().transformDirection(mesh.matrixWorld).normalize()
-  const localPoint = wrapper.worldToLocal(hit.point.clone())
+  const snapped = camera ? getClosestSnapPoint(getSnapCandidates(hit), camera, mouse) : null
+  const planePoint = (snapped ?? hit.point).clone()
+  const localPoint = wrapper.worldToLocal(planePoint.clone())
+  const meshLocalPoint = mesh.worldToLocal(planePoint.clone())
   const tri = buildWorldFaceTriangleFromHit(hit)
-  const pick: AssemblyPlaneSelection = { modelId, point: hit.point.clone(), localPoint, normal }
+  const pick: AssemblyPlaneSelection = {
+    modelId,
+    point: planePoint,
+    localPoint,
+    meshUuid: mesh.uuid,
+    meshLocalPoint,
+    normal,
+  }
   if (tri) pick.previewGeometry = tri
   const target = inferCadLinearPickTarget()
   if (!target) {
@@ -2556,17 +2923,19 @@ function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
   if (target === 'plane1') {
     disposePlanePreviewGeometry(cadLinearPlane1.value ?? undefined)
     cadLinearPlane1.value = pick
-    cadLinearStatus.value = 'Выбрана 1-я измеряемая плоскость.'
+    cadLinearPickTarget.value = 'plane2'
+    cadLinearStatus.value = 'Плоскость 1 выбрана. Кликните по грани для плоскости 2.'
   } else if (target === 'plane2') {
     disposePlanePreviewGeometry(cadLinearPlane2.value ?? undefined)
     cadLinearPlane2.value = pick
-    cadLinearStatus.value = 'Выбрана 2-я измеряемая плоскость.'
+    cadLinearPickTarget.value = 'display'
+    cadLinearStatus.value = 'Плоскость 2 выбрана. Кликните по грани плоскости вывода размера.'
   } else {
     disposePlanePreviewGeometry(cadLinearDisplayPlane.value ?? undefined)
     cadLinearDisplayPlane.value = pick
-    cadLinearStatus.value = 'Выбрана плоскость отображения размера.'
+    cadLinearPickTarget.value = null
+    cadLinearStatus.value = 'Плоскость вывода выбрана.'
   }
-  cadLinearPickTarget.value = null
   if (cadLinearPlane1.value && cadLinearPlane2.value && cadLinearDisplayPlane.value) {
     saveCadLinearFromPickedPlanes()
   }
@@ -3081,12 +3450,105 @@ function localNormalToWorld(group: THREE.Group | undefined, n: SavedVec3 | null 
   return savedToVec(n).transformDirection(group.matrixWorld).normalize()
 }
 
-function resolveSavedPointWorld(modelId: string | null | undefined, local: SavedVec3 | null | undefined, worldFallback: SavedVec3): THREE.Vector3 {
+function findMeshInModel(modelId: string, meshUuid: string): THREE.Mesh | null {
+  const g = modelGroupsById.get(modelId)
+  if (!g) return null
+  let found: THREE.Mesh | null = null
+  g.traverse((obj) => {
+    if (found) return
+    if (obj instanceof THREE.Mesh && obj.uuid === meshUuid) found = obj
+  })
+  return found
+}
+
+function meshPointToSaved(mesh: THREE.Mesh, worldPoint: THREE.Vector3): SavedVec3 {
+  return vecToSaved(mesh.worldToLocal(worldPoint.clone()))
+}
+
+function meshNormalToSaved(mesh: THREE.Mesh, worldNormal: THREE.Vector3): SavedVec3 {
+  const n = worldNormal.clone()
+  const inv = mesh.matrixWorld.clone().invert()
+  n.transformDirection(inv).normalize()
+  return vecToSaved(n)
+}
+
+function pushMeasureAnchor(
+  mesh: THREE.Mesh,
+  modelId: string,
+  worldPoint: THREE.Vector3,
+  worldNormal: THREE.Vector3 | null,
+) {
+  measurementPoints.push(worldPoint.clone())
+  measurementPointNormals.push(worldNormal?.clone() ?? null)
+  measurementPointModelIds.push(modelId || null)
+  measurementPointMeshUuids.push(mesh.uuid)
+  measurementPointLocals.push(meshPointToSaved(mesh, worldPoint))
+  measurementPointNormalLocals.push(worldNormal ? meshNormalToSaved(mesh, worldNormal) : null)
+}
+
+function setMeasureAnchorAt(
+  index: number,
+  mesh: THREE.Mesh,
+  modelId: string,
+  worldPoint: THREE.Vector3,
+  worldNormal: THREE.Vector3 | null,
+) {
+  measurementPointModelIds[index] = modelId || null
+  measurementPointMeshUuids[index] = mesh.uuid
+  measurementPointLocals[index] = meshPointToSaved(mesh, worldPoint)
+  measurementPointNormalLocals[index] = worldNormal ? meshNormalToSaved(mesh, worldNormal) : null
+}
+
+function resolveSavedPointWorld(
+  modelId: string | null | undefined,
+  local: SavedVec3 | null | undefined,
+  worldFallback: SavedVec3,
+  meshUuid?: string | null,
+): THREE.Vector3 {
+  if (modelId && meshUuid && local) {
+    const mesh = findMeshInModel(modelId, meshUuid)
+    if (mesh) return mesh.localToWorld(savedToVec(local))
+  }
   if (modelId && local) {
     const g = modelGroupsById.get(modelId)
     if (g) return g.localToWorld(savedToVec(local))
   }
   return savedToVec(worldFallback)
+}
+
+function resolveSavedNormalWorld(
+  modelId: string | null | undefined,
+  nLocal: SavedVec3 | null | undefined,
+  nWorld: SavedVec3 | null | undefined,
+  meshUuid?: string | null,
+): THREE.Vector3 | null {
+  if (modelId && meshUuid && nLocal) {
+    const mesh = findMeshInModel(modelId, meshUuid)
+    if (mesh) return savedToVec(nLocal).transformDirection(mesh.matrixWorld).normalize()
+  }
+  if (modelId && nLocal) {
+    return localNormalToWorld(modelGroupsById.get(modelId), nLocal)
+  }
+  return nWorld ? savedToVec(nWorld) : null
+}
+
+function refreshActiveMeasurementAnchors() {
+  for (let i = 0; i < measurementPoints.length; i++) {
+    const mid = measurementPointModelIds[i]
+    const local = measurementPointLocals[i]
+    if (!mid || !local) continue
+    measurementPoints[i] = resolveSavedPointWorld(
+      mid,
+      local,
+      vecToSaved(measurementPoints[i]),
+      measurementPointMeshUuids[i],
+    )
+    const nLocal = measurementPointNormalLocals[i]
+    if (nLocal) {
+      const nw = resolveSavedNormalWorld(mid, nLocal, null, measurementPointMeshUuids[i])
+      if (nw) measurementPointNormals[i] = nw
+    }
+  }
 }
 
 function projectPerpendicularByNormals(
@@ -3137,6 +3599,8 @@ function saveDistanceMeasurement() {
     n2: measurementPointNormals[1] ? vecToSaved(measurementPointNormals[1]!) : null,
     modelId1: measurementPointModelIds[0] ?? null,
     modelId2: measurementPointModelIds[1] ?? null,
+    meshUuid1: measurementPointMeshUuids[0] ?? null,
+    meshUuid2: measurementPointMeshUuids[1] ?? null,
     p1Local: measurementPointLocals[0] ?? null,
     p2Local: measurementPointLocals[1] ?? null,
     n1Local: measurementPointNormalLocals[0] ?? null,
@@ -3145,9 +3609,26 @@ function saveDistanceMeasurement() {
   measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
   selectedMeasurementId.value = row.id
   rebuildSavedMeasurementsVisuals()
+  measurementPoints = []
+  measurementPointNormals = []
+  measurementPointModelIds = []
+  measurementPointMeshUuids = []
+  measurementPointLocals = []
+  measurementPointNormalLocals = []
+  for (const g of measurementFaceGeometries) g.dispose()
+  measurementFaceGeometries = []
+  updateMeasurementGraphics()
 }
 
-function saveRadiusMeasurement(center: THREE.Vector3, radius: number, normal: THREE.Vector3, modelId: string | null, localCenter: SavedVec3 | null, localNormal: SavedVec3 | null) {
+function saveRadiusMeasurement(
+  center: THREE.Vector3,
+  radius: number,
+  normal: THREE.Vector3,
+  modelId: string | null,
+  localCenter: SavedVec3 | null,
+  localNormal: SavedVec3 | null,
+  centerMeshUuid: string | null = null,
+) {
   const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   const row: SavedMeasurement = {
     id,
@@ -3162,6 +3643,7 @@ function saveRadiusMeasurement(center: THREE.Vector3, radius: number, normal: TH
     n1: vecToSaved(normal),
     n2: null,
     centerModelId: modelId,
+    centerMeshUuid: centerMeshUuid,
     centerLocal: localCenter,
     centerNormalLocal: localNormal,
     radiusMmValue: radius,
@@ -3181,6 +3663,8 @@ function saveDiameterMeasurement(
   secondCenter?: THREE.Vector3,
   secondModelId?: string | null,
   secondCenterLocal?: SavedVec3 | null,
+  firstCenterMeshUuid: string | null = null,
+  secondCenterMeshUuid: string | null = null,
 ) {
   const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
   const p2 = secondCenter ?? firstCenter
@@ -3197,10 +3681,12 @@ function saveDiameterMeasurement(
     n1: vecToSaved(firstNormal),
     n2: null,
     centerModelId: firstModelId,
+    centerMeshUuid: firstCenterMeshUuid,
     centerLocal: firstCenterLocal,
     centerNormalLocal: firstNormalLocal,
     radiusMmValue: firstRadius,
     secondCenterModelId: secondModelId ?? null,
+    secondCenterMeshUuid: secondCenterMeshUuid,
     secondCenterLocal: secondCenterLocal ?? null,
   }
   measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
@@ -3244,6 +3730,8 @@ function saveCadLinearMeasurement(
   outputPlaneModelId: string | null,
   outputPlaneLocalPoint: SavedVec3 | null,
   outputPlaneLocalNormal: SavedVec3 | null,
+  meshUuid1: string | null = null,
+  meshUuid2: string | null = null,
 ) {
   let planePoint = outputPlaneLocalPoint ? savedToVec(outputPlaneLocalPoint) : (cadLinearPlanePoint ?? a.clone())
   let planeNormal = outputPlaneLocalNormal ? savedToVec(outputPlaneLocalNormal).normalize() : (cadLinearPlaneNormal ?? new THREE.Vector3(0, 1, 0))
@@ -3280,6 +3768,8 @@ function saveCadLinearMeasurement(
     n2: n2 ? vecToSaved(n2) : null,
     modelId1,
     modelId2,
+    meshUuid1,
+    meshUuid2,
     p1Local,
     p2Local,
     displayValue: len.toFixed(2),
@@ -3297,17 +3787,17 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
   measureModeRef.value = true
   clearMeasurements()
   if (row.type === 'radius') {
-    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
-    const normal = row.centerModelId
-      ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
-      : (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1, row.centerMeshUuid)
+    const normal =
+      resolveSavedNormalWorld(row.centerModelId, row.centerNormalLocal, row.n1, row.centerMeshUuid)
+      ?? new THREE.Vector3(0, 1, 0)
     radiusOrDiameterResult = {
       center,
       radius: row.radiusMmValue ?? row.lengthMm,
       normal,
       isDiameter: false,
     }
-    measureType = 'radius'
+    measureTypeRef.value = 'radius'
     updateMeasurementGraphics()
     selectedMeasurementId.value = row.id
     if (focusCamera) {
@@ -3318,10 +3808,10 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
     return
   }
   if (row.type === 'diameter') {
-    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
-    const normal = row.centerModelId
-      ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
-      : (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+    const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1, row.centerMeshUuid)
+    const normal =
+      resolveSavedNormalWorld(row.centerModelId, row.centerNormalLocal, row.n1, row.centerMeshUuid)
+      ?? new THREE.Vector3(0, 1, 0)
     firstClickHole = {
       center: center.clone(),
       radius: (row.radiusMmValue ?? row.lengthMm * 0.5),
@@ -3334,12 +3824,12 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
       isDiameter: true,
     }
     if (row.secondCenterLocal || row.secondCenterModelId || row.p2) {
-      const second = resolveSavedPointWorld(row.secondCenterModelId, row.secondCenterLocal, row.p2)
+      const second = resolveSavedPointWorld(row.secondCenterModelId, row.secondCenterLocal, row.p2, row.secondCenterMeshUuid)
       secondHoleResult = { center: second.clone(), radius: row.radiusMmValue ?? row.lengthMm * 0.5, normal: normal.clone() }
       measurementPoints = [center.clone(), second.clone()]
       measurementPointNormals = [null, null]
     }
-    measureType = 'diameter'
+    measureTypeRef.value = 'diameter'
     updateMeasurementGraphics()
     selectedMeasurementId.value = row.id
     if (focusCamera) {
@@ -3358,7 +3848,7 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
     if (path.length === 0 && row.arcPath?.length) path = row.arcPath.map((p) => savedToVec(p))
     if (path.length >= 2) {
       arcResult = { path, length: row.lengthMm }
-      measureType = 'arc'
+      measureTypeRef.value = 'arc'
       updateMeasurementGraphics()
       selectedMeasurementId.value = row.id
       if (focusCamera) {
@@ -3370,16 +3860,12 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
     return
   }
   if (row.type === 'cad-linear') {
-    const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
-    const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+    const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+    const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
     measurementPoints = [a, b]
     measurementPointNormals = [
-      row.modelId1 && row.n1Local
-        ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local)
-        : (row.n1 ? savedToVec(row.n1) : null),
-      row.modelId2 && row.n2Local
-        ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local)
-        : (row.n2 ? savedToVec(row.n2) : null),
+      resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1),
+      resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2),
     ]
     if (row.outputPlaneModelId && row.outputPlaneLocalPoint && row.outputPlaneLocalNormal) {
       const g = modelGroupsById.get(row.outputPlaneModelId)
@@ -3388,7 +3874,7 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
         cadLinearPlaneNormal = localNormalToWorld(g, row.outputPlaneLocalNormal)
       }
     }
-    measureType = 'cad-linear'
+    measureTypeRef.value = 'cad-linear'
     selectedMeasurementId.value = row.id
     if (focusCamera) {
       controls.target.copy(a.clone().add(b).multiplyScalar(0.5))
@@ -3398,18 +3884,14 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
     return
   }
   if (row.type !== 'distance') return
-  measureType = 'distance'
+  measureTypeRef.value = 'distance'
   measurementPoints = [
-    resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1),
-    resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2),
+    resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1),
+    resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2),
   ]
   measurementPointNormals = [
-    row.modelId1 && row.n1Local
-      ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local)
-      : (row.n1 ? savedToVec(row.n1) : null),
-    row.modelId2 && row.n2Local
-      ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local)
-      : (row.n2 ? savedToVec(row.n2) : null),
+    resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1),
+    resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2),
   ]
   updateMeasurementGraphics()
   selectedMeasurementId.value = row.id
@@ -3553,8 +4035,8 @@ function rebuildSavedMeasurementsVisuals() {
   clearSavedMeasurementVisuals()
   for (const row of measurementHistory.value) {
     if (row.type === 'distance') {
-      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
-      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
       const delta = b.clone().sub(a)
       const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
       const bPrime = b.clone().sub(perpComp)
@@ -3571,11 +4053,11 @@ function rebuildSavedMeasurementsVisuals() {
       continue
     }
     if (row.type === 'radius' || row.type === 'diameter') {
-      const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1)
+      const center = resolveSavedPointWorld(row.centerModelId, row.centerLocal, row.p1, row.centerMeshUuid)
       const radius = row.radiusMmValue ?? (row.type === 'diameter' ? row.lengthMm * 0.5 : row.lengthMm)
       const normal =
-        (row.centerModelId ? localNormalToWorld(modelGroupsById.get(row.centerModelId), row.centerNormalLocal) : null)
-        ?? (row.n1 ? savedToVec(row.n1) : new THREE.Vector3(0, 1, 0))
+        resolveSavedNormalWorld(row.centerModelId, row.centerNormalLocal, row.n1, row.centerMeshUuid)
+        ?? new THREE.Vector3(0, 1, 0)
       const u = new THREE.Vector3().crossVectors(normal, new THREE.Vector3(1, 0, 0)).normalize()
       if (u.lengthSq() < 0.01) u.crossVectors(normal, new THREE.Vector3(0, 1, 0)).normalize()
       const rim = center.clone().add(u.clone().multiplyScalar(radius))
@@ -3625,8 +4107,8 @@ function rebuildSavedMeasurementsVisuals() {
       continue
     }
     if (row.type === 'cad-linear') {
-      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
-      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
       let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
       let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
       if (row.outputPlaneModelId) {
@@ -3682,8 +4164,14 @@ function measurementValueText(m: SavedMeasurement): string {
   return m.displayValue ?? m.lengthMm.toFixed(2)
 }
 
-const SNAP_SCREEN_THRESHOLD = 0.08
+const SNAP_SCREEN_THRESHOLD_SURFACE = 0.09
+const SNAP_SCREEN_THRESHOLD_EDGE = 0.14
+const SNAP_SCREEN_THRESHOLD_VERTEX = 0.16
 const snapProj = new THREE.Vector3()
+const snapSeg = new THREE.Line3()
+const snapClosest = new THREE.Vector3()
+
+type SnapCandidate = { point: THREE.Vector3; kind: 'vertex' | 'edge' | 'face' | 'surface' }
 
 function updateGroundGrid(box?: THREE.Box3) {
   if (!scene) return
@@ -3899,6 +4387,7 @@ function initScene() {
   hoverTooltipEl.style.display = 'none'
   containerRef.value.appendChild(hoverTooltipEl)
   renderer.domElement.addEventListener('click', onCanvasClick)
+  renderer.domElement.addEventListener('pointerdown', onCanvasPointerDownCapture, true)
   renderer.domElement.addEventListener('mousedown', onCanvasMouseDown, true)
   renderer.domElement.addEventListener('contextmenu', onCanvasContextMenu)
   renderer.domElement.addEventListener('mousemove', onCanvasMouseMove, false)
@@ -3943,7 +4432,7 @@ function initScene() {
           lastHoverPoint = hit.point.clone()
           // Для distance-режима исключаем тяжёлую цилиндрическую аналитику (миллионы граней).
           const needsHoleAnalysis =
-            measureType === 'radius' || measureType === 'diameter' || measureType === 'hole-center-distance'
+            measureTypeRef.value === 'radius' || measureTypeRef.value === 'diameter' || measureTypeRef.value === 'hole-center-distance'
           const skipHeavyHover = draggedModelGroup !== null
           let holeInfo: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
           let radiusInfo: { center: THREE.Vector3; radius: number } | null = null
@@ -4007,14 +4496,13 @@ function initScene() {
             if (u.lengthSq() < 0.01) u.crossVectors(n, new THREE.Vector3(0, 1, 0)).normalize()
             const v = new THREE.Vector3().crossVectors(n, u).normalize()
             const r = holeInfo.radius
-            candidates = [
+            candidates = mergeSnapCandidates(candidates, [
               holeInfo.center.clone(),
               holeInfo.center.clone().add(u.clone().multiplyScalar(r)),
               holeInfo.center.clone().sub(u.clone().multiplyScalar(r)),
               holeInfo.center.clone().add(v.clone().multiplyScalar(r)),
               holeInfo.center.clone().sub(v.clone().multiplyScalar(r)),
-              ...candidates,
-            ]
+            ], 'face')
             if (showHoleCylinderHighlight) {
               const rimPts: THREE.Vector3[] = []
               for (let i = 0; i <= 64; i++) {
@@ -4034,7 +4522,7 @@ function initScene() {
               highlightGroup.add(rimLine)
             }
           } else if (radiusInfo) {
-            candidates = [radiusInfo.center.clone(), ...candidates]
+            candidates = mergeSnapCandidates(candidates, [radiusInfo.center.clone()], 'face')
             if (showHoleCylinderHighlight) {
               const n = worldNormal
               const u = new THREE.Vector3().crossVectors(n, new THREE.Vector3(1, 0, 0)).normalize()
@@ -4073,6 +4561,24 @@ function initScene() {
             hoverTooltipEl.style.display = 'block'
           } else if (hoverTooltipEl) {
             hoverTooltipEl.style.display = 'none'
+          }
+
+          if (measureModeRef.value && camera) {
+            const snapPt = getClosestSnapPoint(candidates, camera, mouse)
+            if (snapPt) {
+              const r = Math.max(1.5, adaptiveMeasurementScale(snapPt) * 0.06)
+              const snapGeom = new THREE.SphereGeometry(r, 12, 12)
+              const snapMat = new THREE.MeshBasicMaterial({
+                color: 0xffcc00,
+                depthTest: false,
+                transparent: true,
+                opacity: 0.95,
+              })
+              const snapMarker = new THREE.Mesh(snapGeom, snapMat)
+              snapMarker.position.copy(snapPt)
+              snapMarker.renderOrder = 999
+              highlightGroup.add(snapMarker)
+            }
           }
         } else if (hoverTooltipEl) {
           hoverTooltipEl.style.display = 'none'
@@ -4118,7 +4624,7 @@ function initScene() {
       }
       if (measurementLabelEl) measurementLabelEl.style.display = 'none'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
-    } else if (measurementPoints.length === 2 && measureType === 'hole-center-distance' && containerRef.value && measurementLabelEl) {
+    } else if (measurementPoints.length === 2 && measureTypeRef.value === 'hole-center-distance' && containerRef.value && measurementLabelEl) {
       const rect = containerRef.value.getBoundingClientRect()
       const A = measurementPoints[0]
       const B = measurementPoints[1]
@@ -4134,7 +4640,7 @@ function initScene() {
       if (measurementLabelEl2) measurementLabelEl2.style.display = 'none'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
       if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
-    } else if (measureType === 'diameter' && firstClickHole && secondHoleResult && measurementPoints.length === 2 && containerRef.value && measurementExtraLabelEl && diameterSecondLabelEl && measurementLabelEl && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
+    } else if (measureTypeRef.value === 'diameter' && firstClickHole && secondHoleResult && measurementPoints.length === 2 && containerRef.value && measurementExtraLabelEl && diameterSecondLabelEl && measurementLabelEl && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
       const rect = containerRef.value.getBoundingClientRect()
       const A = measurementPoints[0]
       const B = measurementPoints[1]
@@ -4177,7 +4683,7 @@ function initScene() {
       measurementLabelEl.textContent = L.toFixed(2)
       measurementLabelEl.style.display = 'block'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
-    } else if (measurementPoints.length === 2 && measureType === 'distance' && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
+    } else if (measurementPoints.length === 2 && measureTypeRef.value === 'distance' && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
       const rect = containerRef.value.getBoundingClientRect()
       const A = measurementPoints[0]
       const B = measurementPoints[1]
@@ -4206,7 +4712,7 @@ function initScene() {
         labels[i].style.display = 'block'
       }
       if (measurementLabelEl) measurementLabelEl.style.display = 'none'
-      if (measureType === 'diameter' && firstClickHole && measurementExtraLabelEl) {
+      if (measureTypeRef.value === 'diameter' && firstClickHole && measurementExtraLabelEl) {
         const dc = firstClickHole.center.clone()
         dc.project(camera)
         measurementExtraLabelEl.style.left = (dc.x * 0.5 + 0.5) * rect.width + 'px'
@@ -4992,6 +5498,64 @@ function updateMouseFromClient(clientX: number, clientY: number) {
   mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1
 }
 
+/** Точка на детали под курсором — центр вращения сцены (ПКМ). */
+function pickOrbitPivotFromClient(clientX: number, clientY: number): THREE.Vector3 | null {
+  if (!camera || !renderer || !meshGroup?.children.length) return null
+  updateMouseFromClient(clientX, clientY)
+  raycaster.setFromCamera(mouse, camera)
+  meshGroup.updateMatrixWorld(true)
+  const hit = pickSolidSurfaceHit(intersectPickableMeshes(raycaster))
+  return hit ? hit.point.clone() : null
+}
+
+/** Точка на трекболе (как в TrackballControls._getMouseOnCircle). */
+function syncTrackballMouseOnCircle(pageX: number, pageY: number) {
+  if (!controls?.domElement) return
+  controls.handleResize()
+  const s = controls.screen
+  const x = (pageX - s.width * 0.5 - s.left) / (s.width * 0.5)
+  const y = (s.height + 2 * (s.top - pageY)) / s.width
+  controls._moveCurr.set(x, y)
+  controls._movePrev.copy(controls._moveCurr)
+}
+
+/** Синхронизация TrackballControls после смены target. */
+function syncTrackballAfterPivotChange() {
+  if (!camera || !controls) return
+  controls._eye.subVectors(camera.position, controls.target)
+  controls._lastPosition.copy(camera.position)
+  controls._lastAngle = 0
+  savedCameraTarget.copy(controls.target)
+}
+
+/**
+ * Новый центр вращения на детали: camera и target сдвигаются на один вектор —
+ * на экране картинка не меняется (параллельный перенос).
+ */
+function applyOrbitPivotInvisibly(worldPoint: THREE.Vector3) {
+  if (!camera || !controls) return
+  if (controls.target.distanceTo(worldPoint) < ORBIT_PIVOT_MIN_SHIFT_MM) return
+  const delta = worldPoint.clone().sub(controls.target)
+  controls.target.add(delta)
+  camera.position.add(delta)
+  syncTrackballAfterPivotChange()
+}
+
+/** Pivot — только после порога перетаскивания (клик под меню не дёргает камеру). */
+function tryApplyPendingOrbitPivotOnDrag(ev: MouseEvent) {
+  if (!rightMouseDown || !controls || orbitPivotAppliedThisGesture) return
+  const dx = ev.clientX - rightMouseDownX
+  const dy = ev.clientY - rightMouseDownY
+  if (Math.hypot(dx, dy) < RIGHT_DRAG_THRESHOLD_PX) return
+  rightMouseDragged = true
+  if (pendingOrbitPivot) {
+    applyOrbitPivotInvisibly(pendingOrbitPivot)
+    syncTrackballMouseOnCircle(ev.pageX, ev.pageY)
+    orbitPivotAppliedThisGesture = true
+  }
+  if (controls.noRotate) controls.noRotate = false
+}
+
 function onCanvasMouseMove(ev: MouseEvent) {
   updateMouseFromClient(ev.clientX, ev.clientY)
   hoverDirty = true
@@ -5399,6 +5963,67 @@ function extractLabelsFromStepSpecMeta(meta: any): string[] {
     })
   })
   return [...new Set(labels)]
+}
+
+function labelsFromPartColorMeta(meta: PartColorMeta): string[] {
+  const labels = meta.parts
+    .map((p) => String(p.displayName || p.name || p.partId || '').trim())
+    .filter(Boolean)
+  return [...new Set(labels)]
+}
+
+/** STL — один меш; режем по несвязным телам и подписываем для дерева/цветов. */
+function splitStlMergedMeshes(wrapper: THREE.Group, partMeta?: PartColorMeta | null): number {
+  const labels = partMeta ? labelsFromPartColorMeta(partMeta) : []
+  const toSplit: THREE.Mesh[] = []
+  wrapper.children.forEach((c) => {
+    if (c instanceof THREE.Mesh) toSplit.push(c)
+  })
+  if (!toSplit.length) return 0
+  let created = 0
+  for (const mesh of toSplit) {
+    const parent = mesh.parent
+    if (!parent) continue
+    const split = splitMeshByConnectivity(mesh, labels)
+    if (split.length <= 1) continue
+    const oldVisible = mesh.visible
+    parent.remove(mesh)
+    mesh.geometry.dispose()
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+    mats.forEach((m) => m.dispose())
+    split.forEach((m) => {
+      m.visible = oldVisible
+      parent.add(m)
+    })
+    created += split.length
+  }
+  if (created > 1) {
+    logger.info('Viewer3D', `STL: по связности выделено тел: ${created}`)
+  }
+  return created
+}
+
+function assignPartMetaToStlMeshes(wrapper: THREE.Object3D, meta: PartColorMeta): void {
+  if (!meta.parts.length) return
+  const meshes: THREE.Mesh[] = []
+  wrapper.traverse((o) => {
+    if (o instanceof THREE.Mesh) meshes.push(o)
+  })
+  meshes.sort((a, b) => meshVolumeScore(b) - meshVolumeScore(a))
+  meshes.forEach((m, i) => {
+    const part = meta.parts[i]
+    if (!part) return
+    const label = String(part.displayName || part.name || part.partId).trim()
+    const hex = normalizeHexColor(part.defaultColor)
+    m.name = label || m.name
+    m.userData = {
+      ...m.userData,
+      partId: part.partId,
+      partName: label,
+      lockPartColor: !!hex,
+      partColorHex: hex,
+    }
+  })
 }
 
 function splitMeshByConnectivity(
@@ -5907,6 +6532,8 @@ function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group) {
   const hierarchyRoots = tryBuildTreeFromSceneHierarchy(modelId, wrapper)
   if (hierarchyRoots) {
     componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: hierarchyRoots }
+    ensureExplodeCacheForModel(wrapper, true)
+    if (explodeAmount.value > 0) applyExplodeForModel(wrapper, explodeAmount.value)
     return
   }
 
@@ -5917,6 +6544,8 @@ function buildComponentTreeForModel(modelId: string, wrapper: THREE.Group) {
   const buckets = buildGeometryBucketsForMeshes(meshes, 0)
   const roots = bucketsToPartGroupNodes(modelId, buckets, '')
   componentTreeByModel.value = { ...componentTreeByModel.value, [modelId]: roots }
+  ensureExplodeCacheForModel(wrapper, true)
+  if (explodeAmount.value > 0) applyExplodeForModel(wrapper, explodeAmount.value)
 }
 
 function refreshComponentTreeVisibility(modelId: string) {
@@ -6910,6 +7539,33 @@ watch([dimArrowSizeMm, dimLineOffsetMm, dimFontSizeMm], () => {
   rebuildSavedMeasurementsVisuals()
 })
 
+watch(
+  () => props.measureMode,
+  (enabled) => {
+    if (enabled === undefined) return
+    if (enabled === measureModeRef.value) return
+    measureModeRef.value = enabled
+    if (!enabled) clearMeasurements()
+  },
+  { immediate: true },
+)
+
+watch(
+  () => props.measureType,
+  (t) => {
+    if (!t || t === measureTypeRef.value) return
+    setMeasureType(t)
+  },
+)
+
+watch(
+  () => props.measureSnapMode,
+  (mode) => {
+    if (mode) measureSnapMode = mode
+  },
+  { immediate: true },
+)
+
 function onCanvasMouseDown(ev: MouseEvent) {
   if (partContextMenuOpen.value) partContextMenuOpen.value = false
   if (ev.button === 0 && placementActive.value && placementModelId.value && camera && renderer) {
@@ -6939,13 +7595,6 @@ function onCanvasMouseDown(ev: MouseEvent) {
     ev.stopPropagation()
     return
   }
-  if (ev.button === 2) {
-    rightMouseDown = true
-    rightMouseDragged = false
-    rightMouseDownX = ev.clientX
-    rightMouseDownY = ev.clientY
-    contextMenuCanShow.value = tryPickContextTarget(ev.clientX, ev.clientY)
-  }
   if (!camera || !controls || !meshGroup) return
   if (ev.button === 0 && selectedMeasurementId.value && savedMeasurementsGroup) {
     const rect = renderer.domElement.getBoundingClientRect()
@@ -6962,12 +7611,12 @@ function onCanvasMouseDown(ev: MouseEvent) {
       const row = measurementHistory.value.find((m) => m.id === hitRow)
       if (row && (row.type === 'distance' || row.type === 'cad-linear')) {
         const anchorWorld = row.type === 'cad-linear'
-          ? resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)).multiplyScalar(0.5)
-          : resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)).multiplyScalar(0.5)
+          ? resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)).multiplyScalar(0.5)
+          : resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)).multiplyScalar(0.5)
         const dirWorld = (() => {
           if (row.type === 'cad-linear') {
-            const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
-            const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+            const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+            const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
             let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
             let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
             if (row.outputPlaneModelId) {
@@ -6987,11 +7636,11 @@ function onCanvasMouseDown(ev: MouseEvent) {
             if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
             return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
           }
-          const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1)
-          const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2)
+          const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+          const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
           const baseNormal =
-            (row.modelId2 && row.n2Local ? localNormalToWorld(modelGroupsById.get(row.modelId2), row.n2Local) : null)
-            ?? (row.modelId1 && row.n1Local ? localNormalToWorld(modelGroupsById.get(row.modelId1), row.n1Local) : null)
+            resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2)
+            ?? resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1)
             ?? (row.n2 ? savedToVec(row.n2) : (row.n1 ? savedToVec(row.n1) : null))
           const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
           const srcA = strict ? strict.projected : a
@@ -7077,6 +7726,21 @@ function onCanvasMouseDown(ev: MouseEvent) {
         ev.stopPropagation()
       }
     }
+  }
+}
+
+function onCanvasPointerDownCapture(ev: PointerEvent) {
+  if (ev.button !== 2) return
+  rightMouseDown = true
+  rightMouseDragged = false
+  orbitPivotAppliedThisGesture = false
+  rightMouseDownX = ev.clientX
+  rightMouseDownY = ev.clientY
+  pendingOrbitPivot = null
+  contextMenuCanShow.value = tryPickContextTarget(ev.clientX, ev.clientY)
+  if (camera && controls && meshGroup?.children.length && controls.enabled) {
+    pendingOrbitPivot = pickOrbitPivotFromClient(ev.clientX, ev.clientY)
+    controls.noRotate = true
   }
 }
 
@@ -7173,11 +7837,7 @@ function onGlobalMouseDown(ev: MouseEvent) {
 }
 
 function onCanvasMouseMovePan(ev: MouseEvent) {
-  if (rightMouseDown) {
-    const dx = ev.clientX - rightMouseDownX
-    const dy = ev.clientY - rightMouseDownY
-    if (Math.hypot(dx, dy) >= RIGHT_DRAG_THRESHOLD_PX) rightMouseDragged = true
-  }
+  if (rightMouseDown) tryApplyPendingOrbitPivotOnDrag(ev)
   if (draggedMeasurementOffset) {
     ev.preventDefault()
     ev.stopPropagation()
@@ -7239,6 +7899,9 @@ function onCanvasMouseUp(ev: MouseEvent) {
     }
     rightMouseDown = false
     rightMouseDragged = false
+    pendingOrbitPivot = null
+    orbitPivotAppliedThisGesture = false
+    if (controls) controls.noRotate = false
     contextMenuCanShow.value = false
   }
   if (ev.button === 0 && draggedMeasurementOffset) {
@@ -7342,6 +8005,7 @@ function onCanvasClick(ev: MouseEvent) {
   mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1
   mouse.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1
   raycaster.setFromCamera(mouse, camera)
+  meshGroup.updateMatrixWorld(true)
   const hits = intersectPickableMeshes(raycaster)
   if (remarkAnchorPickMode.value && selectedRemark.value) {
     const surfaceHit = pickSolidSurfaceHit(hits)
@@ -7361,7 +8025,7 @@ function onCanvasClick(ev: MouseEvent) {
     pickAssemblyPlaneFromHit(surfaceHit)
     return
   }
-  if (measureModeRef.value && measureType === 'cad-linear') {
+  if (measureModeRef.value && measureTypeRef.value === 'cad-linear') {
     const faceHit = firstMeshFaceHit(hits)
     if (!faceHit) {
       cadLinearStatus.value = 'Линейный размер: кликните по плоской грани модели.'
@@ -7370,7 +8034,11 @@ function onCanvasClick(ev: MouseEvent) {
     pickCadLinearPlaneFromHit(faceHit)
     return
   }
-  if ((assemblyPanelOpen.value || (assemblySourceModelId.value && assemblyTargetModelId.value)) && hits.length > 0) {
+  if (
+    !measureModeRef.value &&
+    (assemblyPanelOpen.value || (assemblySourceModelId.value && assemblyTargetModelId.value)) &&
+    hits.length > 0
+  ) {
     const surfaceHit = pickSolidSurfaceHit(hits)
     if (surfaceHit) {
       const wrapper = findWrapperGroup(surfaceHit.object)
@@ -7418,9 +8086,9 @@ function onCanvasClick(ev: MouseEvent) {
   const clickT0 = performance.now()
   logger.info(
     'Viewer3D',
-    `MeasureClick#${clickId} start: type=${measureType}, hits=${hits.length}, points=${measurementPoints.length}, mode=${measureModeRef.value ? 'on' : 'off'}`
+    `MeasureClick#${clickId} start: type=${measureTypeRef.value}, hits=${hits.length}, points=${measurementPoints.length}, mode=${measureModeRef.value ? 'on' : 'off'}`
   )
-  if (measureType === 'radius') {
+  if (measureTypeRef.value === 'radius') {
     const hit = pickSolidSurfaceHit(hits)
     if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} radius: no hits`)
@@ -7441,9 +8109,9 @@ function onCanvasClick(ev: MouseEvent) {
     }
     if (fit) {
       radiusOrDiameterResult = { center: fit.center, radius: fit.radius, normal, isDiameter: false }
-      const localCenter = wrapper ? vecToSaved(wrapper.worldToLocal(fit.center.clone())) : null
-      const localNormal = wrapper ? vecToSaved(worldNormalToLocal(wrapper, normal)) : null
-      saveRadiusMeasurement(fit.center, fit.radius, normal, modelId || null, localCenter, localNormal)
+      const localCenter = meshPointToSaved(mesh, fit.center)
+      const localNormal = meshNormalToSaved(mesh, normal)
+      saveRadiusMeasurement(fit.center, fit.radius, normal, modelId || null, localCenter, localNormal, mesh.uuid)
       logger.info(
         'Viewer3D',
         `MeasureClick#${clickId} radius fit: center=${formatVec3(fit.center)}, r=${fit.radius.toFixed(2)}`
@@ -7455,7 +8123,7 @@ function onCanvasClick(ev: MouseEvent) {
     }
     return
   }
-  if (measureType === 'diameter') {
+  if (measureTypeRef.value === 'diameter') {
     const hit = pickSolidSurfaceHit(hits)
     if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} diameter: no hits`)
@@ -7466,6 +8134,7 @@ function onCanvasClick(ev: MouseEvent) {
       secondHoleResult = null
       measurementPoints = []
       measurementPointNormals = []
+      measurementPointMeshUuids = []
       radiusOrDiameterResult = null
       updateMeasurementGraphics()
     }
@@ -7491,8 +8160,9 @@ function onCanvasClick(ev: MouseEvent) {
       if (!hole) return
       firstClickHole = { center: hole.center.clone(), radius: hole.radius, normal: hole.normal.clone() }
       firstClickHoleModelId = modelId || null
-      firstClickHoleLocalCenter = wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null
-      firstClickHoleLocalNormal = wrapper ? vecToSaved(worldNormalToLocal(wrapper, hole.normal.clone())) : null
+      firstClickHoleMeshUuid = mesh.uuid
+      firstClickHoleLocalCenter = meshPointToSaved(mesh, hole.center)
+      firstClickHoleLocalNormal = meshNormalToSaved(mesh, hole.normal)
       radiusOrDiameterResult = { center: hole.center, radius: hole.radius, normal: hole.normal, isDiameter: true }
       updateMeasurementGraphics()
       logger.info(
@@ -7506,11 +8176,12 @@ function onCanvasClick(ev: MouseEvent) {
       measurementPoints = [firstClickHole.center.clone(), secondHoleResult.center.clone()]
       measurementPointNormals = [null, null]
       measurementPointModelIds = [firstClickHoleModelId, modelId || null]
+      measurementPointMeshUuids = [firstClickHoleMeshUuid, mesh.uuid]
       measurementPointLocals = [
         firstClickHoleLocalCenter,
-        wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null,
+        meshPointToSaved(mesh, hole.center),
       ]
-      measurementPointNormalLocals = [firstClickHoleLocalNormal, wrapper ? vecToSaved(worldNormalToLocal(wrapper, hole.normal.clone())) : null]
+      measurementPointNormalLocals = [firstClickHoleLocalNormal, meshNormalToSaved(mesh, hole.normal)]
       saveDiameterMeasurement(
         firstClickHole.center,
         firstClickHole.radius,
@@ -7520,7 +8191,9 @@ function onCanvasClick(ev: MouseEvent) {
         firstClickHoleLocalNormal,
         hole.center.clone(),
         modelId || null,
-        wrapper ? vecToSaved(wrapper.worldToLocal(hole.center.clone())) : null,
+        meshPointToSaved(mesh, hole.center),
+        firstClickHoleMeshUuid,
+        mesh.uuid,
       )
     } else {
       const candidates = getSnapCandidates(hit)
@@ -7530,13 +8203,14 @@ function onCanvasClick(ev: MouseEvent) {
       measurementPoints = [firstClickHole.center.clone(), point]
       measurementPointNormals = [firstClickHole.normal.clone(), worldNormal]
       measurementPointModelIds = [firstClickHoleModelId, modelId || null]
+      measurementPointMeshUuids = [firstClickHoleMeshUuid, mesh.uuid]
       measurementPointLocals = [
         firstClickHoleLocalCenter,
-        wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null,
+        meshPointToSaved(mesh, point),
       ]
       measurementPointNormalLocals = [
         firstClickHoleLocalNormal,
-        wrapper ? vecToSaved(worldNormalToLocal(wrapper, worldNormal.clone())) : null,
+        meshNormalToSaved(mesh, worldNormal),
       ]
       saveDiameterMeasurement(
         firstClickHole.center,
@@ -7545,6 +8219,11 @@ function onCanvasClick(ev: MouseEvent) {
         firstClickHoleModelId,
         firstClickHoleLocalCenter,
         firstClickHoleLocalNormal,
+        undefined,
+        undefined,
+        undefined,
+        firstClickHoleMeshUuid,
+        mesh.uuid,
       )
     }
     updateMeasurementGraphics()
@@ -7554,7 +8233,7 @@ function onCanvasClick(ev: MouseEvent) {
     )
     return
   }
-  if (measureType === 'arc') {
+  if (measureTypeRef.value === 'arc') {
     const hit = pickSolidSurfaceHit(hits)
     if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} arc: no hits`)
@@ -7589,13 +8268,15 @@ function onCanvasClick(ev: MouseEvent) {
     }
     return
   }
-  if (measureType === 'hole-center-distance') {
+  if (measureTypeRef.value === 'hole-center-distance') {
     const hit = pickSolidSurfaceHit(hits)
     if (!hit) {
       logger.info('Viewer3D', `MeasureClick#${clickId} hole-center-distance: no hits`)
       return
     }
     const mesh = hit.object as THREE.Mesh
+    const wrapper = findWrapperGroup(mesh)
+    const modelId = String(wrapper?.userData?.modelId ?? '')
     const faceIndex = typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
       ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
       : Math.floor(hit.face!.a / 3)
@@ -7635,12 +8316,44 @@ function onCanvasClick(ev: MouseEvent) {
     }
     if (holeCenterFirst === null) {
       holeCenterFirst = center
+      holeCenterFirstModelId = modelId || null
+      holeCenterFirstMeshUuid = mesh.uuid
+      holeCenterFirstLocal = meshPointToSaved(mesh, center)
       logger.info('Viewer3D', `MeasureClick#${clickId} hole-center-distance first center=${formatVec3(center)}`)
       return
     }
-    measurementPoints = [holeCenterFirst, center]
-    measurementPointNormals = [null, null]
+    const a = holeCenterFirst.clone()
+    const b = center.clone()
+    const row: SavedMeasurement = {
+      id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: 'distance',
+      createdAt: new Date().toLocaleTimeString('ru-RU'),
+      lengthMm: a.distanceTo(b),
+      parallelMm: 0,
+      trianglePerpMm: 0,
+      surfacePerpMm: null,
+      p1: vecToSaved(a),
+      p2: vecToSaved(b),
+      n1: null,
+      n2: null,
+      modelId1: holeCenterFirstModelId,
+      modelId2: modelId || null,
+      meshUuid1: holeCenterFirstMeshUuid,
+      meshUuid2: mesh.uuid,
+      p1Local: holeCenterFirstLocal,
+      p2Local: meshPointToSaved(mesh, center),
+      n1Local: null,
+      n2Local: null,
+    }
     holeCenterFirst = null
+    holeCenterFirstModelId = null
+    holeCenterFirstMeshUuid = null
+    holeCenterFirstLocal = null
+    measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
+    selectedMeasurementId.value = row.id
+    rebuildSavedMeasurementsVisuals()
+    measurementPoints = []
+    measurementPointNormals = []
     updateMeasurementGraphics()
     logger.info('Viewer3D', `MeasureClick#${clickId} done hole-center-distance: ${(performance.now() - clickT0).toFixed(1)} ms`)
     return
@@ -7666,7 +8379,7 @@ function onCanvasClick(ev: MouseEvent) {
 
   const buildFaceGeometryForHighlight = (): THREE.BufferGeometry | null => {
     const tFace = performance.now()
-    const useCoplanarFace = measureType !== 'distance'
+    const useCoplanarFace = measureTypeRef.value !== 'distance'
     const geom =
       (useCoplanarFace ? getCoplanarFaceGeometry(mesh, faceIndex) : null) ??
       (pos
@@ -7706,23 +8419,18 @@ function onCanvasClick(ev: MouseEvent) {
   }
 
   if (measurementPoints.length >= 2) {
-    clearMeasurements()
     measurementPoints = [point]
     measurementPointNormals = [worldNormal]
     measurementPointModelIds = [modelId || null]
-    measurementPointLocals = [wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null]
-    measurementPointNormalLocals = [wrapper ? vecToSaved(worldNormalToLocal(wrapper, worldNormal.clone())) : null]
+    measurementPointMeshUuids = [mesh.uuid]
+    measurementPointLocals = [meshPointToSaved(mesh, point)]
+    measurementPointNormalLocals = [meshNormalToSaved(mesh, worldNormal)]
+    for (const g of measurementFaceGeometries) g.dispose()
+    measurementFaceGeometries = []
     const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
   } else {
-    measurementPoints.push(point)
-    const normalToPush = worldNormal ?? (measurementPointNormals.length > 0 ? measurementPointNormals[0] : null)
-    measurementPointNormals.push(normalToPush)
-    measurementPointModelIds.push(modelId || null)
-    measurementPointLocals.push(wrapper ? vecToSaved(wrapper.worldToLocal(point.clone())) : null)
-    measurementPointNormalLocals.push(
-      wrapper && normalToPush ? vecToSaved(worldNormalToLocal(wrapper, normalToPush.clone())) : null,
-    )
+    pushMeasureAnchor(mesh, modelId, point, worldNormal)
     const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
     logger.info(
@@ -7737,7 +8445,7 @@ function onCanvasClick(ev: MouseEvent) {
       'Viewer3D',
       `MeasureClick#${clickId} graphics updated: ${(performance.now() - tGraphics).toFixed(1)} ms`
     )
-    if (measureType === 'distance' && measurementPoints.length === 2) {
+    if (measureTypeRef.value === 'distance' && measurementPoints.length === 2) {
       saveDistanceMeasurement()
     }
   }
@@ -7757,9 +8465,13 @@ let arcResult: { path: THREE.Vector3[]; length: number } | null = null
 let arcFirstPoint: THREE.Vector3 | null = null
 let arcMesh: THREE.Mesh | null = null
 let holeCenterFirst: THREE.Vector3 | null = null
+let holeCenterFirstModelId: string | null = null
+let holeCenterFirstMeshUuid: string | null = null
+let holeCenterFirstLocal: SavedVec3 | null = null
 let firstClickHole: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
 let secondHoleResult: { center: THREE.Vector3; radius: number; normal: THREE.Vector3 } | null = null
 let firstClickHoleModelId: string | null = null
+let firstClickHoleMeshUuid: string | null = null
 let firstClickHoleLocalCenter: SavedVec3 | null = null
 let firstClickHoleLocalNormal: SavedVec3 | null = null
 let cadLinearPlanePoint: THREE.Vector3 | null = null
@@ -8163,7 +8875,7 @@ function updateMeasurementGraphics() {
   const t0 = performance.now()
   logger.info(
     'Viewer3D',
-    `updateMeasurementGraphics start: type=${measureType}, points=${measurementPoints.length}, faces=${measurementFaceGeometries.length}`
+    `updateMeasurementGraphics start: type=${measureTypeRef.value}, points=${measurementPoints.length}, faces=${measurementFaceGeometries.length}`
   )
   if (measurementLine) {
     measureGroup.remove(measurementLine)
@@ -8237,10 +8949,10 @@ function updateMeasurementGraphics() {
     measureGroup.add(measurementArcPathLine)
   }
   if (
-    measureType !== 'distance'
-    && measureType !== 'hole-center-distance'
-    && measureType !== 'cad-linear'
-    && !(measureType === 'diameter' && measurementPoints.length === 2)
+    measureTypeRef.value !== 'distance'
+    && measureTypeRef.value !== 'hole-center-distance'
+    && measureTypeRef.value !== 'cad-linear'
+    && !(measureTypeRef.value === 'diameter' && measurementPoints.length === 2)
   ) {
     logger.info('Viewer3D', `updateMeasurementGraphics done (non-distance): ${(performance.now() - t0).toFixed(1)} ms`)
     return
@@ -8251,7 +8963,7 @@ function updateMeasurementGraphics() {
     if ('geometry' in c && c.geometry) c.geometry.dispose()
     if ('material' in c && c.material) (c.material as THREE.Material).dispose()
   }
-  if (measureType === 'distance' && measurementPoints.length === 2 && measurementFaceGeometries.length === 2) {
+  if (measureTypeRef.value === 'distance' && measurementPoints.length === 2 && measurementFaceGeometries.length === 2) {
     const planeMat = new THREE.MeshBasicMaterial({
       color: 0x4488ff,
       transparent: true,
@@ -8287,7 +8999,7 @@ function updateMeasurementGraphics() {
     return
   }
   const [A, B] = measurementPoints
-  if (measureType === 'hole-center-distance') {
+  if (measureTypeRef.value === 'hole-center-distance') {
     const geom = new THREE.BufferGeometry().setFromPoints([A, B])
     const mat = new THREE.LineBasicMaterial({ color: AXIS_COLOR_X })
     measurementLine = new THREE.Line(geom, mat)
@@ -8295,7 +9007,7 @@ function updateMeasurementGraphics() {
     logger.info('Viewer3D', `updateMeasurementGraphics done (hole-center): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
-  if (measureType === 'distance') {
+  if (measureTypeRef.value === 'distance') {
     const delta = B.clone().sub(A)
     const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
     const Bprime = B.clone().sub(perpComp)
@@ -8314,7 +9026,7 @@ function updateMeasurementGraphics() {
     logger.info('Viewer3D', `updateMeasurementGraphics done (distance-triangle): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
-  if (measureType === 'cad-linear') {
+  if (measureTypeRef.value === 'cad-linear') {
     const nA = measurementPointNormals[0] ?? null
     const nB = measurementPointNormals[1] ?? null
     const strict = projectPerpendicularByNormals(A, B, nA, nB)
@@ -8357,6 +9069,7 @@ function clearMeasurements() {
   measurementPoints = []
   measurementPointNormals = []
   measurementPointModelIds = []
+  measurementPointMeshUuids = []
   measurementPointLocals = []
   measurementPointNormalLocals = []
   for (const g of measurementFaceGeometries) g.dispose()
@@ -8396,9 +9109,13 @@ function clearMeasurements() {
   arcFirstPoint = null
   arcMesh = null
   holeCenterFirst = null
+  holeCenterFirstModelId = null
+  holeCenterFirstMeshUuid = null
+  holeCenterFirstLocal = null
   firstClickHole = null
   secondHoleResult = null
   firstClickHoleModelId = null
+  firstClickHoleMeshUuid = null
   firstClickHoleLocalCenter = null
   firstClickHoleLocalNormal = null
   cadLinearPlanePoint = null
@@ -8419,13 +9136,16 @@ function setMeasureMode(enabled: boolean) {
   logger.info('Viewer3D', `setMeasureMode вызван: enabled=${enabled}`)
   measureModeRef.value = enabled
   hoverDirty = true
-  if (!enabled) clearMeasurements()
+  if (!enabled) {
+    clearMeasurements()
+    cadLinearPickTarget.value = null
+  }
   logger.info('Viewer3D', `Режим измерения: ${enabled ? 'вкл' : 'выкл'}`)
 }
 
 function setMeasureSnapMode(mode: MeasureSnapMode) {
-  // Режим привязки выбирается автоматически, ручное переключение отключено.
-  measureSnapMode = 'intersection'
+  measureSnapMode = mode
+  emit('update:measureSnapMode', mode)
 }
 
 function getMeasureSnapMode(): MeasureSnapMode {
@@ -8433,11 +9153,13 @@ function getMeasureSnapMode(): MeasureSnapMode {
 }
 
 function setMeasureType(type: MeasureType) {
-  measureType = type
+  measureTypeRef.value = type
+  emit('update:measureType', type)
   if (type !== 'distance') {
     measurementPoints = []
     measurementPointNormals = []
     measurementPointModelIds = []
+    measurementPointMeshUuids = []
     measurementPointLocals = []
     measurementPointNormalLocals = []
     for (const g of measurementFaceGeometries) g.dispose()
@@ -8448,9 +9170,13 @@ function setMeasureType(type: MeasureType) {
   arcFirstPoint = null
   arcMesh = null
   holeCenterFirst = null
+  holeCenterFirstModelId = null
+  holeCenterFirstMeshUuid = null
+  holeCenterFirstLocal = null
   firstClickHole = null
   secondHoleResult = null
   firstClickHoleModelId = null
+  firstClickHoleMeshUuid = null
   firstClickHoleLocalCenter = null
   firstClickHoleLocalNormal = null
   cadLinearPlanePoint = null
@@ -8467,38 +9193,183 @@ function setMeasureType(type: MeasureType) {
   updateMeasurementGraphics()
 }
 
-/** Автопривязка для одной грани: пересечение, вершины, центр, середины рёбер. */
-function getSnapCandidates(hit: THREE.Intersection): THREE.Vector3[] {
+function meshVertexWorld(mesh: THREE.Mesh, vi: number, out: THREE.Vector3): THREE.Vector3 {
+  const pos = mesh.geometry.attributes.position
+  return out.set(pos.getX(vi), pos.getY(vi), pos.getZ(vi)).applyMatrix4(mesh.matrixWorld)
+}
+
+function snapSearchRadiusWorld(mesh: THREE.Mesh): number {
+  const box = new THREE.Box3().setFromObject(mesh)
+  const diag = box.getSize(new THREE.Vector3()).length()
+  return Math.max(10, Math.min(150, diag * 0.02))
+}
+
+function pushSnapUnique(out: SnapCandidate[], point: THREE.Vector3, kind: SnapCandidate['kind'], seen: Set<string>) {
+  const key = `${point.x.toFixed(3)}|${point.y.toFixed(3)}|${point.z.toFixed(3)}|${kind}`
+  if (seen.has(key)) return
+  seen.add(key)
+  out.push({ point: point.clone(), kind })
+}
+
+function collectCoplanarPatchSnap(mesh: THREE.Mesh, faceIndex: number, out: SnapCandidate[], seen: Set<string>) {
+  const patch = getCoplanarFaceGeometry(mesh, faceIndex)
+  if (!patch) return
+  const attr = patch.attributes.position
+  if (!attr) {
+    patch.dispose()
+    return
+  }
+  const v = new THREE.Vector3()
+  for (let i = 0; i < attr.count; i++) {
+    v.set(attr.getX(i), attr.getY(i), attr.getZ(i))
+    pushSnapUnique(out, v, 'vertex', seen)
+  }
+  patch.dispose()
+}
+
+function collectNearbyMeshSnap(mesh: THREE.Mesh, hit: THREE.Intersection, out: SnapCandidate[], seen: Set<string>) {
+  const face = hit.face!
+  const pos = mesh.geometry.attributes.position
+  if (!pos) return
+  const faceIndex =
+    typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
+      ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
+      : Math.floor(face.a / 3)
+  const index = mesh.geometry.index
+  const numFaces = index ? index.count / 3 : pos.count / 3
+  const hitPoint = hit.point
+  const radius = snapSearchRadiusWorld(mesh)
+
+  if (numFaces > 30000) {
+    collectCoplanarPatchSnap(mesh, faceIndex, out, seen)
+    return
+  }
+
+  const vA = new THREE.Vector3()
+  const vB = new THREE.Vector3()
+  const vC = new THREE.Vector3()
+  const center = new THREE.Vector3()
+  const edgeSeen = new Set<string>()
+
+  for (let fi = 0; fi < numFaces; fi++) {
+    let a: number
+    let b: number
+    let c: number
+    if (index) {
+      a = index.getX(fi * 3)!
+      b = index.getX(fi * 3 + 1)!
+      c = index.getX(fi * 3 + 2)!
+    } else {
+      a = fi * 3
+      b = fi * 3 + 1
+      c = fi * 3 + 2
+    }
+    meshVertexWorld(mesh, a, vA)
+    meshVertexWorld(mesh, b, vB)
+    meshVertexWorld(mesh, c, vC)
+    center.copy(vA).add(vB).add(vC).multiplyScalar(1 / 3)
+    if (center.distanceTo(hitPoint) > radius * 1.25) continue
+
+    pushSnapUnique(out, vA, 'vertex', seen)
+    pushSnapUnique(out, vB, 'vertex', seen)
+    pushSnapUnique(out, vC, 'vertex', seen)
+
+    const edges: [number, number][] = [
+      [a, b],
+      [b, c],
+      [c, a],
+    ]
+    for (const [i, j] of edges) {
+      const key = i < j ? `${i},${j}` : `${j},${i}`
+      if (edgeSeen.has(key)) continue
+      edgeSeen.add(key)
+      meshVertexWorld(mesh, i, vA)
+      meshVertexWorld(mesh, j, vB)
+      pushSnapUnique(out, vA.clone().add(vB).multiplyScalar(0.5), 'edge', seen)
+      snapSeg.set(vA, vB)
+      snapSeg.closestPointToPoint(hitPoint, true, snapClosest)
+      pushSnapUnique(out, snapClosest, 'edge', seen)
+    }
+  }
+}
+
+/** Вершины, рёбра и грань у курсора (приоритет: вершина → ребро → грань). */
+function getSnapCandidates(hit: THREE.Intersection): SnapCandidate[] {
   const mesh = hit.object as THREE.Mesh
   const face = hit.face!
   const pos = mesh.geometry.attributes.position
-  if (!pos) return [hit.point.clone()]
-  const vA = new THREE.Vector3(pos.getX(face.a), pos.getY(face.a), pos.getZ(face.a)).applyMatrix4(mesh.matrixWorld)
-  const vB = new THREE.Vector3(pos.getX(face.b), pos.getY(face.b), pos.getZ(face.b)).applyMatrix4(mesh.matrixWorld)
-  const vC = new THREE.Vector3(pos.getX(face.c), pos.getY(face.c), pos.getZ(face.c)).applyMatrix4(mesh.matrixWorld)
+  if (!pos) return [{ point: hit.point.clone(), kind: 'surface' }]
+  const seen = new Set<string>()
+  const out: SnapCandidate[] = []
+  const vA = new THREE.Vector3()
+  const vB = new THREE.Vector3()
+  const vC = new THREE.Vector3()
+  meshVertexWorld(mesh, face.a, vA)
+  meshVertexWorld(mesh, face.b, vB)
+  meshVertexWorld(mesh, face.c, vC)
   const center = vA.clone().add(vB).add(vC).multiplyScalar(1 / 3)
-  const midAB = vA.clone().add(vB).multiplyScalar(0.5)
-  const midBC = vB.clone().add(vC).multiplyScalar(0.5)
-  const midCA = vC.clone().add(vA).multiplyScalar(0.5)
-  // Автопривязка: не требуем ручного выбора "вершина/ребро/грань".
-  return [hit.point.clone(), vA, vB, vC, center, midAB, midBC, midCA]
+  pushSnapUnique(out, hit.point, 'surface', seen)
+  pushSnapUnique(out, vA, 'vertex', seen)
+  pushSnapUnique(out, vB, 'vertex', seen)
+  pushSnapUnique(out, vC, 'vertex', seen)
+  pushSnapUnique(out, center, 'face', seen)
+  pushSnapUnique(out, vA.clone().add(vB).multiplyScalar(0.5), 'edge', seen)
+  pushSnapUnique(out, vB.clone().add(vC).multiplyScalar(0.5), 'edge', seen)
+  pushSnapUnique(out, vC.clone().add(vA).multiplyScalar(0.5), 'edge', seen)
+  const pt = hit.point
+  snapSeg.set(vA, vB)
+  snapSeg.closestPointToPoint(pt, true, snapClosest)
+  pushSnapUnique(out, snapClosest, 'edge', seen)
+  snapSeg.set(vB, vC)
+  snapSeg.closestPointToPoint(pt, true, snapClosest)
+  pushSnapUnique(out, snapClosest, 'edge', seen)
+  snapSeg.set(vC, vA)
+  snapSeg.closestPointToPoint(pt, true, snapClosest)
+  pushSnapUnique(out, snapClosest, 'edge', seen)
+  collectNearbyMeshSnap(mesh, hit, out, seen)
+  return out
 }
 
-/** Pick candidate closest to cursor in NDC (within threshold). */
-function getClosestSnapPoint(candidates: THREE.Vector3[], cam: THREE.Camera, mouseNDC: THREE.Vector2): THREE.Vector3 | null {
-  let best: THREE.Vector3 | null = null
-  let bestD = SNAP_SCREEN_THRESHOLD
-  for (const p of candidates) {
-    snapProj.copy(p).project(cam)
+function snapThresholdForKind(kind: SnapCandidate['kind']): number {
+  if (kind === 'vertex') return SNAP_SCREEN_THRESHOLD_VERTEX
+  if (kind === 'edge') return SNAP_SCREEN_THRESHOLD_EDGE
+  if (kind === 'face') return SNAP_SCREEN_THRESHOLD_SURFACE
+  return SNAP_SCREEN_THRESHOLD_SURFACE
+}
+
+function snapPriority(kind: SnapCandidate['kind']): number {
+  if (kind === 'vertex') return 0
+  if (kind === 'edge') return 1
+  if (kind === 'face') return 2
+  return 3
+}
+
+/** Привязка к вершине/ребру/грани по близости к курсору на экране. */
+function getClosestSnapPoint(
+  candidates: SnapCandidate[],
+  cam: THREE.Camera,
+  mouseNDC: THREE.Vector2,
+): THREE.Vector3 | null {
+  let best: { point: THREE.Vector3; score: number } | null = null
+  for (const c of candidates) {
+    snapProj.copy(c.point).project(cam)
     const dx = snapProj.x - mouseNDC.x
     const dy = snapProj.y - mouseNDC.y
     const d = Math.sqrt(dx * dx + dy * dy)
-    if (d < bestD) {
-      bestD = d
-      best = p
-    }
+    const th = snapThresholdForKind(c.kind)
+    if (d > th) continue
+    const score = snapPriority(c.kind) * 100 + d
+    if (!best || score < best.score) best = { point: c.point, score }
   }
-  return best
+  return best?.point ?? null
+}
+
+function mergeSnapCandidates(base: SnapCandidate[], extra: THREE.Vector3[], kind: SnapCandidate['kind'] = 'surface'): SnapCandidate[] {
+  const seen = new Set<string>()
+  const out: SnapCandidate[] = []
+  for (const c of base) pushSnapUnique(out, c.point, c.kind, seen)
+  for (const p of extra) pushSnapUnique(out, p, kind, seen)
+  return out
 }
 
 const COPLANAR_EPS = 1e-5
@@ -8760,7 +9631,8 @@ function loadGlbUrl(
         }
         wrapper.add(gltf.scene)
         ensureModelUnitsMillimeters(wrapper)
-        ensureExplodeCacheForModel(wrapper)
+        delete wrapper.userData.explodeCacheReady
+        updateModelExplodeProfileOnImport(wrapper, opts?.modelName)
         finalizeModelPartColors(gltf.scene, partMeta)
         const hadModelsBeforeAdd = meshGroup.children.length > 0
         meshGroup.add(wrapper)
@@ -8849,7 +9721,8 @@ function loadGlbUrl(
 async function loadSTL(
   arrayBuffer: ArrayBuffer,
   filename: string,
-  opts?: { modelId: string; modelName: string }
+  opts?: { modelId: string; modelName: string },
+  partMeta?: PartColorMeta | null,
 ): Promise<void> {
   console.log(`${LOG_PREFIX} STL: парсинг, размер ${arrayBuffer.byteLength} байт`)
   const loader = new STLLoader()
@@ -8874,6 +9747,15 @@ async function loadSTL(
     loadedModels.value = []
   }
   wrapper.add(mesh)
+  const splitCount = splitStlMergedMeshes(wrapper, partMeta)
+  if (partMeta) assignPartMetaToStlMeshes(wrapper, partMeta)
+  finalizeModelPartColors(wrapper, partMeta)
+  if (splitCount <= 1 && !partMeta) {
+    logger.info(
+      'Viewer3D',
+      'STL: одно связное тело — дерево из одной детали; для сборки и цветов лучше STEP или GLB',
+    )
+  }
   applyShadingMode()
   const hadModelsBeforeAddStl = meshGroup.children.length > 0
   meshGroup.add(wrapper)
@@ -8981,15 +9863,20 @@ function handleFile(file: File, metaByBaseName?: Map<string, PartColorMeta>): Pr
       if (!partMeta) {
         partMeta = await tryLoadPartMetaByBaseName(baseName)
       }
-      if (!partMeta && ['step', 'stp', 'igs', 'iges'].includes(ext)) {
+      if (!partMeta && ['step', 'stp', 'igs', 'iges', 'stl'].includes(ext)) {
         partMeta = await tryLoadKompasMetaAuto(file.name)
       }
-      if (!partMeta) logger.info('Viewer3D', `meta.json не найден для "${baseName}" (используем цвета из GLB/конвертера)`)
+      if (!partMeta) {
+        logger.info(
+          'Viewer3D',
+          `meta.json не найден для "${baseName}" (STL: авто-раскраска сегментов; STEP/GLB: цвета из файла)`,
+        )
+      }
     console.log('ArrayBuffer (байт):', buf?.byteLength ?? 0)
     if (ext === 'stl') {
       console.log('формат: STL — загрузка через STLLoader')
       console.groupEnd()
-      await loadSTL(buf, file.name, opts)
+      await loadSTL(buf, file.name, opts, partMeta)
       resolve()
       return
     }
@@ -9346,6 +10233,7 @@ onUnmounted(() => {
   }
   if (renderer?.domElement) {
     renderer.domElement.removeEventListener('click', onCanvasClick)
+    renderer.domElement.removeEventListener('pointerdown', onCanvasPointerDownCapture, true)
     renderer.domElement.removeEventListener('mousedown', onCanvasMouseDown, true)
     renderer.domElement.removeEventListener('contextmenu', onCanvasContextMenu)
     renderer.domElement.removeEventListener('mousemove', onCanvasMouseMove, false)
@@ -10154,7 +11042,7 @@ defineExpose({
               @input="onHeaderOffsetInput"
             />
           </template>
-          <button type="button" class="viewer-3d-btn" :class="{ active: measureMode || (leftSidebarTab === 'params' && paramsSubTab === 'measurements') }" @click="onMeasureHeaderClick">Измерение</button>
+          <button type="button" class="viewer-3d-btn" :class="{ active: measureModeRef || (leftSidebarTab === 'params' && paramsSubTab === 'measurements') }" @click="onMeasureHeaderClick">Измерение</button>
           <button
             type="button"
             class="viewer-3d-btn"
@@ -10235,6 +11123,33 @@ defineExpose({
               @wheel.prevent="onTintBrightnessWheel"
             />
           </label>
+          <label
+            class="viewer-scene-shading viewer-explode-control"
+            title="Крупнейшая деталь закреплена; остальные разъезжаются от неё и друг от друга (% × макс. габарит)."
+          >
+            <span>Разнос</span>
+            <input
+              type="range"
+              class="viewer-frame-opacity-slider"
+              :min="EXPLODE_MIN"
+              :max="EXPLODE_MAX"
+              :step="EXPLODE_STEP"
+              :value="explodeAmount"
+              @input="onExplodeInput"
+            />
+            <input
+              type="number"
+              class="viewer-frame-opacity-input"
+              :min="EXPLODE_MIN"
+              :max="EXPLODE_MAX"
+              :step="EXPLODE_STEP"
+              :value="explodeAmount"
+              title="Процент от макс. габарита (0 — собрано, 100 — вся большая сторона)"
+              @input="onExplodeInput"
+            />
+            <span v-if="explodeTravelHint != null" class="viewer-explode-mm-hint">{{ explodeTravelHint.pct }}% ≈{{ explodeTravelHint.mm }} мм</span>
+            <button type="button" class="viewer-3d-btn viewer-explode-reset" title="Сбросить разнесение" @click="resetExplodeAmount">0</button>
+          </label>
         </div>
         <div v-show="headerToolsTab === 'export'" class="viewer-header-block" data-group="Экспорт">
           <button type="button" class="viewer-3d-btn" @click="emit('screenshot-3d')">Скриншот 3D</button>
@@ -10282,6 +11197,23 @@ defineExpose({
           <button type="button" class="viewer-placement-btn" title="Снять подсветку и затемнение" @click="resetPartSelectionAndView">Сбросить выделение</button>
           <button type="button" class="viewer-placement-btn viewer-placement-btn-primary" title="Вернуть цвета из STEP/meta" @click="restoreOriginalModelColors()">Исходные цвета</button>
         </div>
+        <label
+          class="viewer-tree-explode"
+          title="Крупнейшая деталь закреплена, остальные группы дерева разъезжаются от её центра."
+        >
+          <span>Разнесение деталей</span>
+          <input
+            type="range"
+            class="viewer-tree-explode-slider"
+            :min="EXPLODE_MIN"
+            :max="EXPLODE_MAX"
+            :step="EXPLODE_STEP"
+            :value="explodeAmount"
+            @input="onExplodeInput"
+          />
+          <span class="viewer-tree-explode-val">{{ explodeAmount }}%<template v-if="explodeTravelHint != null"> ≈{{ explodeTravelHint.mm }} мм</template></span>
+          <button type="button" class="viewer-placement-btn" @click="resetExplodeAmount">Сброс</button>
+        </label>
         <label class="viewer-tree-isolate-check">
           <input v-model="partIsolateDimOthers" type="checkbox" @change="partIsolateDimOthers ? applySelectionVisualsAndFocus() : clearPartFocusVisuals()" />
           <span>Затемнять остальные при выделении (тяжело на больших сборках)</span>
@@ -10594,7 +11526,7 @@ defineExpose({
             <button type="button" class="viewer-measurements-clear" @click="clearMeasurementHistory">очистить</button>
           </div>
           <div class="viewer-measurements-controls">
-            <select class="viewer-measurements-select" :value="measureType" @change="setMeasureType(($event.target as HTMLSelectElement).value as MeasureType)">
+            <select class="viewer-measurements-select" :value="measureTypeRef" @change="setMeasureType(($event.target as HTMLSelectElement).value as MeasureType)">
               <optgroup label="Основные">
                 <option value="distance">Расстояние (треугольник Δ)</option>
                 <option value="cad-linear">Линейный размер (вынос, ГОСТ)</option>
@@ -10620,7 +11552,7 @@ defineExpose({
                 {{ measureModeRef ? 'Измерение: вкл' : 'Измерение: выкл' }}
               </button>
             </div>
-            <div v-if="measureType === 'cad-linear'" class="viewer-measurements-cad-row">
+            <div v-if="measureTypeRef === 'cad-linear'" class="viewer-measurements-cad-row">
               <label>Линейный размер по плоскостям (с выносными стрелками)</label>
               <div class="viewer-measurements-cad-pick">
                 <input class="viewer-measurements-cad-input" :value="cadLinearPlane1Text" readonly title="1-я измеряемая плоскость" />
@@ -11174,6 +12106,10 @@ defineExpose({
   align-items: center;
   gap: 0.25rem;
 }
+.viewer-explode-control .viewer-frame-opacity-input {
+  min-width: 3.6rem;
+}
+
 .viewer-frame-opacity-input {
   width: 2.8rem;
   padding: 0.2rem 0.25rem;
@@ -11186,6 +12122,44 @@ defineExpose({
 }
 .viewer-frame-opacity-input::-webkit-inner-spin-button {
   opacity: 1;
+}
+.viewer-explode-control {
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  max-width: 280px;
+}
+.viewer-explode-reset {
+  min-width: 28px;
+  padding: 2px 6px;
+}
+.viewer-tree-explode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 6px 8px 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--viewer-muted, #9aa8bc);
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+}
+.viewer-tree-explode-slider {
+  flex: 1;
+  min-width: 80px;
+  accent-color: #6a9fd8;
+}
+.viewer-explode-mm-hint {
+  font-size: 0.75rem;
+  opacity: 0.85;
+  white-space: nowrap;
+  min-width: 4.5em;
+}
+
+.viewer-tree-explode-val {
+  min-width: 1.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .viewer-frame-opacity-slider {
   width: 4rem;

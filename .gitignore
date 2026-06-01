@@ -33,3 +33,10 @@ __pycache__/
 
 # Test / sample data (optional: remove if you want to track)
 project_m1/
+
+# Private notes (IP, HR, strategy — not for GitHub)
+notes/private/
+
+# Local collab data (backup before migrations)
+server/collab.sqlite3
+server/uploads/
