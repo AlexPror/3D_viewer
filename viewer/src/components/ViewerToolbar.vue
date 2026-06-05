@@ -5,10 +5,18 @@ export type ViewMode = '2d' | '3d' | 'split' | 'log'
 export type MeasureSnapMode = 'intersection' | 'vertex' | 'face' | 'edge'
 export type MeasureType = 'distance' | 'radius' | 'diameter' | 'arc' | 'hole-center-distance' | 'cad-linear'
 
-defineProps<{
-  viewMode: ViewMode
-  workspaceMode: 'engineering' | 'production'
-}>()
+withDefaults(
+  defineProps<{
+    viewMode: ViewMode
+    workspaceMode: 'engineering' | 'production'
+    reportScreenshotCount?: number
+    reportBasketPulse?: boolean
+  }>(),
+  {
+    reportScreenshotCount: 0,
+    reportBasketPulse: false,
+  },
+)
 
 const emit = defineEmits<{
   'update:viewMode': [value: ViewMode]
@@ -16,6 +24,7 @@ const emit = defineEmits<{
   'open-pdf': []
   'open-file': []
   'export-report': []
+  'open-report-gallery': []
   'save-assembly-project': []
   'open-assembly-project': []
   'save-pdf': []
@@ -32,6 +41,11 @@ const emit = defineEmits<{
 
 type MenuId = 'file' | 'mode' | 'logs' | 'report' | 'telemost' | null
 const openMenu = ref<MenuId>(null)
+const reportMenuTriggerRef = ref<HTMLButtonElement | null>(null)
+
+defineExpose({
+  getReportBadgeRect: (): DOMRect | null => reportMenuTriggerRef.value?.getBoundingClientRect() ?? null,
+})
 
 function setMenu(id: MenuId) {
   openMenu.value = openMenu.value === id ? null : id
@@ -188,16 +202,29 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 
         <div class="toolbar-menu-wrap">
           <button
+            ref="reportMenuTriggerRef"
             type="button"
-            class="toolbar-menu-trigger"
+            class="toolbar-menu-trigger toolbar-menu-trigger--report"
             :class="{ 'is-open': openMenu === 'report' }"
             aria-haspopup="true"
             :aria-expanded="openMenu === 'report'"
             @click.stop="setMenu('report')"
           >
             Скриншот-отчёт
+            <span
+              v-if="reportScreenshotCount > 0"
+              class="toolbar-menu-badge"
+              :class="{ 'toolbar-menu-badge--pulse': reportBasketPulse }"
+            >
+              {{ reportScreenshotCount > 99 ? '99+' : reportScreenshotCount }}
+            </span>
           </button>
           <div v-show="openMenu === 'report'" class="toolbar-menu-dropdown" role="menu">
+            <button type="button" class="toolbar-menu-item toolbar-menu-item--basket" role="menuitem" @click="run(() => emit('open-report-gallery'))">
+              <span>Все скриншоты</span>
+              <span v-if="reportScreenshotCount > 0" class="toolbar-menu-item-badge">{{ reportScreenshotCount }}</span>
+            </button>
+            <div class="toolbar-menu-separator" role="separator" />
             <button type="button" class="toolbar-menu-item" role="menuitem" @click="run(() => emit('export-report'))">
               Экспорт скриншот-отчёта в PDF…
             </button>
@@ -289,6 +316,62 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 .toolbar-menu-trigger--telemost {
   border-color: rgba(120, 160, 120, 0.55);
   background: rgba(60, 95, 70, 0.5);
+}
+.toolbar-menu-trigger--report {
+  position: relative;
+}
+.toolbar-menu-badge {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #e85d04;
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.15rem;
+  text-align: center;
+  pointer-events: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+.toolbar-menu-badge--pulse {
+  animation: report-badge-pulse 0.55s ease;
+}
+@keyframes report-badge-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.28);
+  }
+}
+.toolbar-menu-item--basket {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-weight: 600;
+}
+.toolbar-menu-item-badge {
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #e85d04;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.25rem;
+  text-align: center;
+}
+.toolbar-menu-separator {
+  height: 1px;
+  margin: 0.25rem 0.5rem;
+  background: rgba(120, 140, 170, 0.35);
 }
 .toolbar-menu-dropdown {
   position: absolute;

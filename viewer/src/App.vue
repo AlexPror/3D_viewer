@@ -12,6 +12,8 @@ import ViewerToolbar from './components/ViewerToolbar.vue'
 import PdfViewer from './components/PdfViewer.vue'
 import LogPanel from './components/LogPanel.vue'
 import ScreenshotEditorModal from './components/ScreenshotEditorModal.vue'
+import ReportScreenshotsModal from './components/ReportScreenshotsModal.vue'
+import ScreenshotFlyToBasket from './components/ScreenshotFlyToBasket.vue'
 import CollabRoleIcon from './components/CollabRoleIcon.vue'
 import CollaborativeEditor from './components/CollaborativeEditor.vue'
 import YandexDiskTree from './components/YandexDiskTree.vue'
@@ -45,6 +47,17 @@ const showScreenshotModal = ref(false)
 const screenshotSourceType = ref<'2d' | '3d'>('2d')
 const editingScreenshotId = ref<string | null>(null)
 const reportScreenshots = ref<ReportScreenshotItem[]>([])
+const showReportGallery = ref(false)
+const reportBasketPulse = ref(false)
+const toolbarRef = ref<InstanceType<typeof ViewerToolbar> | null>(null)
+type ScreenshotFlyAnim = {
+  src: string
+  fromX: number
+  fromY: number
+  toX: number
+  toY: number
+}
+const screenshotFlyAnim = ref<ScreenshotFlyAnim | null>(null)
 const reportProjectName = ref('')
 const reportModuleNumber = ref('')
 const reportSheetNumber = ref('')
@@ -1079,7 +1092,7 @@ function onExportReportEmail() {
 
 async function onExportReportChat() {
   if (reportScreenshots.value.length === 0) {
-    window.alert('Добавьте скриншоты в панель отчёта.')
+    window.alert('Добавьте скриншоты в «Скриншот-отчёт» → «Все скриншоты».')
     return
   }
   for (const item of reportScreenshots.value) {
@@ -1699,21 +1712,13 @@ async function onExportReport() {
     doc.setFontSize(10)
     const report = viewerRef.value?.getMeasurementReport?.()
     if (report) {
-      if ('triangle' in report && report.triangle) {
-        doc.text(
-          `${MEASURE_LABELS.length}: ${report.lengths[0].toFixed(2)} ${MEASURE_LABELS.mm}  |  ${report.lengths[1].toFixed(2)} ${MEASURE_LABELS.mm}  |  ${report.lengths[2].toFixed(2)} ${MEASURE_LABELS.mm}`,
-          margin,
-          y
-        )
-      } else {
-        doc.text(`${MEASURE_LABELS.length}: ${report.length.toFixed(2)} ${MEASURE_LABELS.mm}`, margin, y)
-        y += lineH
-        doc.text(
-          `ΔX: ${report.dx.toFixed(2)} ${MEASURE_LABELS.mm}  ΔY: ${report.dy.toFixed(2)} ${MEASURE_LABELS.mm}  ΔZ: ${report.dz.toFixed(2)} ${MEASURE_LABELS.mm}`,
-          margin,
-          y
-        )
-      }
+      doc.text(`${MEASURE_LABELS.length}: ${report.length.toFixed(2)} ${MEASURE_LABELS.mm}`, margin, y)
+      y += lineH
+      doc.text(
+        `ΔX: ${report.dx.toFixed(2)} ${MEASURE_LABELS.mm}  ΔY: ${report.dy.toFixed(2)} ${MEASURE_LABELS.mm}  ΔZ: ${report.dz.toFixed(2)} ${MEASURE_LABELS.mm}`,
+        margin,
+        y
+      )
     } else {
       doc.text(MEASURE_LABELS.noMeasurements, margin, y)
     }
@@ -1839,6 +1844,49 @@ async function onScreenshot3D() {
 }
 
 /** Прямой рендер страницы PDF в изображение (как 3D takeScreenshot), без захвата экрана ОС */
+function openReportGallery() {
+  showReportGallery.value = true
+}
+
+function triggerScreenshotFlyAnimation(dataUrl: string) {
+  const rect = toolbarRef.value?.getReportBadgeRect?.()
+  if (!rect) return
+  screenshotFlyAnim.value = {
+    src: dataUrl,
+    fromX: window.innerWidth / 2,
+    fromY: window.innerHeight / 2,
+    toX: rect.left + rect.width / 2,
+    toY: rect.top + rect.height / 2,
+  }
+}
+
+function onScreenshotFlyDone() {
+  screenshotFlyAnim.value = null
+  reportBasketPulse.value = true
+  window.setTimeout(() => {
+    reportBasketPulse.value = false
+  }, 600)
+}
+
+function downloadScreenshotItem(item: ReportScreenshotItem) {
+  const a = document.createElement('a')
+  a.href = item.dataUrl
+  a.download =
+    item.type === '2d'
+      ? build2dScreenshotFileName(item)
+      : `3d-скриншот-${item.id.slice(-8)}.png`
+  a.click()
+}
+
+function onScreenshotReorder(fromIndex: number, toIndex: number) {
+  const arr = [...reportScreenshots.value]
+  if (fromIndex < 0 || fromIndex >= arr.length || toIndex < 0 || toIndex >= arr.length) return
+  const [item] = arr.splice(fromIndex, 1)
+  arr.splice(toIndex, 0, item)
+  reportScreenshots.value = arr
+  logger.info('App', `Скриншот перемещён с ${fromIndex + 1} на ${toIndex + 1}`)
+}
+
 async function onScreenshot2d() {
   const pv = pdfViewerRef.value
   if (!pdfFile.value || !pv?.getCurrentPageImageUrlAsync) {
@@ -1892,6 +1940,7 @@ function onScreenshotEditorClose(dataUrl: string | null) {
       }
       reportScreenshots.value.push(item)
       logger.info('App', `Редактор скриншота: добавлен ${type === '2d' ? '2D' : '3D'} скриншот в отчёт (всего ${reportScreenshots.value.length})`)
+      void nextTick(() => triggerScreenshotFlyAnimation(dataUrl))
     }
   }
   editingScreenshotId.value = null
@@ -1912,6 +1961,7 @@ function onScreenshotEditorFinalImage(dataUrl: string) {
 }
 
 function openEditorForScreenshot(item: ReportScreenshotItem) {
+  showReportGallery.value = false
   editingScreenshotId.value = item.id
   screenshotSourceType.value = item.type
   screenshotImageUrl.value = item.dataUrl
@@ -1938,31 +1988,6 @@ function moveScreenshotDown(index: number) {
   const next = [...arr]
   ;[next[index], next[index + 1]] = [next[index + 1], next[index]]
   reportScreenshots.value = next
-}
-
-function onScreenshotDragStart(e: DragEvent, index: number) {
-  if (!e.dataTransfer) return
-  e.dataTransfer.effectAllowed = 'move'
-  e.dataTransfer.setData('text/plain', String(index))
-  e.dataTransfer.setData('application/x-screenshot-index', String(index))
-}
-
-function onScreenshotDragOver(e: DragEvent) {
-  e.preventDefault()
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
-}
-
-function onScreenshotDrop(e: DragEvent, toIndex: number) {
-  e.preventDefault()
-  if (!e.dataTransfer) return
-  const fromIndex = Number(e.dataTransfer.getData('text/plain'))
-  if (Number.isNaN(fromIndex) || fromIndex === toIndex) return
-  const arr = [...reportScreenshots.value]
-  if (fromIndex < 0 || fromIndex >= arr.length || toIndex < 0 || toIndex >= arr.length) return
-  const [item] = arr.splice(fromIndex, 1)
-  arr.splice(toIndex, 0, item)
-  reportScreenshots.value = arr
-  logger.info('App', `Скриншот перемещён с ${fromIndex + 1} на ${toIndex + 1}`)
 }
 
 async function fillProjectNameFromFirstSheet() {
@@ -2960,12 +2985,16 @@ onUnmounted(() => {
       @change="onAssemblyProjectFile"
     />
     <ViewerToolbar
+      ref="toolbarRef"
       :view-mode="viewMode"
       :workspace-mode="workspaceMode"
+      :report-screenshot-count="reportScreenshots.length"
+      :report-basket-pulse="reportBasketPulse"
       @update:view-mode="onViewModeChange"
       @update:workspace-mode="workspaceMode = $event"
       @open-pdf="onOpenPdf"
       @open-file="onOpenFile"
+      @open-report-gallery="openReportGallery"
       @export-report="onExportReport"
       @export-report-email="onExportReportEmail"
       @export-report-chat="onExportReportChat"
@@ -2994,47 +3023,6 @@ onUnmounted(() => {
       <button type="button" class="telemost-call-banner-dismiss" @click="dismissTelemostBanner">×</button>
     </div>
     <div v-if="saveActionToast" class="workspace-save-toast">{{ saveActionToast }}</div>
-    <div class="report-screenshots-panel">
-      <div class="report-screenshots-header">
-        <span class="report-screenshots-title">Скриншоты для отчёта</span>
-        <span class="report-screenshots-count">({{ reportScreenshots.length }})</span>
-      </div>
-      <div class="report-params">
-        <label class="report-params-label">Шифр альбома:</label>
-        <input v-model="reportProjectName" type="text" class="report-params-input" placeholder="10-23-КП-Р-НВФ1.1" />
-        <button type="button" class="report-params-btn" title="Взять с первого листа PDF" @click="fillProjectNameFromFirstSheet">С 1-го листа</button>
-        <label class="report-params-label">Номер модуля:</label>
-        <input v-model="reportModuleNumber" type="text" class="report-params-input" placeholder="например 3 или М1" />
-        <label class="report-params-label">Номер листа:</label>
-        <input v-model="reportSheetNumber" type="text" class="report-params-input" placeholder="1" />
-        <label class="report-params-label">Автор замечаний:</label>
-        <input v-model="reportAuthor" type="text" class="report-params-input" placeholder="Фамилия Имя" />
-      </div>
-      <div v-if="reportScreenshots.length === 0" class="report-screenshots-empty">
-        Делайте скриншоты кнопками «Скриншот 2D» / «Скриншот 3D» на панелях чертежа и 3D — после закрытия редактора они появятся здесь; PDF отчёт собирается через «Файл» → «Отчёт…» или кнопку «Отчёт» в шапке.
-      </div>
-      <div v-else class="report-screenshots-list">
-        <div
-          v-for="(item, index) in reportScreenshots"
-          :key="item.id"
-          class="report-screenshot-card"
-          draggable="true"
-          @dragstart="onScreenshotDragStart($event, index)"
-          @dragover="onScreenshotDragOver($event)"
-          @drop="onScreenshotDrop($event, index)"
-        >
-          <img :src="item.dataUrl" :alt="item.type" class="report-screenshot-thumb" draggable="false" />
-          <span class="report-screenshot-type">{{ item.type === '2d' ? '2D' : '3D' }}</span>
-          <div class="report-screenshot-actions">
-            <button type="button" class="report-screenshot-btn" title="Выше в отчёте" :disabled="index === 0" @click="moveScreenshotUp(index)">↑</button>
-            <button type="button" class="report-screenshot-btn" title="Ниже в отчёте" :disabled="index === reportScreenshots.length - 1" @click="moveScreenshotDown(index)">↓</button>
-            <button type="button" class="report-screenshot-btn" title="Редактировать" @click="openEditorForScreenshot(item)">✎</button>
-            <button type="button" class="report-screenshot-btn report-screenshot-btn-chat" title="Отправить скриншот в чат" @click="sendScreenshotToChat(item)">В чат</button>
-            <button type="button" class="report-screenshot-btn report-screenshot-btn-remove" title="Удалить из отчёта" @click="removeScreenshotFromReport(item)">×</button>
-          </div>
-        </div>
-      </div>
-    </div>
     <div v-if="workspaceMode === 'engineering'" class="workspace">
       <div
         class="workspace-side-rail workspace-side-rail--left"
@@ -3742,6 +3730,39 @@ onUnmounted(() => {
       @final-image="onScreenshotEditorFinalImage"
       @send-to-chat="onScreenshotEditorSendToChat"
     />
+    <ReportScreenshotsModal
+      :open="showReportGallery"
+      :screenshots="reportScreenshots"
+      :project-name="reportProjectName"
+      :module-number="reportModuleNumber"
+      :sheet-number="reportSheetNumber"
+      :author="reportAuthor"
+      @close="showReportGallery = false"
+      @update:project-name="reportProjectName = $event"
+      @update:module-number="reportModuleNumber = $event"
+      @update:sheet-number="reportSheetNumber = $event"
+      @update:author="reportAuthor = $event"
+      @edit="openEditorForScreenshot"
+      @remove="removeScreenshotFromReport"
+      @move-up="moveScreenshotUp"
+      @move-down="moveScreenshotDown"
+      @reorder="onScreenshotReorder"
+      @send-chat="sendScreenshotToChat"
+      @download="downloadScreenshotItem"
+      @export-pdf="onExportReport"
+      @export-email="onExportReportEmail"
+      @export-chat="onExportReportChat"
+      @fill-first-sheet="fillProjectNameFromFirstSheet"
+    />
+    <ScreenshotFlyToBasket
+      v-if="screenshotFlyAnim"
+      :src="screenshotFlyAnim.src"
+      :from-x="screenshotFlyAnim.fromX"
+      :from-y="screenshotFlyAnim.fromY"
+      :to-x="screenshotFlyAnim.toX"
+      :to-y="screenshotFlyAnim.toY"
+      @done="onScreenshotFlyDone"
+    />
   </div>
 </template>
 
@@ -3768,152 +3789,6 @@ onUnmounted(() => {
   color: #fff;
   pointer-events: none;
   z-index: 500;
-}
-.report-screenshots-panel {
-  flex-shrink: 0;
-  background: #1e2433;
-  border-bottom: 1px solid #3a4a6a;
-  padding: 0.4rem 0.6rem;
-  max-height: 200px;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-.report-params {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem 0.6rem;
-  margin-bottom: 0.35rem;
-}
-.report-params-label {
-  font-size: 0.8rem;
-  color: #8a9bb5;
-  white-space: nowrap;
-}
-.report-params-input {
-  width: 10rem;
-  max-width: 140px;
-  padding: 0.25rem 0.4rem;
-  font-size: 0.85rem;
-  background: #2d3a52;
-  border: 1px solid #4a5f7a;
-  border-radius: 4px;
-  color: #e0e8f0;
-}
-.report-params-input::placeholder {
-  color: #6a7a8a;
-}
-.report-params-btn {
-  padding: 0.25rem 0.5rem;
-  font-size: 0.8rem;
-  background: #3d4a62;
-  color: #e0e8f0;
-  border: 1px solid #4a5f7a;
-  border-radius: 4px;
-  cursor: pointer;
-}
-.report-params-btn:hover {
-  background: #4a6fc7;
-  border-color: #5a7fd7;
-}
-.report-screenshots-header {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  margin-bottom: 0.35rem;
-  font-size: 0.85rem;
-  color: #8a9bb5;
-}
-.report-screenshots-title {
-  font-weight: 600;
-  color: #e0e8f0;
-}
-.report-screenshots-count {
-  color: #8a9bb5;
-}
-.report-screenshots-empty {
-  font-size: 0.8rem;
-  color: #6a7a8a;
-  padding: 0.25rem 0;
-}
-.report-screenshots-list {
-  display: flex;
-  gap: 0.5rem;
-  overflow-x: auto;
-  padding: 0.2rem 0;
-  align-items: flex-end;
-}
-.report-screenshot-card {
-  flex-shrink: 0;
-  width: 80px;
-  position: relative;
-  background: #252525;
-  border: 1px solid #3a4a6a;
-  border-radius: 6px;
-  overflow: hidden;
-  cursor: grab;
-  user-select: none;
-}
-.report-screenshot-card:active {
-  cursor: grabbing;
-}
-.report-screenshot-thumb {
-  display: block;
-  width: 80px;
-  height: 60px;
-  object-fit: contain;
-  background: #1a1a1a;
-}
-.report-screenshot-type {
-  position: absolute;
-  top: 2px;
-  left: 4px;
-  font-size: 0.65rem;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.6);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
-.report-screenshot-actions {
-  position: absolute;
-  bottom: 2px;
-  right: 2px;
-  display: flex;
-  gap: 2px;
-}
-.report-screenshot-btn {
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  font-size: 0.9rem;
-  line-height: 1;
-  border: none;
-  border-radius: 4px;
-  background: rgba(74, 111, 199, 0.9);
-  color: #fff;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.report-screenshot-btn:hover:not(:disabled) {
-  background: #4a6fc7;
-}
-.report-screenshot-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-.report-screenshot-btn-chat {
-  width: auto;
-  padding: 0 6px;
-  font-size: 0.7rem;
-}
-.report-screenshot-btn-remove {
-  background: rgba(180, 60, 60, 0.9);
-}
-.report-screenshot-btn-remove:hover {
-  background: #b43c3c;
 }
 .content {
   flex: 1 1 auto;

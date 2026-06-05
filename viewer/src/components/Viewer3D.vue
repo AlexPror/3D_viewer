@@ -154,6 +154,10 @@ let measurementLabelEl0: HTMLDivElement | null = null
 let measurementLabelEl1: HTMLDivElement | null = null
 let measurementLabelEl2: HTMLDivElement | null = null
 let hoverTooltipEl: HTMLDivElement | null = null
+/** Вторая точка при live-preview (расстояние: 1 клик + движение мыши). */
+let measurePreviewPoint: THREE.Vector3 | null = null
+let savedMeasurementLabelsLayer: HTMLDivElement | null = null
+const savedMeasurementLabelById = new Map<string, HTMLDivElement>()
 let lastHoverNormal: THREE.Vector3 | null = null
 let lastHoverPoint: THREE.Vector3 | null = null
 const measureModeRef = ref(false)
@@ -522,6 +526,11 @@ const selectedComponentRowId = ref<string | null>(null)
 /** Мультивыбор деталей: ключ `${modelId}:${rowId}`. */
 const selectedPartRowKeys = ref<Set<string>>(new Set())
 const highlightedComponentMeshes = new Set<THREE.Mesh>()
+type SelectionMaterialBackup = { color: THREE.Color; emissive: THREE.Color; emissiveIntensity: number }
+const selectionMaterialBackups = new Map<THREE.Mesh, SelectionMaterialBackup[]>()
+const PART_SELECTION_TINT = new THREE.Color(0x7fd4ff)
+const PART_SELECTION_EMISSIVE = 0x2a8fd4
+const PART_SELECTION_EMISSIVE_INTENSITY = 1.2
 const expandedCategoryIds = ref<Record<string, boolean>>({})
 let hiddenOutlineGroup: THREE.Group
 const hiddenOutlineByComponentId = new Map<string, THREE.Box3Helper>()
@@ -593,7 +602,6 @@ const sceneLayers3d = ref<SceneLayer3d[]>([
 const meshLayerByUuid = ref<Record<string, string>>({})
 const layerColorOverrideByUuid = ref<Record<string, string>>({})
 const selectedLayerAssignId = ref('layer-0')
-const partBoxSelectMode = ref(false)
 const partFocusActive = ref(false)
 /** Затемнять остальные детали при выделении (выкл. по умолчанию — иначе тормозит на больших сборках). */
 const partIsolateDimOthers = ref(false)
@@ -606,6 +614,7 @@ const boxSelectRect = ref<{
   mode: 'window' | 'crossing'
 } | null>(null)
 let boxSelectDrag: { startX: number; startY: number; additive: boolean } | null = null
+let didBoxSelect = false
 
 const dimmedMeshBackups = new Map<
   THREE.Mesh,
@@ -1150,7 +1159,7 @@ const mousePanSpeed = ref(2)
 const mouseDamping = ref(0.22)
 const mouseZoomGestureMs = ref(450)
 /** Левая кнопка: перемещение модели в сцене (перетаскивание детали) */
-const leftButtonMoveModel = ref(true)
+const leftButtonMoveModel = ref(false)
 const autoNavLimitsEnabled = ref(true)
 
 const CAD_MOUSE_LIMITS = {
@@ -1806,6 +1815,9 @@ function applyShadingMode() {
   setMeshGroupShadowState(false)
   syncWireframeEdges()
   applyUserOpacityToMeshGroup()
+  if (selectedPartRowKeys.value.size > 0) {
+    applySelectionVisualsAndFocus()
+  }
 }
 
 function onShadingModeChange(ev: Event) {
@@ -2706,6 +2718,7 @@ function startCadLinearPlanePick(target: Exclude<CadLinearPickTarget, null>) {
     display: 'Линейный размер: выберите плоскость отображения размера.',
   }
   cadLinearStatus.value = hints[target]
+  measureStatusHint.value = hints[target]
 }
 
 function beginNextCadLinearDimension() {
@@ -2713,7 +2726,8 @@ function beginNextCadLinearDimension() {
   measureTypeRef.value = 'cad-linear'
   measureModeRef.value = true
   cadLinearPickTarget.value = 'plane1'
-  cadLinearStatus.value = 'Линейный размер: выберите 1-ю измеряемую плоскость (клик по грани).'
+  cadLinearStatus.value = 'Между гранями: кликните 1-ю параллельную грань.'
+  measureStatusHint.value = cadLinearStatus.value
 }
 
 function clearCadLinearPicks() {
@@ -2724,6 +2738,7 @@ function clearCadLinearPicks() {
   cadLinearPlane2.value = null
   cadLinearDisplayPlane.value = null
   cadLinearPickTarget.value = null
+  refreshMeasurementReferenceFaceHighlights()
 }
 
 function startNewCadLinearMeasurement() {
@@ -2741,8 +2756,8 @@ function saveCadLinearFromPickedPlanes() {
   const p2 = cadLinearPlane2.value
   const pd = cadLinearDisplayPlane.value
   if (!p1 || !p2 || !pd) return
-  const n1 = p1.normal.clone().normalize()
-  const n2 = p2.normal.clone().normalize()
+  const n1 = planePickNormalWorld(p1)
+  const n2 = planePickNormalWorld(p2)
   if (Math.abs(n1.dot(n2)) < 0.85) {
     cadLinearStatus.value =
       'Плоскости 1 и 2 должны быть параллельны (кликните по другим граням или «Новый размер»).'
@@ -2758,6 +2773,8 @@ function saveCadLinearFromPickedPlanes() {
     vecToSaved(p2.meshLocalPoint ?? p2.localPoint),
     n1,
     n2,
+    vecToSaved(p1.normal),
+    vecToSaved(p2.normal),
     pd.modelId,
     vecToSaved(pd.localPoint),
     vecToSaved(pd.normal),
@@ -2765,15 +2782,28 @@ function saveCadLinearFromPickedPlanes() {
     p2.meshUuid ?? null,
   )
   beginNextCadLinearDimension()
-  cadLinearStatus.value = 'Линейный размер сохранён. Выберите 1-ю плоскость для следующего.'
+  cadLinearStatus.value = 'Размер сохранён. Кликните 1-ю грань для следующего.'
+  measureStatusHint.value = cadLinearStatus.value
 }
 
 function inferCadLinearPickTarget(): Exclude<CadLinearPickTarget, null> | null {
   if (cadLinearPickTarget.value) return cadLinearPickTarget.value
   if (!cadLinearPlane1.value) return 'plane1'
   if (!cadLinearPlane2.value) return 'plane2'
-  if (!cadLinearDisplayPlane.value) return 'display'
-  return null
+  return 'display'
+}
+
+function autoCadLinearDisplayAndSave() {
+  const p1 = cadLinearPlane1.value
+  const p2 = cadLinearPlane2.value
+  if (!p1 || !p2) {
+    cadLinearStatus.value = 'Сначала выберите грани 1 и 2.'
+    measureStatusHint.value = cadLinearStatus.value
+    return
+  }
+  cadLinearDisplayPlane.value = buildAutoCadLinearDisplayPlane(p1, p2)
+  cadLinearPickTarget.value = null
+  saveCadLinearFromPickedPlanes()
 }
 
 function meshFromIntersectObject(obj: THREE.Object3D): THREE.Mesh | null {
@@ -2905,14 +2935,15 @@ function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
   const planePoint = (snapped ?? hit.point).clone()
   const localPoint = wrapper.worldToLocal(planePoint.clone())
   const meshLocalPoint = mesh.worldToLocal(planePoint.clone())
-  const tri = buildWorldFaceTriangleFromHit(hit)
+  const tri = buildFaceHighlightGeometryFromHit(hit)
+  const localNormal = worldNormalToLocal(wrapper, normal)
   const pick: AssemblyPlaneSelection = {
     modelId,
     point: planePoint,
     localPoint,
     meshUuid: mesh.uuid,
     meshLocalPoint,
-    normal,
+    normal: localNormal,
   }
   if (tri) pick.previewGeometry = tri
   const target = inferCadLinearPickTarget()
@@ -2921,24 +2952,29 @@ function pickCadLinearPlaneFromHit(hit: THREE.Intersection) {
     return
   }
   if (target === 'plane1') {
+    selectedMeasurementId.value = null
     disposePlanePreviewGeometry(cadLinearPlane1.value ?? undefined)
     cadLinearPlane1.value = pick
     cadLinearPickTarget.value = 'plane2'
-    cadLinearStatus.value = 'Плоскость 1 выбрана. Кликните по грани для плоскости 2.'
+    cadLinearStatus.value = 'Грань 1 выбрана. Кликните 2-ю параллельную грань.'
+    measureStatusHint.value = cadLinearStatus.value
   } else if (target === 'plane2') {
     disposePlanePreviewGeometry(cadLinearPlane2.value ?? undefined)
     cadLinearPlane2.value = pick
     cadLinearPickTarget.value = 'display'
-    cadLinearStatus.value = 'Плоскость 2 выбрана. Кликните по грани плоскости вывода размера.'
+    cadLinearStatus.value = 'Грань 2 выбрана. Кликните плоскость вывода (3-я грань) или «Авто-вынос».'
+    measureStatusHint.value = cadLinearStatus.value
   } else {
     disposePlanePreviewGeometry(cadLinearDisplayPlane.value ?? undefined)
     cadLinearDisplayPlane.value = pick
     cadLinearPickTarget.value = null
     cadLinearStatus.value = 'Плоскость вывода выбрана.'
+    measureStatusHint.value = cadLinearStatus.value
   }
   if (cadLinearPlane1.value && cadLinearPlane2.value && cadLinearDisplayPlane.value) {
     saveCadLinearFromPickedPlanes()
   }
+  refreshMeasurementReferenceFaceHighlights()
 }
 
 function inferAutoAssemblyPickTarget(modelId: string): Exclude<AssemblyPickTarget, null> | null {
@@ -3420,7 +3456,212 @@ const sceneMetricsText = computed(() => {
 const dimArrowSizeMm = ref(8)
 const dimLineOffsetMm = ref(18)
 const dimFontSizeMm = ref(12)
+const measureStatusHint = ref('')
 const expandedLinearMeasurementIds = ref<string[]>([])
+
+type LinearDimGeometry = {
+  srcA: THREE.Vector3
+  srcB: THREE.Vector3
+  dimA: THREE.Vector3
+  dimB: THREE.Vector3
+  labelWorld: THREE.Vector3
+}
+
+function defaultMeasurementLineOffsetMm(): number {
+  return Math.max(dimLineOffsetMm.value, loadedSceneCharDim * 0.028)
+}
+
+function buildSavedDisplayPlaneFields(
+  mid: THREE.Vector3,
+  anchorModelId: string | null,
+): {
+  outputPlaneModelId: string | null
+  outputPlaneLocalPoint: SavedVec3 | null
+  outputPlaneLocalNormal: SavedVec3 | null
+} {
+  if (!anchorModelId || !camera) {
+    return { outputPlaneModelId: null, outputPlaneLocalPoint: null, outputPlaneLocalNormal: null }
+  }
+  const g = modelGroupsById.get(anchorModelId)
+  if (!g) {
+    return { outputPlaneModelId: null, outputPlaneLocalPoint: null, outputPlaneLocalNormal: null }
+  }
+  const viewNormal = mid.clone().sub(camera.position).normalize()
+  return {
+    outputPlaneModelId: anchorModelId,
+    outputPlaneLocalPoint: vecToSaved(g.worldToLocal(mid.clone())),
+    outputPlaneLocalNormal: vecToSaved(worldNormalToLocal(g, viewNormal)),
+  }
+}
+
+function planePickNormalWorld(pick: AssemblyPlaneSelection): THREE.Vector3 {
+  const g = modelGroupsById.get(pick.modelId)
+  if (g) return localNormalToWorld(g, vecToSaved(pick.normal)) ?? savedToVec(pick.normal)
+  return savedToVec(pick.normal)
+}
+
+function buildLinearDimGeometry(
+  srcA: THREE.Vector3,
+  srcB: THREE.Vector3,
+  planeNormal: THREE.Vector3,
+  lineOffsetMm: number,
+): LinearDimGeometry {
+  const dir = srcB.clone().sub(srcA)
+  if (dir.lengthSq() < 1e-12) dir.set(1, 0, 0)
+  else dir.normalize()
+  const n = planeNormal.clone().normalize()
+  let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+  if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+  offsetDir = orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+  const off = normalizeSignedOffset(lineOffsetMm)
+  const dimA = srcA.clone().add(offsetDir.clone().multiplyScalar(off))
+  const dimB = srcB.clone().add(offsetDir.clone().multiplyScalar(off))
+  return {
+    srcA: srcA.clone(),
+    srcB: srcB.clone(),
+    dimA,
+    dimB,
+    labelWorld: dimA.clone().add(dimB).multiplyScalar(0.5),
+  }
+}
+
+function linearDimLabelWorldForAnchorPoints(
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  lineOffsetMm = defaultMeasurementLineOffsetMm(),
+  planeNormal?: THREE.Vector3,
+): THREE.Vector3 {
+  const mid = a.clone().add(b).multiplyScalar(0.5)
+  const n = planeNormal?.clone().normalize()
+    ?? (camera ? mid.clone().sub(camera.position).normalize() : new THREE.Vector3(0, 1, 0))
+  return buildLinearDimGeometry(a, b, n, lineOffsetMm).labelWorld
+}
+
+function displayPlaneNormalForSavedRow(row: SavedMeasurement, mid: THREE.Vector3): THREE.Vector3 {
+  if (row.outputPlaneLocalNormal) {
+    if (row.outputPlaneModelId) {
+      const g = modelGroupsById.get(row.outputPlaneModelId)
+      if (g) return (localNormalToWorld(g, row.outputPlaneLocalNormal) ?? savedToVec(row.outputPlaneLocalNormal)).normalize()
+    }
+    return savedToVec(row.outputPlaneLocalNormal).normalize()
+  }
+  const nA = resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1)
+  const nB = resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2)
+  const faceN = nB ?? nA
+  if (faceN) return faceN.clone().normalize()
+  if (camera) return mid.clone().sub(camera.position).normalize()
+  return new THREE.Vector3(0, 1, 0)
+}
+
+function resolveLinearDimForDistanceRow(row: SavedMeasurement): LinearDimGeometry | null {
+  const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+  const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
+  const mid = a.clone().add(b).multiplyScalar(0.5)
+  return buildLinearDimGeometry(
+    a,
+    b,
+    displayPlaneNormalForSavedRow(row, mid),
+    row.lineOffsetMm ?? defaultMeasurementLineOffsetMm(),
+  )
+}
+
+function resolveLinearDimForCadLinearRow(row: SavedMeasurement): LinearDimGeometry | null {
+  const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+  const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
+  let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
+  let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
+  if (row.outputPlaneModelId) {
+    const g = modelGroupsById.get(row.outputPlaneModelId)
+    if (g) {
+      planePoint = g.localToWorld(planePoint)
+      planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
+    }
+  }
+  const n = planeNormal.clone().normalize()
+  const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
+  const nA = resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1)
+  const nB = resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2)
+  const strict = projectPerpendicularByNormals(a, b, nA, nB)
+  const srcA = strict ? strict.projected : project(a)
+  const srcB = strict ? strict.otherPoint : project(b)
+  return buildLinearDimGeometry(srcA, srcB, n, row.lineOffsetMm ?? defaultMeasurementLineOffsetMm())
+}
+
+function buildAutoCadLinearDisplayPlane(
+  p1: AssemblyPlaneSelection,
+  p2: AssemblyPlaneSelection,
+): AssemblyPlaneSelection {
+  const mid = p1.point.clone().add(p2.point).multiplyScalar(0.5)
+  const viewNormal = camera
+    ? mid.clone().sub(camera.position).normalize()
+    : p1.normal.clone().normalize()
+  const g = modelGroupsById.get(p1.modelId)
+  const localNormal = g ? worldNormalToLocal(g, viewNormal) : viewNormal.clone()
+  return {
+    modelId: p1.modelId,
+    point: mid,
+    localPoint: g ? vecToSaved(g.worldToLocal(mid.clone())) : vecToSaved(mid),
+    normal: localNormal,
+    meshUuid: p1.meshUuid ?? null,
+    meshLocalPoint: p1.meshLocalPoint,
+  }
+}
+
+function syncSavedMeasurementLabelElements() {
+  if (!savedMeasurementLabelsLayer) return
+  const ids = new Set(measurementHistory.value.map((m) => m.id))
+  for (const [id, el] of savedMeasurementLabelById) {
+    if (!ids.has(id)) {
+      el.remove()
+      savedMeasurementLabelById.delete(id)
+    }
+  }
+  for (const row of measurementHistory.value) {
+    if (row.type !== 'distance' && row.type !== 'cad-linear') continue
+    if (savedMeasurementLabelById.has(row.id)) continue
+    const el = document.createElement('div')
+    el.className = 'measurement-label saved-measurement-label'
+    el.style.cssText =
+      'position:absolute;pointer-events:none;color:#fff;background:rgba(12,18,32,0.88);padding:3px 10px;border-radius:4px;font-size:13px;font-weight:600;white-space:nowrap;display:none;border:1px solid rgba(255,173,91,0.75);z-index:6;transform:translate(-50%,-50%);'
+    savedMeasurementLabelsLayer.appendChild(el)
+    savedMeasurementLabelById.set(row.id, el)
+  }
+}
+
+function updateSavedMeasurementLabelPositions() {
+  if (!camera || !containerRef.value) return
+  const rect = containerRef.value.getBoundingClientRect()
+  for (const row of measurementHistory.value) {
+    const el = savedMeasurementLabelById.get(row.id)
+    if (!el) continue
+    if (row.type !== 'distance' && row.type !== 'cad-linear') {
+      el.style.display = 'none'
+      continue
+    }
+    const geom = row.type === 'distance'
+      ? resolveLinearDimForDistanceRow(row)
+      : resolveLinearDimForCadLinearRow(row)
+    if (!geom) {
+      el.style.display = 'none'
+      continue
+    }
+    const p = geom.labelWorld.clone().project(camera)
+    if (p.z > 1) {
+      el.style.display = 'none'
+      continue
+    }
+    el.style.left = `${(p.x * 0.5 + 0.5) * rect.width}px`
+    el.style.top = `${(-p.y * 0.5 + 0.5) * rect.height}px`
+    el.textContent = `${measurementValueText(row)} мм`
+    el.style.borderColor = row.id === selectedMeasurementId.value ? '#ffffff' : 'rgba(255,173,91,0.75)'
+    el.style.display = 'block'
+  }
+}
+
+function clearSavedMeasurementLabelElements() {
+  for (const el of savedMeasurementLabelById.values()) el.remove()
+  savedMeasurementLabelById.clear()
+}
 let draggedMeasurementOffset:
   | {
       id: string
@@ -3431,6 +3672,183 @@ let draggedMeasurementOffset:
       axisY: number
     }
   | null = null
+/** Кандидат на drag выноса — активируется только после сдвига мыши, чтобы не блокировать клик. */
+let offsetDragPending:
+  | {
+      id: string
+      startX: number
+      startY: number
+      startOffset: number
+      axisX: number
+      axisY: number
+    }
+  | null = null
+
+/** Мин. смещение preview-точки (мм²), чтобы не перерисовывать линию на каждый пиксель. */
+const MEASURE_PREVIEW_MOVE_THRESH_MM2 = 4
+/** Порог попадания в линию размера (пиксели) — только для перетаскивания выноса. */
+const DIM_LINE_PICK_THRESHOLD_PX = 24
+/** Ниже этого сдвига (px) считаем кликом, а не drag выноса. */
+const DIM_DRAG_MIN_PX = 5
+
+function isDistancePointPlacementActive(): boolean {
+  return measureModeRef.value && measureTypeRef.value === 'distance' && measurementPoints.length > 0
+}
+
+function isCadLinearPlanePlacementActive(): boolean {
+  return measureModeRef.value && measureTypeRef.value === 'cad-linear' && !!(cadLinearPlane1.value || cadLinearPlane2.value)
+}
+
+function shouldDeferSavedMeasurementPick(): boolean {
+  return isDistancePointPlacementActive() || isCadLinearPlanePlacementActive()
+}
+
+function commitMeasurementLineOffset(id: string, lineOffsetMm: number) {
+  measurementHistory.value = measurementHistory.value.map((m) =>
+    m.id === id ? { ...m, lineOffsetMm } : m,
+  )
+}
+
+function screenDistToSegmentPx(
+  px: number,
+  py: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): number {
+  const dx = x2 - x1
+  const dy = y2 - y1
+  const lenSq = dx * dx + dy * dy
+  if (lenSq < 1e-6) return Math.hypot(px - x1, py - y1)
+  let t = ((px - x1) * dx + (py - y1) * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+}
+
+function offsetDragAxisForLinearRow(row: SavedMeasurement, rect: DOMRect): { axisX: number; axisY: number } {
+  const anchorWorld = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+    .clone()
+    .add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2))
+    .multiplyScalar(0.5)
+  const dirWorld = (() => {
+    const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+    const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
+    if (row.type === 'cad-linear') {
+      let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
+      let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
+      if (row.outputPlaneModelId) {
+        const g = modelGroupsById.get(row.outputPlaneModelId)
+        if (g) {
+          planePoint = g.localToWorld(planePoint)
+          planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
+        }
+      }
+      const n = planeNormal.clone().normalize()
+      const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
+      const nA = resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1)
+      const nB = resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2)
+      const strict = projectPerpendicularByNormals(a, b, nA, nB)
+      const srcA = strict ? strict.projected : project(a)
+      const srcB = strict ? strict.otherPoint : project(b)
+      const dir = srcB.clone().sub(srcA).normalize()
+      let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+      if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+      return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
+    }
+    const mid = a.clone().add(b).multiplyScalar(0.5)
+    const n = displayPlaneNormalForSavedRow(row, mid)
+    const dir = b.clone().sub(a).normalize()
+    let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
+    if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
+    return orientOffsetDirForScreen(offsetDir, mid)
+  })()
+  if (!camera) return { axisX: 0, axisY: -1 }
+  const p0 = anchorWorld.clone().project(camera)
+  const p1 = anchorWorld.clone().add(dirWorld.clone().multiplyScalar(100)).project(camera)
+  let axisX = (p1.x - p0.x) * rect.width * 0.5
+  let axisY = -(p1.y - p0.y) * rect.height * 0.5
+  const axisLen = Math.hypot(axisX, axisY)
+  if (axisLen > 1e-3) {
+    axisX /= axisLen
+    axisY /= axisLen
+  } else {
+    axisX = 0
+    axisY = -1
+  }
+  return { axisX, axisY }
+}
+
+function pickLinearMeasurementAtClient(clientX: number, clientY: number): SavedMeasurement | null {
+  if (!camera || !renderer || !savedMeasurementsGroup) return null
+  const rect = renderer.domElement.getBoundingClientRect()
+  const mx = ((clientX - rect.left) / rect.width) * 2 - 1
+  const my = -((clientY - rect.top) / rect.height) * 2 + 1
+  savedMeasurementsGroup.updateMatrixWorld(true)
+  const rr = new THREE.Raycaster()
+  rr.params.Line = { threshold: DIM_LINE_PICK_THRESHOLD_PX }
+  rr.setFromCamera(new THREE.Vector2(mx, my), camera)
+  for (const h of rr.intersectObject(savedMeasurementsGroup, true)) {
+    const id = String((h.object as THREE.Object3D).userData?.measurementId ?? '')
+    if (!id) continue
+    const row = measurementHistory.value.find((m) => m.id === id)
+    if (row && (row.type === 'distance' || row.type === 'cad-linear')) return row
+  }
+  const px = clientX - rect.left
+  const py = clientY - rect.top
+  let bestRow: SavedMeasurement | null = null
+  let bestDist = DIM_LINE_PICK_THRESHOLD_PX
+  const toScreen = (v: THREE.Vector3) => {
+    const p = v.clone().project(camera!)
+    return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, z: p.z }
+  }
+  for (const row of measurementHistory.value) {
+    if (row.type !== 'distance' && row.type !== 'cad-linear') continue
+    const dim = row.type === 'distance'
+      ? resolveLinearDimForDistanceRow(row)
+      : resolveLinearDimForCadLinearRow(row)
+    if (!dim) continue
+    const segments: [THREE.Vector3, THREE.Vector3][] = [
+      [dim.srcA, dim.dimA],
+      [dim.srcB, dim.dimB],
+      [dim.dimA, dim.dimB],
+    ]
+    for (const [a, b] of segments) {
+      const sa = toScreen(a)
+      const sb = toScreen(b)
+      if (sa.z > 1 && sb.z > 1) continue
+      const d = screenDistToSegmentPx(px, py, sa.x, sa.y, sb.x, sb.y)
+      if (d < bestDist) {
+        bestDist = d
+        bestRow = row
+      }
+    }
+  }
+  return bestRow
+}
+
+function tryBeginMeasurementOffsetDrag(ev: MouseEvent): boolean {
+  if (ev.button !== 0 || !savedMeasurementsGroup || !renderer || shouldDeferSavedMeasurementPick()) return false
+  const row = pickLinearMeasurementAtClient(ev.clientX, ev.clientY)
+  if (!row) return false
+  if (selectedMeasurementId.value !== row.id) {
+    selectedMeasurementId.value = row.id
+    rebuildSavedMeasurementsVisuals()
+  }
+  const rect = renderer.domElement.getBoundingClientRect()
+  const { axisX, axisY } = offsetDragAxisForLinearRow(row, rect)
+  offsetDragPending = {
+    id: row.id,
+    startX: ev.clientX,
+    startY: ev.clientY,
+    startOffset: row.lineOffsetMm ?? defaultMeasurementLineOffsetMm(),
+    axisX,
+    axisY,
+  }
+  ev.preventDefault()
+  ev.stopPropagation()
+  return true
+}
 
 function vecToSaved(v: THREE.Vector3): SavedVec3 {
   return { x: v.x, y: v.y, z: v.z }
@@ -3569,30 +3987,19 @@ function projectPerpendicularByNormals(
 function saveDistanceMeasurement() {
   if (measurementPoints.length !== 2) return
   const [a, b] = measurementPoints
-  const delta = b.clone().sub(a)
-  const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
-  const bPrime = b.clone().sub(perpComp)
-  const parallelMm = a.distanceTo(bPrime)
-  const trianglePerpMm = bPrime.distanceTo(b)
-  const nA = measurementPointNormals[0] ?? null
-  const nB = measurementPointNormals[1] ?? null
-  const perpByPlane = projectPerpendicularByNormals(a, b, nA, nB)
-  let surfacePerpMm: number | null = null
-  if (nA || nB) {
-    const baseNormal = (nB || nA)!.clone().normalize()
-    const basePoint = nB ? b : a
-    const otherPoint = nB ? a : b
-    surfacePerpMm = Math.abs(otherPoint.clone().sub(basePoint).dot(baseNormal))
-  }
+  const lengthMm = a.distanceTo(b)
   const id = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+  const mid = a.clone().add(b).multiplyScalar(0.5)
+  const anchorModelId = measurementPointModelIds[0] ?? measurementPointModelIds[1] ?? null
+  const displayPlane = buildSavedDisplayPlaneFields(mid, anchorModelId)
   const row: SavedMeasurement = {
     id,
     type: 'distance',
     createdAt: new Date().toLocaleTimeString('ru-RU'),
-    lengthMm: perpByPlane ? perpByPlane.distanceMm : a.distanceTo(b),
-    parallelMm,
-    trianglePerpMm,
-    surfacePerpMm,
+    lengthMm,
+    parallelMm: 0,
+    trianglePerpMm: 0,
+    surfacePerpMm: null,
     p1: vecToSaved(a),
     p2: vecToSaved(b),
     n1: measurementPointNormals[0] ? vecToSaved(measurementPointNormals[0]!) : null,
@@ -3605,9 +4012,15 @@ function saveDistanceMeasurement() {
     p2Local: measurementPointLocals[1] ?? null,
     n1Local: measurementPointNormalLocals[0] ?? null,
     n2Local: measurementPointNormalLocals[1] ?? null,
+    outputPlaneModelId: displayPlane.outputPlaneModelId,
+    outputPlaneLocalPoint: displayPlane.outputPlaneLocalPoint,
+    outputPlaneLocalNormal: displayPlane.outputPlaneLocalNormal,
+    lineOffsetMm: defaultMeasurementLineOffsetMm(),
   }
   measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
-  selectedMeasurementId.value = row.id
+  selectedMeasurementId.value = null
+  measurePreviewPoint = null
+  measureStatusHint.value = `Размер ${row.lengthMm.toFixed(2)} мм сохранён. Потяните линию для выноса или кликните 1-ю точку.`
   rebuildSavedMeasurementsVisuals()
   measurementPoints = []
   measurementPointNormals = []
@@ -3618,6 +4031,7 @@ function saveDistanceMeasurement() {
   for (const g of measurementFaceGeometries) g.dispose()
   measurementFaceGeometries = []
   updateMeasurementGraphics()
+  refreshMeasurementReferenceFaceHighlights()
 }
 
 function saveRadiusMeasurement(
@@ -3727,6 +4141,8 @@ function saveCadLinearMeasurement(
   p2Local: SavedVec3 | null,
   n1: THREE.Vector3 | null,
   n2: THREE.Vector3 | null,
+  n1Local: SavedVec3 | null,
+  n2Local: SavedVec3 | null,
   outputPlaneModelId: string | null,
   outputPlaneLocalPoint: SavedVec3 | null,
   outputPlaneLocalNormal: SavedVec3 | null,
@@ -3772,10 +4188,13 @@ function saveCadLinearMeasurement(
     meshUuid2,
     p1Local,
     p2Local,
+    n1Local,
+    n2Local,
     displayValue: len.toFixed(2),
     outputPlaneModelId,
     outputPlaneLocalPoint,
     outputPlaneLocalNormal,
+    lineOffsetMm: defaultMeasurementLineOffsetMm(),
   }
   measurementHistory.value = [row, ...measurementHistory.value].slice(0, 200)
   selectedMeasurementId.value = row.id
@@ -3881,31 +4300,26 @@ function restoreMeasurement(row: SavedMeasurement, focusCamera = true) {
       controls.update()
     }
     rebuildSavedMeasurementsVisuals()
+    refreshMeasurementReferenceFaceHighlights()
     return
   }
   if (row.type !== 'distance') return
   measureTypeRef.value = 'distance'
-  measurementPoints = [
-    resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1),
-    resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2),
-  ]
-  measurementPointNormals = [
-    resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1),
-    resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2),
-  ]
-  updateMeasurementGraphics()
   selectedMeasurementId.value = row.id
   if (focusCamera) {
-    const mid = measurementPoints[0].clone().add(measurementPoints[1]).multiplyScalar(0.5)
-    controls.target.copy(mid)
+    const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
+    const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
+    controls.target.copy(a.clone().add(b).multiplyScalar(0.5))
     controls.update()
   }
   rebuildSavedMeasurementsVisuals()
+  refreshMeasurementReferenceFaceHighlights()
 }
 
 function clearMeasurementHistory() {
   measurementHistory.value = []
   selectedMeasurementId.value = null
+  clearSavedMeasurementLabelElements()
   rebuildSavedMeasurementsVisuals()
 }
 
@@ -3990,6 +4404,26 @@ function addLine(group: THREE.Group, a: THREE.Vector3, b: THREE.Vector3, color =
   group.add(line)
 }
 
+function addDimLine(
+  group: THREE.Group,
+  a: THREE.Vector3,
+  b: THREE.Vector3,
+  color = DIM_GOST_COLOR,
+  measurementId?: string,
+): void {
+  const g = new THREE.BufferGeometry().setFromPoints([a, b])
+  const m = new THREE.LineBasicMaterial({
+    color,
+    depthTest: false,
+    transparent: true,
+    opacity: 0.96,
+  })
+  const line = new THREE.Line(g, m)
+  line.renderOrder = 1000
+  if (measurementId) line.userData.measurementId = measurementId
+  group.add(line)
+}
+
 function addArrowHead(group: THREE.Group, tip: THREE.Vector3, dirToInside: THREE.Vector3, color = 0x7fc2ff, size = 4, measurementId?: string): void {
   const u = dirToInside.clone().normalize()
   const aux = Math.abs(u.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
@@ -4000,6 +4434,160 @@ function addArrowHead(group: THREE.Group, tip: THREE.Vector3, dirToInside: THREE
 }
 
 const DIM_GOST_COLOR = 0xffad5b
+/** Мягкая подсветка 1-й опорной грани / точки */
+const MEASURE_REF_FACE_COLOR_1 = 0x8eedb8
+/** Мягкая подсветка 2-й опорной грани / точки */
+const MEASURE_REF_FACE_COLOR_2 = 0xf0a0a0
+const MEASURE_REF_FACE_OPACITY = 0.815
+
+function measurementHighlightLiftMm(): number {
+  return Math.max(0.12, loadedSceneCharDim * 4e-5)
+}
+
+/** Слегка отодвигает геометрию от поверхности модели — убирает z-fighting и «мерцание пикселей». */
+function liftHighlightGeometryFromSurface(geom: THREE.BufferGeometry, liftMm?: number): THREE.BufferGeometry {
+  const g = geom.clone()
+  const lift = liftMm ?? measurementHighlightLiftMm()
+  if (!g.getAttribute('normal')) g.computeVertexNormals()
+  const pos = g.getAttribute('position') as THREE.BufferAttribute
+  const norm = g.getAttribute('normal') as THREE.BufferAttribute
+  for (let i = 0; i < pos.count; i++) {
+    pos.setXYZ(
+      i,
+      pos.getX(i) + norm.getX(i) * lift,
+      pos.getY(i) + norm.getY(i) * lift,
+      pos.getZ(i) + norm.getZ(i) * lift,
+    )
+  }
+  pos.needsUpdate = true
+  return g
+}
+
+function clearMeasurementPlanesGroup() {
+  if (!measurementPlanesGroup) return
+  while (measurementPlanesGroup.children.length) {
+    const c = measurementPlanesGroup.children[0]
+    measurementPlanesGroup.remove(c)
+    if ('geometry' in c && c.geometry) c.geometry.dispose()
+    if ('material' in c && c.material) {
+      const m = c.material as THREE.Material | THREE.Material[]
+      if (Array.isArray(m)) m.forEach((x) => x.dispose())
+      else m.dispose()
+    }
+  }
+}
+
+function addMeasurementFaceHighlightMesh(geom: THREE.BufferGeometry, color: number, opacity = MEASURE_REF_FACE_OPACITY) {
+  if (!measurementPlanesGroup) return
+  const mat = new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    depthTest: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
+  })
+  const mesh = new THREE.Mesh(liftHighlightGeometryFromSurface(geom), mat)
+  mesh.renderOrder = 1003
+  measurementPlanesGroup.add(mesh)
+}
+
+function buildFaceHighlightGeometryFromHit(hit: THREE.Intersection): THREE.BufferGeometry | null {
+  const mesh = hit.object as THREE.Mesh
+  const face = hit.face
+  if (!face) return buildWorldFaceTriangleFromHit(hit)
+  const faceIndex =
+    typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
+      ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
+      : Math.floor(face.a / 3)
+  const coplanar = getCoplanarFaceGeometry(mesh, faceIndex)
+  if (coplanar) {
+    const g = coplanar.clone()
+    g.applyMatrix4(mesh.matrixWorld)
+    return g
+  }
+  return buildWorldFaceTriangleFromHit(hit)
+}
+
+function findFaceIndexNearSavedAnchor(
+  mesh: THREE.Mesh,
+  worldPoint: THREE.Vector3,
+  worldNormal: THREE.Vector3 | null,
+): number | null {
+  const geom = mesh.geometry as THREE.BufferGeometry
+  const pos = geom.attributes.position as THREE.BufferAttribute | undefined
+  if (!pos) return null
+  const index = geom.index
+  const triCount = index ? index.count / 3 : pos.count / 3
+  const inv = mesh.matrixWorld.clone().invert()
+  const localPt = worldPoint.clone().applyMatrix4(inv)
+  let bestFi: number | null = null
+  let bestScore = Infinity
+  for (let fi = 0; fi < triCount; fi++) {
+    const nw = meshTriangleWorldNormal(mesh, fi)
+    if (!nw) continue
+    if (worldNormal && nw.dot(worldNormal) < 0.85) continue
+    const ia = index ? index.getX(fi * 3) : fi * 3
+    const ib = index ? index.getX(fi * 3 + 1) : fi * 3 + 1
+    const ic = index ? index.getX(fi * 3 + 2) : fi * 3 + 2
+    const cx = (pos.getX(ia) + pos.getX(ib) + pos.getX(ic)) / 3
+    const cy = (pos.getY(ia) + pos.getY(ib) + pos.getY(ic)) / 3
+    const cz = (pos.getZ(ia) + pos.getZ(ib) + pos.getZ(ic)) / 3
+    const distSq = localPt.distanceToSquared(new THREE.Vector3(cx, cy, cz))
+    if (distSq < bestScore) {
+      bestScore = distSq
+      bestFi = fi
+    }
+  }
+  return bestFi
+}
+
+function buildSavedAnchorFaceHighlight(row: SavedMeasurement, slot: 0 | 1): THREE.BufferGeometry | null {
+  const modelId = slot === 0 ? row.modelId1 : row.modelId2
+  const meshUuid = slot === 0 ? row.meshUuid1 : row.meshUuid2
+  const localPoint = slot === 0 ? row.p1Local : row.p2Local
+  const worldFallback = slot === 0 ? row.p1 : row.p2
+  const nLocal = slot === 0 ? row.n1Local : row.n2Local
+  const nWorld = slot === 0 ? row.n1 : row.n2
+  if (!modelId || !meshUuid) return null
+  const mesh = findMeshInModel(modelId, meshUuid)
+  if (!mesh) return null
+  const worldPoint = resolveSavedPointWorld(modelId, localPoint, worldFallback, meshUuid)
+  const worldNormal = resolveSavedNormalWorld(modelId, nLocal, nWorld, meshUuid)
+  const faceIndex = findFaceIndexNearSavedAnchor(mesh, worldPoint, worldNormal)
+  if (faceIndex == null) return null
+  return getCoplanarFaceGeometry(mesh, faceIndex)
+}
+
+function refreshMeasurementReferenceFaceHighlights() {
+  clearMeasurementPlanesGroup()
+  const colors = [MEASURE_REF_FACE_COLOR_1, MEASURE_REF_FACE_COLOR_2] as const
+  const activeSlotGeom: (THREE.BufferGeometry | null)[] = [null, null]
+
+  if (measureModeRef.value && measureTypeRef.value === 'cad-linear') {
+    if (cadLinearPlane1.value?.previewGeometry) activeSlotGeom[0] = cadLinearPlane1.value.previewGeometry
+    if (cadLinearPlane2.value?.previewGeometry) activeSlotGeom[1] = cadLinearPlane2.value.previewGeometry
+  } else if (measureModeRef.value && measureTypeRef.value === 'distance') {
+    const count = Math.min(measurementFaceGeometries.length, measurementPoints.length, 2)
+    for (let i = 0; i < count; i++) activeSlotGeom[i] = measurementFaceGeometries[i]
+  }
+
+  const savedRow = selectedMeasurementId.value
+    ? measurementHistory.value.find((m) => m.id === selectedMeasurementId.value) ?? null
+    : null
+  const linearSavedRow =
+    savedRow && (savedRow.type === 'distance' || savedRow.type === 'cad-linear') ? savedRow : null
+
+  for (let slot = 0; slot < 2; slot++) {
+    let geom: THREE.BufferGeometry | null = activeSlotGeom[slot]
+    if (!geom && linearSavedRow) geom = buildSavedAnchorFaceHighlight(linearSavedRow, slot as 0 | 1)
+    if (!geom) continue
+    addMeasurementFaceHighlightMesh(geom.clone(), colors[slot])
+  }
+}
 
 function addGostArrowHead(
   group: THREE.Object3D,
@@ -4035,21 +4623,15 @@ function rebuildSavedMeasurementsVisuals() {
   clearSavedMeasurementVisuals()
   for (const row of measurementHistory.value) {
     if (row.type === 'distance') {
-      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
-      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
-      const delta = b.clone().sub(a)
-      const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
-      const bPrime = b.clone().sub(perpComp)
-      addLine(savedMeasurementsGroup, a, bPrime, AXIS_COLOR_X, row.id)
-      addLine(savedMeasurementsGroup, bPrime, b, AXIS_COLOR_Y, row.id)
-      addLine(savedMeasurementsGroup, b, a, AXIS_COLOR_Z, row.id)
-      const mid = a.clone().add(b).multiplyScalar(0.5)
-      const scale = adaptiveMeasurementScale(mid)
-      const s = createMeasurementTextSprite(measurementValueText(row))
-      s.scale.multiplyScalar(scale)
-      s.userData.measurementId = row.id
-      s.position.copy(mid)
-      savedMeasurementsGroup.add(s)
+      const dim = resolveLinearDimForDistanceRow(row)
+      if (!dim) continue
+      const scale = adaptiveMeasurementScale(dim.labelWorld)
+      const arrow = Math.max(3, dimArrowSizeMm.value * scale)
+      addDimLine(savedMeasurementsGroup, dim.srcA, dim.dimA, DIM_GOST_COLOR, row.id)
+      addDimLine(savedMeasurementsGroup, dim.srcB, dim.dimB, DIM_GOST_COLOR, row.id)
+      addDimLine(savedMeasurementsGroup, dim.dimA, dim.dimB, DIM_GOST_COLOR, row.id)
+      addGostArrowHead(savedMeasurementsGroup, dim.dimA, dim.dimB.clone().sub(dim.dimA), DIM_GOST_COLOR, arrow, row.id)
+      addGostArrowHead(savedMeasurementsGroup, dim.dimB, dim.dimA.clone().sub(dim.dimB), DIM_GOST_COLOR, arrow, row.id)
       continue
     }
     if (row.type === 'radius' || row.type === 'diameter') {
@@ -4107,44 +4689,19 @@ function rebuildSavedMeasurementsVisuals() {
       continue
     }
     if (row.type === 'cad-linear') {
-      const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
-      const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
-      let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
-      let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
-      if (row.outputPlaneModelId) {
-        const g = modelGroupsById.get(row.outputPlaneModelId)
-        if (g) {
-          planePoint = g.localToWorld(planePoint)
-          planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
-        }
-      }
-      const n = planeNormal.clone().normalize()
-      const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
-      const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
-      const srcA = strict ? strict.projected : project(a)
-      const srcB = strict ? strict.otherPoint : project(b)
-      const dir = srcB.clone().sub(srcA).normalize()
-      let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
-      if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
-      offsetDir = orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
-      const off = normalizeSignedOffset(row.lineOffsetMm ?? dimLineOffsetMm.value)
-      const aProj = srcA.clone().add(offsetDir.clone().multiplyScalar(off))
-      const bProj = srcB.clone().add(offsetDir.clone().multiplyScalar(off))
-      const scale = adaptiveMeasurementScale(aProj.clone().add(bProj).multiplyScalar(0.5))
+      const dim = resolveLinearDimForCadLinearRow(row)
+      if (!dim) continue
+      const scale = adaptiveMeasurementScale(dim.labelWorld)
       const arrow = Math.max(3, dimArrowSizeMm.value * scale)
-      addLine(savedMeasurementsGroup, srcA, aProj, DIM_GOST_COLOR, row.id)
-      addLine(savedMeasurementsGroup, srcB, bProj, DIM_GOST_COLOR, row.id)
-      addLine(savedMeasurementsGroup, aProj, bProj, DIM_GOST_COLOR, row.id)
-      addGostArrowHead(savedMeasurementsGroup, aProj, bProj.clone().sub(aProj), DIM_GOST_COLOR, arrow, row.id)
-      addGostArrowHead(savedMeasurementsGroup, bProj, aProj.clone().sub(bProj), DIM_GOST_COLOR, arrow, row.id)
-      const mid = aProj.clone().add(bProj).multiplyScalar(0.5)
-      const t = createMeasurementTextSprite(measurementValueText(row))
-      t.scale.multiplyScalar(scale)
-      t.userData.measurementId = row.id
-      t.position.copy(mid)
-      savedMeasurementsGroup.add(t)
+      addDimLine(savedMeasurementsGroup, dim.srcA, dim.dimA, DIM_GOST_COLOR, row.id)
+      addDimLine(savedMeasurementsGroup, dim.srcB, dim.dimB, DIM_GOST_COLOR, row.id)
+      addDimLine(savedMeasurementsGroup, dim.dimA, dim.dimB, DIM_GOST_COLOR, row.id)
+      addGostArrowHead(savedMeasurementsGroup, dim.dimA, dim.dimB.clone().sub(dim.dimA), DIM_GOST_COLOR, arrow, row.id)
+      addGostArrowHead(savedMeasurementsGroup, dim.dimB, dim.dimA.clone().sub(dim.dimB), DIM_GOST_COLOR, arrow, row.id)
     }
   }
+  syncSavedMeasurementLabelElements()
+  updateSavedMeasurementLabelPositions()
 }
 
 function removeMeasurement(id: string) {
@@ -4153,6 +4710,7 @@ function removeMeasurement(id: string) {
     selectedMeasurementId.value = null
   }
   rebuildSavedMeasurementsVisuals()
+  refreshMeasurementReferenceFaceHighlights()
 }
 
 function measurementTypeLabel(m: SavedMeasurement): string {
@@ -4386,6 +4944,10 @@ function initScene() {
   hoverTooltipEl.style.cssText = labelStyle + 'font-size:11px;'
   hoverTooltipEl.style.display = 'none'
   containerRef.value.appendChild(hoverTooltipEl)
+  savedMeasurementLabelsLayer = document.createElement('div')
+  savedMeasurementLabelsLayer.className = 'saved-measurement-labels-layer'
+  savedMeasurementLabelsLayer.style.cssText = 'position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:5;'
+  containerRef.value.appendChild(savedMeasurementLabelsLayer)
   renderer.domElement.addEventListener('click', onCanvasClick)
   renderer.domElement.addEventListener('pointerdown', onCanvasPointerDownCapture, true)
   renderer.domElement.addEventListener('mousedown', onCanvasMouseDown, true)
@@ -4579,6 +5141,18 @@ function initScene() {
               snapMarker.renderOrder = 999
               highlightGroup.add(snapMarker)
             }
+            if (
+              measureTypeRef.value === 'distance'
+              && measurementPoints.length === 1
+            ) {
+              const previewPt = (snapPt ?? hit.point).clone()
+              const moved = !measurePreviewPoint
+                || measurePreviewPoint.distanceToSquared(previewPt) > MEASURE_PREVIEW_MOVE_THRESH_MM2
+              if (moved) {
+                measurePreviewPoint = previewPt
+                updateMeasurementGraphics()
+              }
+            }
           }
         } else if (hoverTooltipEl) {
           hoverTooltipEl.style.display = 'none'
@@ -4599,31 +5173,33 @@ function initScene() {
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
       if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
       if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
-    } else if (measurementPoints.length === 3 && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
+    } else if (
+      measurementPoints.length === 1
+      && measurePreviewPoint
+      && measureTypeRef.value === 'distance'
+      && measureModeRef.value
+      && containerRef.value
+      && measurementLabelEl
+    ) {
       const rect = containerRef.value.getBoundingClientRect()
-      const p0 = measurementPoints[0]
-      const p1 = measurementPoints[1]
-      const p2 = measurementPoints[2]
-      const midpoints = [
-        p0.clone().add(p1).multiplyScalar(0.5),
-        p1.clone().add(p2).multiplyScalar(0.5),
-        p2.clone().add(p0).multiplyScalar(0.5),
-      ]
-      const lengths = [
-        p0.distanceTo(p1),
-        p1.distanceTo(p2),
-        p2.distanceTo(p0),
-      ]
-      const labels = [measurementLabelEl0, measurementLabelEl1, measurementLabelEl2]
-      for (let i = 0; i < 3; i++) {
-        midpoints[i].project(camera)
-        labels[i].style.left = (midpoints[i].x * 0.5 + 0.5) * rect.width + 'px'
-        labels[i].style.top = (-midpoints[i].y * 0.5 + 0.5) * rect.height + 'px'
-        labels[i].textContent = `${lengths[i].toFixed(2)}`
-        labels[i].style.display = 'block'
-      }
-      if (measurementLabelEl) measurementLabelEl.style.display = 'none'
+      const A = measurementPoints[0]
+      const B = measurePreviewPoint
+      const d = A.distanceTo(B)
+      const labelWorld = linearDimLabelWorldForAnchorPoints(A, B)
+      labelWorld.project(camera)
+      measurementLabelEl.style.left = `${(labelWorld.x * 0.5 + 0.5) * rect.width}px`
+      measurementLabelEl.style.top = `${(-labelWorld.y * 0.5 + 0.5) * rect.height}px`
+      measurementLabelEl.textContent = `${d.toFixed(2)} мм`
+      measurementLabelEl.style.display = 'block'
+      measurementLabelEl.style.fontSize = '14px'
+      measurementLabelEl.style.fontWeight = '600'
+      measurementLabelEl.style.border = '1px solid rgba(127,194,255,0.8)'
+      if (measurementLabelEl0) measurementLabelEl0.style.display = 'none'
+      if (measurementLabelEl1) measurementLabelEl1.style.display = 'none'
+      if (measurementLabelEl2) measurementLabelEl2.style.display = 'none'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
+      if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
+      if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
     } else if (measurementPoints.length === 2 && measureTypeRef.value === 'hole-center-distance' && containerRef.value && measurementLabelEl) {
       const rect = containerRef.value.getBoundingClientRect()
       const A = measurementPoints[0]
@@ -4683,64 +5259,6 @@ function initScene() {
       measurementLabelEl.textContent = L.toFixed(2)
       measurementLabelEl.style.display = 'block'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
-    } else if (measurementPoints.length === 2 && measureTypeRef.value === 'distance' && containerRef.value && measurementLabelEl0 && measurementLabelEl1 && measurementLabelEl2) {
-      const rect = containerRef.value.getBoundingClientRect()
-      const A = measurementPoints[0]
-      const B = measurementPoints[1]
-      const delta = B.clone().sub(A)
-      const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
-      const Bprime = B.clone().sub(perpComp)
-      const L = A.distanceTo(B)
-      const L_parallel = A.distanceTo(Bprime)
-      const L_perp = Bprime.distanceTo(B)
-      const midpoints = [
-        A.clone().add(B).multiplyScalar(0.5),
-        A.clone().add(Bprime).multiplyScalar(0.5),
-        Bprime.clone().add(B).multiplyScalar(0.5),
-      ]
-      const texts = [
-        `${L.toFixed(2)}`,
-        `${L_parallel.toFixed(2)}`,
-        `${L_perp.toFixed(2)}`,
-      ]
-      const labels = [measurementLabelEl0, measurementLabelEl1, measurementLabelEl2]
-      for (let i = 0; i < 3; i++) {
-        midpoints[i].project(camera)
-        labels[i].style.left = (midpoints[i].x * 0.5 + 0.5) * rect.width + 'px'
-        labels[i].style.top = (-midpoints[i].y * 0.5 + 0.5) * rect.height + 'px'
-        labels[i].textContent = texts[i]
-        labels[i].style.display = 'block'
-      }
-      if (measurementLabelEl) measurementLabelEl.style.display = 'none'
-      if (measureTypeRef.value === 'diameter' && firstClickHole && measurementExtraLabelEl) {
-        const dc = firstClickHole.center.clone()
-        dc.project(camera)
-        measurementExtraLabelEl.style.left = (dc.x * 0.5 + 0.5) * rect.width + 'px'
-        measurementExtraLabelEl.style.top = (-dc.y * 0.5 + 0.5) * rect.height + 'px'
-        measurementExtraLabelEl.textContent = (2 * firstClickHole.radius).toFixed(2)
-        measurementExtraLabelEl.style.display = 'block'
-      } else if (measurementExtraLabelEl) {
-        measurementExtraLabelEl.style.display = 'none'
-      }
-      if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
-      const nA = measurementPointNormals[0] ?? null
-      const nB = measurementPointNormals[1] ?? null
-      if (measurementPerpLabelEl && (nA || nB)) {
-        const baseNormal = (nB || nA)!.clone().normalize()
-        const basePoint = nB ? B : A
-        const otherPoint = nB ? A : B
-        const v = otherPoint.clone().sub(basePoint)
-        const distSigned = v.dot(baseNormal)
-        const proj = otherPoint.clone().sub(baseNormal.clone().multiplyScalar(distSigned))
-        const midPerp = otherPoint.clone().add(proj).multiplyScalar(0.5)
-        midPerp.project(camera)
-        measurementPerpLabelEl.style.left = (midPerp.x * 0.5 + 0.5) * rect.width + 'px'
-        measurementPerpLabelEl.style.top = (-midPerp.y * 0.5 + 0.5) * rect.height + 'px'
-        measurementPerpLabelEl.textContent = `${Math.abs(distSigned).toFixed(2)}`
-        measurementPerpLabelEl.style.display = 'block'
-      } else if (measurementPerpLabelEl) {
-        measurementPerpLabelEl.style.display = 'none'
-      }
     } else if (radiusOrDiameterResult && measurementExtraLabelEl && containerRef.value) {
       const rect = containerRef.value.getBoundingClientRect()
       const proj = radiusOrDiameterResult.center.clone()
@@ -4779,6 +5297,11 @@ function initScene() {
       if (measurementLabelEl2) measurementLabelEl2.style.display = 'none'
       if (measurementPerpLabelEl) measurementPerpLabelEl.style.display = 'none'
       if (measurementExtraLabelEl) measurementExtraLabelEl.style.display = 'none'
+    }
+    if (!isCameraInteracting) {
+      updateSavedMeasurementLabelPositions()
+    } else {
+      for (const el of savedMeasurementLabelById.values()) el.style.display = 'none'
     }
     }
     renderer.render(scene, camera)
@@ -4933,17 +5456,41 @@ function onWindowKeyDown(ev: KeyboardEvent) {
   }
   if (ev.code === 'Escape') {
     ev.preventDefault()
-  if (placementActive.value) {
-    cancelModelPlacement()
-    return
-  }
-  if (partTreeIsolateState.value) {
-    restorePartTreeIsolate()
-    selectedPartRowKeys.value = new Set()
-    clearComponentHighlight()
-    return
-  }
-  modelRotateMode.value = false
+    if (boxSelectDrag || boxSelectRect.value) {
+      detachBoxSelectWindowListeners()
+      boxSelectDrag = null
+      boxSelectRect.value = null
+      if (controls) controls.enabled = true
+      return
+    }
+    if (placementActive.value) {
+      cancelModelPlacement()
+      return
+    }
+    const cadInProgress = !!(cadLinearPlane1.value || cadLinearPlane2.value || cadLinearPickTarget.value)
+    const measureInProgress = measurementPoints.length > 0 || measurePreviewPoint || cadInProgress
+    if (measureModeRef.value && measureInProgress) {
+      clearMeasurements()
+      clearCadLinearPicks()
+      cadLinearPickTarget.value = null
+      if (measureTypeRef.value === 'cad-linear') {
+        beginNextCadLinearDimension()
+      } else if (measureTypeRef.value === 'distance') {
+        measureStatusHint.value = 'Кликните 1-ю точку на модели.'
+      }
+      return
+    }
+    if (
+      selectedPartRowKeys.value.size > 0
+      || selectedComponentRowId.value
+      || partTreeIsolateState.value
+      || partFocusActive.value
+    ) {
+      resetPartSelectionAndView()
+      focusedModelId.value = null
+      return
+    }
+    modelRotateMode.value = false
     clearPendingAssemblyPlaneSelections()
     clearMeasurements()
     setMeasureMode(false)
@@ -5560,21 +6107,7 @@ function onCanvasMouseMove(ev: MouseEvent) {
   updateMouseFromClient(ev.clientX, ev.clientY)
   hoverDirty = true
   if (placementActive.value) updatePlacementFromCursor(ev.clientX, ev.clientY)
-  if (boxSelectDrag && renderer) {
-    const rect = renderer.domElement.getBoundingClientRect()
-    const x0 = boxSelectDrag.startX - rect.left
-    const y0 = boxSelectDrag.startY - rect.top
-    const x1 = ev.clientX - rect.left
-    const y1 = ev.clientY - rect.top
-    const mode: 'window' | 'crossing' = x1 >= x0 ? 'window' : 'crossing'
-    boxSelectRect.value = {
-      left: Math.min(x0, x1),
-      top: Math.min(y0, y1),
-      width: Math.abs(x1 - x0),
-      height: Math.abs(y1 - y0),
-      mode,
-    }
-  }
+  updateBoxSelectRectFromClient(ev.clientX, ev.clientY)
 }
 
 function onContainerMouseMove(ev: MouseEvent) {
@@ -5632,6 +6165,8 @@ let dragRotateUndoBefore: TransformSnapshot | null = null
 const MODEL_ROTATE_MOUSE_SENS = 0.005
 /** Чтобы не считать клик после перетаскивания модели */
 let didDragModel = false
+/** Чтобы не считать клик измерения после перетаскивания выноса размера */
+let didDragMeasurement = false
 const dragPlane = new THREE.Plane()
 const dragIntersect = new THREE.Vector3()
 
@@ -6682,6 +7217,37 @@ function focusCameraOnMeshIds(ids: Set<string>) {
   controls.update()
 }
 
+function applySelectionHighlightToMesh(mesh: THREE.Mesh) {
+  if (!mesh.material) return
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  const backups: SelectionMaterialBackup[] = []
+  mats.forEach((mat) => {
+    if (!('color' in mat)) return
+    const m = mat as THREE.MeshPhongMaterial & { emissive?: THREE.Color; emissiveIntensity?: number }
+    backups.push({
+      color: m.color.clone(),
+      emissive: m.emissive?.clone() ?? new THREE.Color(0x000000),
+      emissiveIntensity: typeof m.emissiveIntensity === 'number' ? m.emissiveIntensity : 1,
+    })
+    const highlighted = m.color.clone()
+    highlighted.lerp(PART_SELECTION_TINT, 0.48)
+    highlighted.r = Math.min(1, highlighted.r * 1.55)
+    highlighted.g = Math.min(1, highlighted.g * 1.55)
+    highlighted.b = Math.min(1, highlighted.b * 1.65)
+    m.color.copy(highlighted)
+    if (m.emissive) {
+      m.emissive.setHex(PART_SELECTION_EMISSIVE)
+      if (typeof m.emissiveIntensity === 'number') {
+        m.emissiveIntensity = PART_SELECTION_EMISSIVE_INTENSITY
+      }
+    }
+  })
+  if (backups.length > 0) {
+    selectionMaterialBackups.set(mesh, backups)
+    highlightedComponentMeshes.add(mesh)
+  }
+}
+
 function applySelectionVisualsAndFocus() {
   clearComponentHighlight()
   const focusedIds = collectFocusedMeshIds()
@@ -6692,16 +7258,8 @@ function applySelectionVisualsAndFocus() {
   }
   if (!meshGroup) return
   meshGroup.traverse((obj: THREE.Object3D) => {
-    if (!(obj instanceof THREE.Mesh) || !obj.visible || !obj.material || !focusedIds.has(obj.uuid)) return
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
-    mats.forEach((m: THREE.Material) => {
-      if ('emissive' in m) {
-        const mm = m as THREE.MeshPhongMaterial
-        mm.emissive.setHex(0x336699)
-        if ('emissiveIntensity' in mm) mm.emissiveIntensity = 0.45
-      }
-    })
-    highlightedComponentMeshes.add(obj)
+    if (!(obj instanceof THREE.Mesh) || !obj.visible || !focusedIds.has(obj.uuid)) return
+    applySelectionHighlightToMesh(obj)
   })
   if (partIsolateDimOthers.value) applyPartFocusVisuals(focusedIds)
 }
@@ -6792,6 +7350,61 @@ function restoreOriginalModelColors(modelId?: string) {
   applyShadingMode()
 }
 
+function isPartBoxSelectEnabled(): boolean {
+  if (measureModeRef.value || modelRotateMode.value || placementActive.value) return false
+  if (remarkAnchorPickMode.value || assemblyPickTarget.value || sectionModeRef.value) return false
+  if (cadLinearPickTarget.value && measureTypeRef.value === 'cad-linear') return false
+  return !!(meshGroup?.children.length)
+}
+
+function updateBoxSelectRectFromClient(clientX: number, clientY: number) {
+  if (!boxSelectDrag || !renderer) return
+  const rect = renderer.domElement.getBoundingClientRect()
+  const x0 = boxSelectDrag.startX - rect.left
+  const y0 = boxSelectDrag.startY - rect.top
+  const x1 = clientX - rect.left
+  const y1 = clientY - rect.top
+  const mode: 'window' | 'crossing' = x1 >= x0 ? 'window' : 'crossing'
+  boxSelectRect.value = {
+    left: Math.min(x0, x1),
+    top: Math.min(y0, y1),
+    width: Math.abs(x1 - x0),
+    height: Math.abs(y1 - y0),
+    mode,
+  }
+}
+
+function onBoxSelectWindowMove(ev: MouseEvent) {
+  updateBoxSelectRectFromClient(ev.clientX, ev.clientY)
+}
+
+function onBoxSelectWindowUp(ev: MouseEvent) {
+  if (ev.button !== 0 || !boxSelectDrag) return
+  finishBoxSelect(ev.clientX, ev.clientY)
+}
+
+function attachBoxSelectWindowListeners() {
+  window.addEventListener('mousemove', onBoxSelectWindowMove, true)
+  window.addEventListener('mouseup', onBoxSelectWindowUp, true)
+}
+
+function detachBoxSelectWindowListeners() {
+  window.removeEventListener('mousemove', onBoxSelectWindowMove, true)
+  window.removeEventListener('mouseup', onBoxSelectWindowUp, true)
+}
+
+function beginBoxSelectDrag(ev: MouseEvent) {
+  boxSelectDrag = {
+    startX: ev.clientX,
+    startY: ev.clientY,
+    additive: !!(ev.ctrlKey || ev.metaKey || ev.shiftKey),
+  }
+  attachBoxSelectWindowListeners()
+  if (controls) controls.enabled = false
+  ev.preventDefault()
+  ev.stopPropagation()
+}
+
 function meshScreenRect(mesh: THREE.Mesh, canvasRect: DOMRect): { minX: number; minY: number; maxX: number; maxY: number } | null {
   if (!camera) return null
   mesh.updateMatrixWorld(true)
@@ -6834,6 +7447,7 @@ function rectIntersects(a: { minX: number; minY: number; maxX: number; maxY: num
 }
 
 function finishBoxSelect(clientX: number, clientY: number) {
+  detachBoxSelectWindowListeners()
   if (!renderer || !boxSelectDrag) return
   const rect = renderer.domElement.getBoundingClientRect()
   const x0 = boxSelectDrag.startX - rect.left
@@ -6850,8 +7464,10 @@ function finishBoxSelect(clientX: number, clientY: number) {
   if (Math.abs(x1 - x0) < 4 && Math.abs(y1 - y0) < 4) {
     boxSelectDrag = null
     boxSelectRect.value = null
+    if (controls) controls.enabled = true
     return
   }
+  didBoxSelect = true
   const next = boxSelectDrag.additive ? new Set(selectedPartRowKeys.value) : new Set<string>()
   Object.entries(componentTreeRowsByModel.value).forEach(([modelId, rows]) => {
     rows.forEach((row) => {
@@ -6975,28 +7591,43 @@ const focusedModelForTree = computed(() => {
 })
 
 function toggleComponentVisibility(modelId: string, rowId: string) {
-  const group = modelGroupsById.get(modelId)
-  if (!group) return
   const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
-  if (!row) return
-  if (!row.targetIds.length) return
+  if (!row?.targetIds.length) return
+  setComponentVisibilityByRow(modelId, rowId, !row.visible)
+}
+
+function setComponentVisibilityByRow(modelId: string, rowId: string, visible: boolean) {
+  const group = modelGroupsById.get(modelId)
+  const row = componentTreeRowsByModel.value[modelId]?.find((r) => r.id === rowId)
+  if (!group || !row?.targetIds.length) return
   const targetSet = new Set(row.targetIds)
-  const nextVisible = !row.visible
   group.traverse((obj: THREE.Object3D) => {
-    if (targetSet.has(obj.uuid)) obj.visible = nextVisible
+    if (targetSet.has(obj.uuid)) obj.visible = visible
   })
   syncOverlayVisibilityForModel(modelId)
   clearHiddenOutlinesForModel(modelId)
   refreshComponentTreeVisibility(modelId)
-  if (!nextVisible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
+  if (!visible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
     const next = new Set(selectedPartRowKeys.value)
     next.delete(`${modelId}:${rowId}`)
     selectedPartRowKeys.value = next
     applySelectionVisualsAndFocus()
-  } else if (nextVisible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
+  } else if (visible && selectedPartRowKeys.value.has(`${modelId}:${rowId}`)) {
     selectComponentRow(modelId, rowId)
   }
   scheduleSceneMetricsRecalc()
+}
+
+function setComponentVisibilityForObject(modelId: string, obj: THREE.Object3D, visible: boolean) {
+  const mesh = obj instanceof THREE.Mesh ? obj : null
+  if (mesh) {
+    const row = findPartRowForMeshUuid(modelId, mesh.uuid)
+    if (row?.targetIds.length) {
+      setComponentVisibilityByRow(modelId, row.id, visible)
+      return
+    }
+  }
+  setSingleComponentVisibility(modelId, obj, visible)
 }
 
 function setSingleComponentVisibility(modelId: string, obj: THREE.Object3D, visible: boolean) {
@@ -7009,17 +7640,20 @@ function setSingleComponentVisibility(modelId: string, obj: THREE.Object3D, visi
 
 function clearComponentHighlight() {
   highlightedComponentMeshes.forEach((mesh) => {
-    if (!mesh.material) return
+    const backups = selectionMaterialBackups.get(mesh)
+    if (!backups?.length || !mesh.material) return
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material]
-    mats.forEach((m: THREE.Material) => {
-      if ('emissive' in m) {
-        const mm = m as THREE.MeshPhongMaterial
-        mm.emissive.setHex(0x000000)
-        if ('emissiveIntensity' in mm) mm.emissiveIntensity = 1
-      }
+    mats.forEach((mat, index) => {
+      const backup = backups[index]
+      if (!backup || !('color' in mat)) return
+      const m = mat as THREE.MeshPhongMaterial & { emissive?: THREE.Color; emissiveIntensity?: number }
+      m.color.copy(backup.color)
+      if (m.emissive) m.emissive.copy(backup.emissive)
+      if (typeof m.emissiveIntensity === 'number') m.emissiveIntensity = backup.emissiveIntensity
     })
   })
   highlightedComponentMeshes.clear()
+  selectionMaterialBackups.clear()
 }
 
 function findPartRowForMeshUuid(modelId: string, meshUuid: string): ComponentTreeRow | null {
@@ -7566,6 +8200,10 @@ watch(
   { immediate: true },
 )
 
+watch(selectedMeasurementId, () => {
+  refreshMeasurementReferenceFaceHighlights()
+})
+
 function onCanvasMouseDown(ev: MouseEvent) {
   if (partContextMenuOpen.value) partContextMenuOpen.value = false
   if (ev.button === 0 && placementActive.value && placementModelId.value && camera && renderer) {
@@ -7577,106 +8215,12 @@ function onCanvasMouseDown(ev: MouseEvent) {
     ev.stopPropagation()
     return
   }
-  if (
-    ev.button === 0 &&
-    partBoxSelectMode.value &&
-    !measureModeRef.value &&
-    !modelRotateMode.value &&
-    !leftButtonMoveModel.value &&
-    !placementActive.value
-  ) {
-    boxSelectDrag = {
-      startX: ev.clientX,
-      startY: ev.clientY,
-      additive: !!(ev.ctrlKey || ev.metaKey || ev.shiftKey),
-    }
-    controls.enabled = false
-    ev.preventDefault()
-    ev.stopPropagation()
+  if (ev.button === 0 && isPartBoxSelectEnabled()) {
+    beginBoxSelectDrag(ev)
     return
   }
   if (!camera || !controls || !meshGroup) return
-  if (ev.button === 0 && selectedMeasurementId.value && savedMeasurementsGroup) {
-    const rect = renderer.domElement.getBoundingClientRect()
-    const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
-    const my = -((ev.clientY - rect.top) / rect.height) * 2 + 1
-    const rr = new THREE.Raycaster()
-    rr.params.Line = { threshold: 28 }
-    rr.setFromCamera(new THREE.Vector2(mx, my), camera)
-    const hitsDim = rr.intersectObject(savedMeasurementsGroup, true)
-    const hitRow = hitsDim
-      .map((h) => String((h.object as THREE.Object3D).userData?.measurementId ?? ''))
-      .find((id) => !!id)
-    if (hitRow && hitRow === selectedMeasurementId.value) {
-      const row = measurementHistory.value.find((m) => m.id === hitRow)
-      if (row && (row.type === 'distance' || row.type === 'cad-linear')) {
-        const anchorWorld = row.type === 'cad-linear'
-          ? resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)).multiplyScalar(0.5)
-          : resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1).clone().add(resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)).multiplyScalar(0.5)
-        const dirWorld = (() => {
-          if (row.type === 'cad-linear') {
-            const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
-            const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
-            let planePoint = row.outputPlaneLocalPoint ? savedToVec(row.outputPlaneLocalPoint) : a.clone()
-            let planeNormal = row.outputPlaneLocalNormal ? savedToVec(row.outputPlaneLocalNormal) : new THREE.Vector3(0, 1, 0)
-            if (row.outputPlaneModelId) {
-              const g = modelGroupsById.get(row.outputPlaneModelId)
-              if (g) {
-                planePoint = g.localToWorld(planePoint)
-                planeNormal = localNormalToWorld(g, vecToSaved(planeNormal)) ?? planeNormal
-              }
-            }
-            const n = planeNormal.clone().normalize()
-            const project = (p: THREE.Vector3) => p.clone().sub(n.clone().multiplyScalar(p.clone().sub(planePoint).dot(n)))
-            const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
-            const srcA = strict ? strict.projected : project(a)
-            const srcB = strict ? strict.otherPoint : project(b)
-            const dir = srcB.clone().sub(srcA).normalize()
-            let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
-            if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
-            return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
-          }
-          const a = resolveSavedPointWorld(row.modelId1, row.p1Local, row.p1, row.meshUuid1)
-          const b = resolveSavedPointWorld(row.modelId2, row.p2Local, row.p2, row.meshUuid2)
-          const baseNormal =
-            resolveSavedNormalWorld(row.modelId2, row.n2Local, row.n2, row.meshUuid2)
-            ?? resolveSavedNormalWorld(row.modelId1, row.n1Local, row.n1, row.meshUuid1)
-            ?? (row.n2 ? savedToVec(row.n2) : (row.n1 ? savedToVec(row.n1) : null))
-          const strict = projectPerpendicularByNormals(a, b, row.n1 ? savedToVec(row.n1) : null, row.n2 ? savedToVec(row.n2) : null)
-          const srcA = strict ? strict.projected : a
-          const srcB = strict ? strict.otherPoint : b
-          const dir = srcB.clone().sub(srcA).normalize()
-          const n = (baseNormal ?? new THREE.Vector3(0, 1, 0)).clone().normalize()
-          let offsetDir = new THREE.Vector3().crossVectors(dir, n).normalize()
-          if (offsetDir.lengthSq() < 0.01) offsetDir = new THREE.Vector3(0, 0, 1)
-          return orientOffsetDirForScreen(offsetDir, srcA.clone().add(srcB).multiplyScalar(0.5))
-        })()
-        const p0 = anchorWorld.clone().project(camera)
-        const p1 = anchorWorld.clone().add(dirWorld.clone().multiplyScalar(100)).project(camera)
-        let axisX = (p1.x - p0.x) * rect.width * 0.5
-        let axisY = -(p1.y - p0.y) * rect.height * 0.5
-        const axisLen = Math.hypot(axisX, axisY)
-        if (axisLen > 1e-3) {
-          axisX /= axisLen
-          axisY /= axisLen
-        } else {
-          axisX = 0
-          axisY = -1
-        }
-        draggedMeasurementOffset = {
-          id: row.id,
-          startX: ev.clientX,
-          startY: ev.clientY,
-          startOffset: row.lineOffsetMm ?? dimLineOffsetMm.value,
-          axisX,
-          axisY,
-        }
-        ev.preventDefault()
-        ev.stopPropagation()
-        return
-      }
-    }
-  }
+  if (tryBeginMeasurementOffsetDrag(ev)) return
   if (ev.button === 0 && modelRotateMode.value) {
     const rect = renderer.domElement.getBoundingClientRect()
     const mx = ((ev.clientX - rect.left) / rect.width) * 2 - 1
@@ -7768,7 +8312,9 @@ function tryPickContextTarget(clientX: number, clientY: number): boolean {
       const mid = String(wrapper.userData?.modelId ?? '')
       contextMenuTargetModelId.value = mid
       if (mid) focusedModelId.value = mid
-      contextMenuTargetIsHidden.value = !partNode.visible
+      const mesh = partNode instanceof THREE.Mesh ? partNode : null
+      const row = mesh ? findPartRowForMeshUuid(mid, mesh.uuid) : null
+      contextMenuTargetIsHidden.value = row ? !row.visible : !partNode.visible
       return true
     }
   }
@@ -7787,7 +8333,9 @@ function tryPickContextTarget(clientX: number, clientY: number): boolean {
     contextMenuTargetPart = target
     contextMenuTargetModelId.value = modelId
     if (modelId) focusedModelId.value = modelId
-    contextMenuTargetIsHidden.value = !target.visible
+    const mesh = target instanceof THREE.Mesh ? target : null
+    const row = mesh ? findPartRowForMeshUuid(modelId, mesh.uuid) : null
+    contextMenuTargetIsHidden.value = row ? !row.visible : !target.visible
     return true
   }
   return false
@@ -7804,7 +8352,7 @@ function showContextMenuAt(clientX: number, clientY: number) {
 function showSelectedPartFromContextMenu() {
   const mid = contextMenuTargetModelId.value
   if (!contextMenuTargetPart || !mid) return
-  setSingleComponentVisibility(mid, contextMenuTargetPart, true)
+  setComponentVisibilityForObject(mid, contextMenuTargetPart, true)
   partContextMenuOpen.value = false
   contextMenuTargetIsHidden.value = false
   contextMenuTargetPart = null
@@ -7814,7 +8362,7 @@ function showSelectedPartFromContextMenu() {
 function hideSelectedPartFromContextMenu() {
   const mid = contextMenuTargetModelId.value
   if (!contextMenuTargetPart || !mid) return
-  setSingleComponentVisibility(mid, contextMenuTargetPart, false)
+  setComponentVisibilityForObject(mid, contextMenuTargetPart, false)
   partContextMenuOpen.value = false
   contextMenuTargetIsHidden.value = false
   contextMenuTargetPart = null
@@ -7837,18 +8385,33 @@ function onGlobalMouseDown(ev: MouseEvent) {
 }
 
 function onCanvasMouseMovePan(ev: MouseEvent) {
+  if (boxSelectDrag) {
+    updateBoxSelectRectFromClient(ev.clientX, ev.clientY)
+    return
+  }
   if (rightMouseDown) tryApplyPendingOrbitPivotOnDrag(ev)
+  if (offsetDragPending && !draggedMeasurementOffset) {
+    const dx = ev.clientX - offsetDragPending.startX
+    const dy = ev.clientY - offsetDragPending.startY
+    if (Math.hypot(dx, dy) >= DIM_DRAG_MIN_PX) {
+      draggedMeasurementOffset = offsetDragPending
+      offsetDragPending = null
+      draggedModelGroup = null
+      dragStartModelPos = null
+      dragStartIntersection = null
+      if (controls) controls.enabled = false
+    }
+  }
   if (draggedMeasurementOffset) {
     ev.preventDefault()
     ev.stopPropagation()
     const dx = ev.clientX - draggedMeasurementOffset.startX
     const dy = ev.clientY - draggedMeasurementOffset.startY
     const projectedDeltaPx = dx * draggedMeasurementOffset.axisX + dy * draggedMeasurementOffset.axisY
-    const row = measurementHistory.value.find((m) => m.id === draggedMeasurementOffset.id)
-    if (row) {
-      row.lineOffsetMm = draggedMeasurementOffset.startOffset + projectedDeltaPx * 1.4
-      rebuildSavedMeasurementsVisuals()
-    }
+    const nextOffset = draggedMeasurementOffset.startOffset + projectedDeltaPx * 1.4
+    commitMeasurementLineOffset(draggedMeasurementOffset.id, nextOffset)
+    rebuildSavedMeasurementsVisuals()
+    updateSavedMeasurementLabelPositions()
     return
   }
   if (draggedRotateWrapper && camera && controls && dragRotatePivotLocal) {
@@ -7869,6 +8432,7 @@ function onCanvasMouseMovePan(ev: MouseEvent) {
     )
     return
   }
+  if (draggedMeasurementOffset || offsetDragPending) return
   if (!draggedModelGroup || !dragStartModelPos || !dragStartIntersection || !camera || !controls) return
   ev.preventDefault()
   ev.stopPropagation()
@@ -7904,11 +8468,27 @@ function onCanvasMouseUp(ev: MouseEvent) {
     if (controls) controls.noRotate = false
     contextMenuCanShow.value = false
   }
+  if (ev.button === 0 && offsetDragPending) {
+    offsetDragPending = null
+  }
   if (ev.button === 0 && draggedMeasurementOffset) {
+    const drag = draggedMeasurementOffset
+    const dx = ev.clientX - drag.startX
+    const dy = ev.clientY - drag.startY
+    const wasDrag = Math.hypot(dx, dy) >= DIM_DRAG_MIN_PX
+    const row = wasDrag ? measurementHistory.value.find((m) => m.id === drag.id) : null
     draggedMeasurementOffset = null
-    ev.preventDefault()
-    ev.stopPropagation()
-    return
+    draggedModelGroup = null
+    dragStartModelPos = null
+    dragStartIntersection = null
+    if (controls) controls.enabled = true
+    if (wasDrag && row) {
+      commitMeasurementLineOffset(drag.id, row.lineOffsetMm ?? drag.startOffset)
+      didDragMeasurement = true
+      ev.preventDefault()
+      ev.stopPropagation()
+      return
+    }
   }
   if (ev.button === 0 && draggedRotateWrapper) {
     const w = draggedRotateWrapper
@@ -7997,6 +8577,14 @@ function onCanvasClick(ev: MouseEvent) {
     didDragModel = false
     return
   }
+  if (didDragMeasurement) {
+    didDragMeasurement = false
+    return
+  }
+  if (didBoxSelect) {
+    didBoxSelect = false
+    return
+  }
   if (!renderer || !camera || !meshGroup.children.length) {
     if (measureModeRef.value) logger.info('Viewer3D', 'Клик: модель не загружена или нет сцены, измерение игнорируется')
     return
@@ -8024,6 +8612,20 @@ function onCanvasClick(ev: MouseEvent) {
     }
     pickAssemblyPlaneFromHit(surfaceHit)
     return
+  }
+  if (measureModeRef.value && !shouldDeferSavedMeasurementPick()) {
+    const pickedDim = pickLinearMeasurementAtClient(ev.clientX, ev.clientY)
+    if (pickedDim) {
+      const placingNewDistancePoint =
+        measureTypeRef.value === 'distance'
+        && measurementPoints.length === 0
+        && !!pickSolidSurfaceHit(hits)
+      if (!placingNewDistancePoint) {
+        selectedMeasurementId.value = pickedDim.id
+        rebuildSavedMeasurementsVisuals()
+        return
+      }
+    }
   }
   if (measureModeRef.value && measureTypeRef.value === 'cad-linear') {
     const faceHit = firstMeshFaceHit(hits)
@@ -8367,87 +8969,48 @@ function onCanvasClick(ev: MouseEvent) {
   const wrapper = findWrapperGroup(hit.object)
   const modelId = String(wrapper?.userData?.modelId ?? '')
   const face = hit.face!
-  const pos = mesh.geometry.attributes.position
-  const faceIndex =
-    typeof (hit as THREE.Intersection & { faceIndex?: number }).faceIndex === 'number'
-      ? (hit as THREE.Intersection & { faceIndex: number }).faceIndex
-      : Math.floor(face.a / 3)
   const worldNormal = face.normal.clone().transformDirection(mesh.matrixWorld).normalize()
   const candidates = getSnapCandidates(hit)
   const closest = getClosestSnapPoint(candidates, camera, mouse)
   const point = (closest ?? getPointFromHit(hit)).clone()
-
-  const buildFaceGeometryForHighlight = (): THREE.BufferGeometry | null => {
-    const tFace = performance.now()
-    const useCoplanarFace = measureTypeRef.value !== 'distance'
-    const geom =
-      (useCoplanarFace ? getCoplanarFaceGeometry(mesh, faceIndex) : null) ??
-      (pos
-        ? (() => {
-            const vA = new THREE.Vector3(
-              pos.getX(face.a),
-              pos.getY(face.a),
-              pos.getZ(face.a),
-            ).applyMatrix4(mesh.matrixWorld)
-            const vB = new THREE.Vector3(
-              pos.getX(face.b),
-              pos.getY(face.b),
-              pos.getZ(face.b),
-            ).applyMatrix4(mesh.matrixWorld)
-            const vC = new THREE.Vector3(
-              pos.getX(face.c),
-              pos.getY(face.c),
-              pos.getZ(face.c),
-            ).applyMatrix4(mesh.matrixWorld)
-            const g = new THREE.BufferGeometry().setAttribute(
-              'position',
-              new THREE.Float32BufferAttribute(
-                [vA.x, vA.y, vA.z, vB.x, vB.y, vB.z, vC.x, vC.y, vC.z],
-                3,
-              ),
-            )
-            g.computeVertexNormals()
-            return g
-          })()
-        : null)
-    const out = geom ? geom.clone() : null
-    const elapsed = performance.now() - tFace
-    if (elapsed > 100) {
-      logger.info('Viewer3D', `MeasureClick#${clickId} face geometry build: ${elapsed.toFixed(1)} ms`)
-    }
-    return out
-  }
+  const faceGeom = buildFaceHighlightGeometryFromHit(hit)
 
   if (measurementPoints.length >= 2) {
+    selectedMeasurementId.value = null
     measurementPoints = [point]
     measurementPointNormals = [worldNormal]
     measurementPointModelIds = [modelId || null]
     measurementPointMeshUuids = [mesh.uuid]
     measurementPointLocals = [meshPointToSaved(mesh, point)]
     measurementPointNormalLocals = [meshNormalToSaved(mesh, worldNormal)]
+    measurePreviewPoint = null
+    measureStatusHint.value = 'Ведите мышь ко 2-й точке. Клик — зафиксировать. Esc — отмена.'
     for (const g of measurementFaceGeometries) g.dispose()
     measurementFaceGeometries = []
-    const faceGeom = buildFaceGeometryForHighlight()
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
   } else {
+    if (measurementPoints.length === 0) selectedMeasurementId.value = null
     pushMeasureAnchor(mesh, modelId, point, worldNormal)
-    const faceGeom = buildFaceGeometryForHighlight()
+    measurePreviewPoint = null
+    measureStatusHint.value = 'Ведите мышь ко 2-й точке. Клик — зафиксировать. Esc — отмена.'
     if (faceGeom) measurementFaceGeometries.push(faceGeom)
     logger.info(
       'Viewer3D',
       `MeasureClick#${clickId} distance point added: p=${formatVec3(point)}, total=${measurementPoints.length}`
     )
   }
-  if (measurementPoints.length === 2 || measurementPoints.length === 3) {
+  if (measurementPoints.length === 2) {
     const tGraphics = performance.now()
     updateMeasurementGraphics()
     logger.info(
       'Viewer3D',
       `MeasureClick#${clickId} graphics updated: ${(performance.now() - tGraphics).toFixed(1)} ms`
     )
-    if (measureTypeRef.value === 'distance' && measurementPoints.length === 2) {
+    if (measureTypeRef.value === 'distance') {
       saveDistanceMeasurement()
     }
+  } else {
+    refreshMeasurementReferenceFaceHighlights()
   }
   logger.info(
     'Viewer3D',
@@ -8873,7 +9436,7 @@ function shortestPathOnMesh(mesh: THREE.Mesh, from: THREE.Vector3, to: THREE.Vec
 
 function updateMeasurementGraphics() {
   const t0 = performance.now()
-  logger.info(
+  logger.debug(
     'Viewer3D',
     `updateMeasurementGraphics start: type=${measureTypeRef.value}, points=${measurementPoints.length}, faces=${measurementFaceGeometries.length}`
   )
@@ -8957,45 +9520,27 @@ function updateMeasurementGraphics() {
     logger.info('Viewer3D', `updateMeasurementGraphics done (non-distance): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
-  while (measurementPlanesGroup.children.length) {
-    const c = measurementPlanesGroup.children[0]
-    measurementPlanesGroup.remove(c)
-    if ('geometry' in c && c.geometry) c.geometry.dispose()
-    if ('material' in c && c.material) (c.material as THREE.Material).dispose()
-  }
-  if (measureTypeRef.value === 'distance' && measurementPoints.length === 2 && measurementFaceGeometries.length === 2) {
-    const planeMat = new THREE.MeshBasicMaterial({
-      color: 0x4488ff,
+  if (measurementPoints.length === 1 && measurePreviewPoint && measureTypeRef.value === 'distance') {
+    const A = measurementPoints[0]
+    const B = measurePreviewPoint
+    const geom = new THREE.BufferGeometry().setFromPoints([A, B])
+    const mat = new THREE.LineDashedMaterial({
+      color: 0x7fc2ff,
+      dashSize: 6,
+      gapSize: 4,
+      depthTest: false,
       transparent: true,
-      opacity: 0.35,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      depthTest: true,
+      opacity: 0.95,
     })
-    for (const geom of measurementFaceGeometries) {
-      const mesh = new THREE.Mesh(geom, planeMat.clone())
-      measurementPlanesGroup.add(mesh)
-    }
-  }
-  if (measurementPoints.length === 3) {
-    const [p0, p1, p2] = measurementPoints
-    const segs = [
-      { a: p0, b: p1, color: AXIS_COLOR_X },
-      { a: p1, b: p2, color: AXIS_COLOR_Y },
-      { a: p2, b: p0, color: AXIS_COLOR_Z },
-    ]
-    for (const seg of segs) {
-      const geom = new THREE.BufferGeometry().setFromPoints([seg.a, seg.b])
-      const mat = new THREE.LineBasicMaterial({ color: seg.color })
-      const line = new THREE.Line(geom, mat)
-      measureGroup.add(line)
-      measurementTriangleLines.push(line)
-    }
-    logger.info('Viewer3D', `updateMeasurementGraphics done (triangle): ${(performance.now() - t0).toFixed(1)} ms`)
+    measurementLine = new THREE.Line(geom, mat)
+    measurementLine.computeLineDistances()
+    measurementLine.renderOrder = 1000
+    measureGroup.add(measurementLine)
+    logger.debug('Viewer3D', `updateMeasurementGraphics done (preview): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
   if (measurementPoints.length !== 2) {
-    logger.info('Viewer3D', `updateMeasurementGraphics done (points!=2): ${(performance.now() - t0).toFixed(1)} ms`)
+    logger.debug('Viewer3D', `updateMeasurementGraphics done (points!=2): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
   const [A, B] = measurementPoints
@@ -9008,22 +9553,7 @@ function updateMeasurementGraphics() {
     return
   }
   if (measureTypeRef.value === 'distance') {
-    const delta = B.clone().sub(A)
-    const perpComp = MEASURE_PLANE_NORMAL.clone().multiplyScalar(delta.dot(MEASURE_PLANE_NORMAL))
-    const Bprime = B.clone().sub(perpComp)
-    const segs = [
-      { a: A, b: Bprime, color: AXIS_COLOR_X },
-      { a: Bprime, b: B, color: AXIS_COLOR_Y },
-      { a: B, b: A, color: AXIS_COLOR_Z },
-    ]
-    for (const seg of segs) {
-      const geom = new THREE.BufferGeometry().setFromPoints([seg.a, seg.b])
-      const mat = new THREE.LineBasicMaterial({ color: seg.color })
-      const line = new THREE.Line(geom, mat)
-      measureGroup.add(line)
-      measurementTriangleLines.push(line)
-    }
-    logger.info('Viewer3D', `updateMeasurementGraphics done (distance-triangle): ${(performance.now() - t0).toFixed(1)} ms`)
+    logger.debug('Viewer3D', `updateMeasurementGraphics done (distance saved-only): ${(performance.now() - t0).toFixed(1)} ms`)
     return
   }
   if (measureTypeRef.value === 'cad-linear') {
@@ -9074,12 +9604,8 @@ function clearMeasurements() {
   measurementPointNormalLocals = []
   for (const g of measurementFaceGeometries) g.dispose()
   measurementFaceGeometries = []
-  while (measurementPlanesGroup.children.length) {
-    const c = measurementPlanesGroup.children[0]
-    measurementPlanesGroup.remove(c)
-    if ('geometry' in c && c.geometry) c.geometry.dispose()
-    if ('material' in c && c.material) (c.material as THREE.Material).dispose()
-  }
+  clearMeasurementPlanesGroup()
+  refreshMeasurementReferenceFaceHighlights()
   if (measurementPerpLine) {
     measureGroup.remove(measurementPerpLine)
     measurementPerpLine.geometry.dispose()
@@ -9123,6 +9649,7 @@ function clearMeasurements() {
   cadLinearPlaneModelId = null
   cadLinearPlaneLocalPoint = null
   cadLinearPlaneLocalNormal = null
+  measurePreviewPoint = null
   if (measurementLabelEl) measurementLabelEl.style.display = 'none'
   if (diameterSecondLabelEl) diameterSecondLabelEl.style.display = 'none'
   if (measurementLabelEl0) measurementLabelEl0.style.display = 'none'
@@ -9139,6 +9666,11 @@ function setMeasureMode(enabled: boolean) {
   if (!enabled) {
     clearMeasurements()
     cadLinearPickTarget.value = null
+    measureStatusHint.value = ''
+  } else if (measureTypeRef.value === 'distance') {
+    measureStatusHint.value = 'Кликните 1-ю точку на модели.'
+  } else if (measureTypeRef.value === 'cad-linear') {
+    measureStatusHint.value = cadLinearStatus.value || 'Кликните 1-ю параллельную грань.'
   }
   logger.info('Viewer3D', `Режим измерения: ${enabled ? 'вкл' : 'выкл'}`)
 }
@@ -9155,6 +9687,7 @@ function getMeasureSnapMode(): MeasureSnapMode {
 function setMeasureType(type: MeasureType) {
   measureTypeRef.value = type
   emit('update:measureType', type)
+  measurePreviewPoint = null
   if (type !== 'distance') {
     measurementPoints = []
     measurementPointNormals = []
@@ -9189,6 +9722,11 @@ function setMeasureType(type: MeasureType) {
   } else {
     clearCadLinearPicks()
     cadLinearStatus.value = ''
+    if (type === 'distance' && measureModeRef.value) {
+      measureStatusHint.value = 'Кликните 1-ю точку на модели.'
+    } else {
+      measureStatusHint.value = ''
+    }
   }
   updateMeasurementGraphics()
 }
@@ -10228,6 +10766,7 @@ onUnmounted(() => {
   document.removeEventListener('mousedown', onGlobalMouseDown)
   window.removeEventListener('keydown', onWindowKeyDown)
   window.removeEventListener('resize', onResize)
+  detachBoxSelectWindowListeners()
   if (containerRef.value) {
     containerRef.value.removeEventListener('mousemove', onContainerMouseMove, false)
   }
@@ -10251,6 +10790,7 @@ onUnmounted(() => {
     if ('material' in c && c.material) (c.material as THREE.Material).dispose()
   }
   clearSavedMeasurementVisuals()
+  clearSavedMeasurementLabelElements()
   if (savedMeasurementsGroup && scene) {
     scene.remove(savedMeasurementsGroup)
   }
@@ -10313,45 +10853,16 @@ function loadModelFile(file: File): Promise<void> {
   return handleFile(file)
 }
 
-function getMeasurementReport():
-  | { length: number; dx: number; dy: number; dz: number }
-  | { triangle: true; lengths: [number, number, number] }
-  | null {
-  if (measurementPoints.length === 2) {
-    const p0 = measurementPoints[0]
-    const p1 = measurementPoints[1]
-    const nA = measurementPointNormals[0] ?? null
-    const nB = measurementPointNormals[1] ?? null
-    let lengthVal = p0.distanceTo(p1)
-    if (nA || nB) {
-      const baseNormal = (nB || nA)!.clone().normalize()
-      const basePoint = nB ? p1 : p0
-      const otherPoint = nB ? p0 : p1
-      const v = otherPoint.clone().sub(basePoint)
-      const distSigned = v.dot(baseNormal)
-      lengthVal = Math.abs(distSigned)
-    }
-    return {
-      length: lengthVal,
-      dx: p1.x - p0.x,
-      dy: p1.y - p0.y,
-      dz: p1.z - p0.z,
-    }
+function getMeasurementReport(): { length: number; dx: number; dy: number; dz: number } | null {
+  if (measurementPoints.length !== 2) return null
+  const p0 = measurementPoints[0]
+  const p1 = measurementPoints[1]
+  return {
+    length: p0.distanceTo(p1),
+    dx: p1.x - p0.x,
+    dy: p1.y - p0.y,
+    dz: p1.z - p0.z,
   }
-  if (measurementPoints.length === 3) {
-    const p0 = measurementPoints[0]
-    const p1 = measurementPoints[1]
-    const p2 = measurementPoints[2]
-    return {
-      triangle: true,
-      lengths: [
-        p0.distanceTo(p1),
-        p1.distanceTo(p2),
-        p2.distanceTo(p0),
-      ],
-    }
-  }
-  return null
 }
 
 function onModelCardClick(item: { id: string; inScene: boolean }) {
@@ -10797,10 +11308,11 @@ function cancelActiveTool(): boolean {
     cancelModelPlacement()
     cancelled = true
   }
-  if (partBoxSelectMode.value) {
-    partBoxSelectMode.value = false
+  if (boxSelectDrag || boxSelectRect.value) {
+    detachBoxSelectWindowListeners()
     boxSelectDrag = null
     boxSelectRect.value = null
+    if (controls) controls.enabled = true
     cancelled = true
   }
   return cancelled
@@ -11219,7 +11731,7 @@ defineExpose({
           <span>Затемнять остальные при выделении (тяжело на больших сборках)</span>
         </label>
         <div class="viewer-models-hint">
-          Клик в окне — выделение детали. Двойной клик в дереве — изоляция (скрыть остальные детали модели, деталь в цвете). Повторный двойной клик — показать все. ПКМ — прозрачность. Каркас — только кнопка в шапке.
+          Клик — одна деталь. Рамка (при загруженной модели): слева направо — синяя, справа налево — зелёная. Ctrl/Shift — добавить. Двойной клик в дереве — изоляция. ПКМ — прозрачность.
         </div>
         <div v-if="placementActive" class="viewer-placement-panel">
           <div class="viewer-placement-title">Размещение модели</div>
@@ -11492,17 +12004,9 @@ defineExpose({
         </div>
         <div v-show="leftSidebarTab === 'params' && paramsSubTab === 'selection'" class="viewer-left-sidebar-pane viewer-sidebar-panel viewer-selection-panel">
           <div class="viewer-selection-header">Выделение и слои</div>
-          <p class="viewer-selection-summary">{{ selectedPartsSummary }}</p>
-          <button
-            type="button"
-            class="viewer-3d-btn viewer-selection-mode-btn"
-            :class="{ active: partBoxSelectMode }"
-            @click="partBoxSelectMode = !partBoxSelectMode"
-          >
-            {{ partBoxSelectMode ? 'Рамка: вкл' : 'Рамка: выкл' }}
-          </button>
+          <p class="viewer-models-hint">{{ selectedPartsSummary }}</p>
           <p class="viewer-models-hint">
-            Рамка на сцене: слева направо — синяя (только полностью внутри), справа налево — зелёная (пересечение). Ctrl — добавить к выделению.
+            Рамка на сцене (при загруженной модели): слева направо — синяя (полностью внутри), справа налево — зелёная (пересечение). Ctrl/Shift — добавить к выделению.
           </p>
           <div class="viewer-selection-row">
             <label>Слой</label>
@@ -11528,16 +12032,11 @@ defineExpose({
           <div class="viewer-measurements-controls">
             <select class="viewer-measurements-select" :value="measureTypeRef" @change="setMeasureType(($event.target as HTMLSelectElement).value as MeasureType)">
               <optgroup label="Основные">
-                <option value="distance">Расстояние (треугольник Δ)</option>
-                <option value="cad-linear">Линейный размер (вынос, ГОСТ)</option>
-              </optgroup>
-              <optgroup label="Дополнительно">
-                <option value="radius">Радиус</option>
-                <option value="diameter">Диаметр</option>
-                <option value="hole-center-distance">Межцентровое</option>
-                <option value="arc">Длина дуги</option>
+                <option value="distance">Расстояние (2 клика, live)</option>
+                <option value="cad-linear">Между параллельными гранями</option>
               </optgroup>
             </select>
+            <p v-if="measureStatusHint" class="viewer-measurements-hint">{{ measureStatusHint }}</p>
             <div class="viewer-measurements-dim-row">
               <span>Стрелка</span>
               <input v-model.number="dimArrowSizeMm" type="number" class="viewer-measurements-dim-input" min="2" max="60" step="0.5" />
@@ -11553,18 +12052,19 @@ defineExpose({
               </button>
             </div>
             <div v-if="measureTypeRef === 'cad-linear'" class="viewer-measurements-cad-row">
-              <label>Линейный размер по плоскостям (с выносными стрелками)</label>
+              <label>Три шага: грань 1 → грань 2 → плоскость вывода (или авто-вынос)</label>
               <div class="viewer-measurements-cad-pick">
-                <input class="viewer-measurements-cad-input" :value="cadLinearPlane1Text" readonly title="1-я измеряемая плоскость" />
-                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane1')">Плоскость 1</button>
+                <input class="viewer-measurements-cad-input" :value="cadLinearPlane1Text" readonly title="1-я грань" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane1')">Грань 1</button>
               </div>
               <div class="viewer-measurements-cad-pick">
-                <input class="viewer-measurements-cad-input" :value="cadLinearPlane2Text" readonly title="2-я измеряемая плоскость" />
-                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane2')">Плоскость 2</button>
+                <input class="viewer-measurements-cad-input" :value="cadLinearPlane2Text" readonly title="2-я грань" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('plane2')">Грань 2</button>
               </div>
-              <div class="viewer-measurements-cad-pick">
-                <input class="viewer-measurements-cad-input" :value="cadLinearDisplayPlaneText" readonly title="Плоскость отображения выноса" />
-                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('display')">Плоскость вывода</button>
+              <div class="viewer-measurements-cad-pick viewer-measurements-cad-pick--optional">
+                <input class="viewer-measurements-cad-input" :value="cadLinearDisplayPlaneText || '—'" readonly title="Плоскость выноса" />
+                <button type="button" class="viewer-measurements-cad-btn" @click="startCadLinearPlanePick('display')">Вынос (3-я грань)</button>
+                <button type="button" class="viewer-measurements-cad-btn" @click="autoCadLinearDisplayAndSave">Авто-вынос</button>
               </div>
               <button type="button" class="viewer-measurements-cad-new" @click="startNewCadLinearMeasurement">Новый размер</button>
               <div v-if="cadLinearStatus" class="viewer-measurements-cad-status">{{ cadLinearStatus }}</div>
@@ -12975,6 +13475,19 @@ defineExpose({
   background: rgba(26, 38, 58, 0.8);
   border-radius: 5px;
   padding: 3px 6px;
+}
+.viewer-measurements-hint {
+  margin: 0;
+  font-size: 0.68rem;
+  color: #b8cce8;
+  line-height: 1.4;
+  padding: 6px 8px;
+  background: rgba(26, 38, 58, 0.75);
+  border-radius: 5px;
+  border-left: 3px solid rgba(127, 194, 255, 0.65);
+}
+.viewer-measurements-cad-pick--optional {
+  opacity: 0.82;
 }
 .viewer-measurements-cad-new {
   height: 26px;
